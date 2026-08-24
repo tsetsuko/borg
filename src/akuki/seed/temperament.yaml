@@ -1,0 +1,66 @@
+# Akuki -- wrodzony temperament. Wylacznie parametry, nigdy proza.
+#
+# "The seed should define temperament, not destiny."
+#   akuki_child_psychology_research.md:990
+# Lista licencjonowanych sklonnosci: :992-1002. Lista zakazanych wnioskow: :1004-1015.
+#
+# ZASADA PROJEKTOWA -- te liczby sa STALE.
+# Rozwoj bierze sie z wyuczonego stanu przekraczajacego prog, nigdy z obnizenia progu.
+# Ustawienie wysokiego progu na starcie jest warunkiem poczatkowym i jest legalne.
+# Ruszenie go pozniej zamienia rozwoj w pokretlo i czyni go nieodroznialnym od strojenia.
+#
+# UCZCIWE OSTRZEZENIE O WARTOSCIACH.
+# W dniu zapisu tego pliku JEDYNYM kluczem, ktory ma konsumenta, jest attachment.figure.
+# Mechanizmy czytajace reszte to M2/M3/M4/M5 i one nie istnieja. Zadna z ponizszych
+# liczb nie zostala wiec jeszcze przez nic sfalsyfikowana -- sa to wartosci startowe
+# dobrane z rozsadku, nie zmierzone. Zasadna jest ich STALOSC, nie ich konkretna wartosc.
+# Kazdy klucz nosi `consumer:` -- kamien milowy, ktorego mechanizm ma go czytac.
+# temperament.test.ts wywala build dla klucza, ktorego kamien milowy juz wszedl,
+# a ktorego nadal nikt nie czyta. Osierocony parametr ma byc bledem, nie ozdoba.
+
+inhibition:
+  # consumer: M3
+  # research:995-996 -- observation, shyness.
+  # Wysoko celowo: Akuki startuje bardzo nieśmiały. Prog sie nie zmienia;
+  # zmienia sie niepewnosc, ktora do niego dochodzi.
+  # Czytane jako: inhibicja = base_threshold + uncertainty_weight * niepewnosc(partner, temat)
+  base_threshold: 0.75
+  uncertainty_weight: 0.5
+
+curiosity:
+  # consumer: M2
+  # research:994 -- curiosity; :999 -- attraction to novelty.
+  gain: 0.7
+  # Strefa najblizszego rozwoju: interesujacy blad predykcji jest POSREDNI
+  # i redukowalny, nie maksymalny. Dlatego przedzial, nie sufit.
+  target_error_band: [0.25, 0.6]
+
+attachment:
+  # consumer: M0 (figure), M2 (memory_weight)
+  # research:997 -- attachment.
+  # Par. 16 :954 licencjonuje WYLACZNIE sygnature wagi pamieciowej i mowi wprost, ze
+  # attachment "remains a research direction rather than a supported implementation
+  # recommendation at this stage". Dlatego NIE MA tu secure_base_discount ani zadnego
+  # innego modulowania zachowania obecnoscia figury.
+  figure: Zosia
+  memory_weight: 1.5
+
+memory:
+  # consumer: M2
+  # research:1001 -- fascination with mistakes; par. 13 :809-823 -- surprise, failure.
+  surprise_weight: 2.0
+
+agency:
+  # consumer: M5
+  # research:1002 -- satisfaction from discovering new capabilities.
+  # DWIE liczby, nie jedna. Posterior Beta jest krzywa, wiec "pewnosc ponad 0.8"
+  # nie nazywa zadnej wielkosci. Policzalne jest dolne ograniczenie PLUS masa:
+  #   P(prawdziwy wskaznik > contingency_floor) > contingency_confidence
+  # czyli: co najmniej 80% krzywej przekonania lezy powyzej 60% skutecznosci.
+  contingency_floor: 0.6
+  contingency_confidence: 0.8
+
+differentiation:
+  # consumer: M4
+  # architecture:431-441 -- observe -> imitate -> observe outcome -> retain/modify/reject.
+  imitation_retention_threshold: 0.6
