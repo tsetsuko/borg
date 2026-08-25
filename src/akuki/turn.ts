@@ -6,6 +6,7 @@
 
 import { Borg } from "../index.js";
 import { parseSessionId } from "../util/ids.js";
+import { applyAkukiSeed } from "./seed/apply.js";
 import { buildAkukiClients, type AkukiEmbeddingMode } from "./tenant.js";
 
 export type RunAkukiTurnOptions = {
@@ -43,6 +44,18 @@ export async function runAkukiTurn(options: RunAkukiTurnOptions): Promise<RunAku
   });
 
   try {
+    // The seed is re-applied every turn on purpose: scaffolding.md and
+    // temperament.yaml are the source of truth in git, so the database should
+    // follow them rather than drift from them. applyAkukiSeed compares before
+    // writing, so an unchanged seed costs two file reads and touches nothing --
+    // no updated_at churn, no identity events that mean nothing.
+    //
+    // NOT wired into BorgPool's initializeBeing: that hook runs for EVERY tenant
+    // the sidecar opens, including Sol's. Calling this there unguarded would write
+    // Akuki's persona into another being's database. If it ever goes there, it
+    // must be gated on tenantId === "akuki".
+    applyAkukiSeed(borg);
+
     const before = borg.identity.listEvents({ limit: EVENT_SCAN_LIMIT }).length;
 
     const result = await borg.turn({
