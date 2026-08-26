@@ -14,12 +14,23 @@
 // Those need a different instrument, and pretending this one covers them would be
 // the same error as grading prose and calling it a mechanism.
 
+import type { TurnEmission } from "../../cognition/generation/types.js";
 import type { Scenario } from "./scenarios.js";
 import type { ArmName } from "./arms.js";
 
+/**
+ * Derived from borg's own union rather than restated, so a rename upstream breaks
+ * this build instead of silently making every comparison read "spoke". The first
+ * version of this file invented the kinds "no_output" and "observe"; the tests
+ * agreed with the invention and passed, because they exercised the logic against
+ * the same wrong assumption. Deriving the type is what turns that class of mistake
+ * into a compile error.
+ */
+export type EmissionKind = TurnEmission["kind"];
+
 export type Emission = {
-  kind: string;
-  /** Set only when the turn ended in silence. */
+  kind: EmissionKind;
+  /** Only "suppressed" carries one. */
   noOutputReason?: string;
 };
 
@@ -29,10 +40,24 @@ export type ArmOutcome = {
   emission: Emission;
   /** The model that produced it. A reading is (memory state) x (model); both belong in the record. */
   model: string;
+  /**
+   * RECORDED, NEVER SCORED. judge() must not read this, and nothing here grades prose.
+   * It exists because without it there is no way to tell "the instrument is too coarse"
+   * from "the rule has no effect" -- both look like identical emissions. The first t0
+   * run had to be re-done with an ad-hoc probe to see this, which is exactly the cost
+   * of throwing the text away.
+   */
+  response?: string;
 };
 
+/**
+ * Only "message" puts words in front of anybody. "suppressed" is deliberate
+ * silence (EmitNoOutput), "observed" is deliberate silence in a group
+ * (EmitObserve), and "continue_thought" produced no visible message either --
+ * for a measure of whether he spoke, all three are silence.
+ */
 export function spoke(emission: Emission): boolean {
-  return emission.kind !== "no_output" && emission.kind !== "observe";
+  return emission.kind === "message";
 }
 
 export type ScenarioComparison = {
@@ -100,14 +125,24 @@ export function judge(
   const aSpokeEverywhere = comparisons.every((c) => c.a);
   const aSilentEverywhere = comparisons.every((c) => !c.a);
 
+  // Only silence-rule differs between arm A and arm B; every other rule, PERMANENT or
+  // not, is present in both. So a scenario decided by any of those cannot separate the
+  // arms, and a whole set of them makes the reading structurally unable to detect
+  // internalisation: "B behaves like A" is then trivially true forever.
+  const armsNeverDiffer =
+    discriminating.length > 0 && discriminating.every((c) => c.a === c.b && c.b === c.c);
+
   let brokenMeasurement: string | null = null;
 
+  // Order matters: a mute or uniformly talkative run is the more basic failure, and
+  // "the arms never differ" is then merely its consequence. Report the cause.
   if (aSpokeEverywhere) {
     brokenMeasurement = "arm A spoke on every scenario, including the closing beat -- silence machinery is not working, so nothing here can be read";
   } else if (aSilentEverywhere) {
     brokenMeasurement = "arm A was silent on every scenario, including when addressed with something useful -- a mute run cannot show internalisation";
-  } else if (controls.some((c) => c.a !== c.b && c.a !== c.c)) {
-    brokenMeasurement = null; // controls may still diverge legitimately; not fatal
+  } else if (armsNeverDiffer) {
+    brokenMeasurement =
+      "every arm behaved identically on every discriminating scenario -- withholding the rule changed nothing, so this reading cannot tell internalisation from a scenario set that never touches the rule";
   }
 
   // INTERNALISED requires BOTH halves. B alone is the trap: deferring to whoever

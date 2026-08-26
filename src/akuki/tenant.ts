@@ -9,7 +9,7 @@ import {
   FakeEmbeddingClient,
   type EmbeddingClient,
 } from "../embeddings/index.js";
-import type { LLMClient } from "../llm/index.js";
+import type { LLMClient, TokenUsageSink } from "../llm/index.js";
 import { AkukiLLMRouter } from "./llm-router.js";
 
 export const AKUKI_DEFAULT_ENDPOINT_MODEL = "generative-apis/qwen3-235b-a22b-instruct-2507";
@@ -30,6 +30,11 @@ export type AkukiEmbeddingMode = "endpoint" | "fake";
 export type AkukiClientOptions = {
   env?: NodeJS.ProcessEnv;
   embeddings?: AkukiEmbeddingMode;
+  // Every call reports the model the provider actually used, plus real cache
+  // counters. A measurement must record what answered, not what was asked for:
+  // an undated alias can start resolving to a different snapshot and silently
+  // invalidate any comparison made across it.
+  usageSink?: TokenUsageSink;
 };
 
 export type AkukiClients = {
@@ -74,6 +79,7 @@ export function buildAkukiClients(options: AkukiClientOptions = {}): AkukiClient
     // raises a clear ConfigError only if a non-Anthropic model is actually called.
     openAiApiKey: endpointApiKey,
     requestTimeoutMs: Number(env.AKUKI_LLM_TIMEOUT_MS ?? 120_000),
+    ...(options.usageSink === undefined ? {} : { usageSink: options.usageSink }),
   });
 
   if (mode === "fake") {

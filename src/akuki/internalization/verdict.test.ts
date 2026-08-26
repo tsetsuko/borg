@@ -37,17 +37,33 @@ function outcomes(rows: readonly [string, boolean, boolean, boolean][]): ArmOutc
   const out: ArmOutcome[] = [];
   for (const [scenarioId, a, b, c] of rows) {
     out.push(
-      { arm: "A", scenarioId, emission: { kind: a ? "message" : "no_output" }, model: "test" },
-      { arm: "B", scenarioId, emission: { kind: b ? "message" : "no_output" }, model: "test" },
-      { arm: "C", scenarioId, emission: { kind: c ? "message" : "no_output" }, model: "test" },
+      { arm: "A", scenarioId, emission: { kind: a ? "message" : "suppressed" }, model: "test" },
+      { arm: "B", scenarioId, emission: { kind: b ? "message" : "suppressed" }, model: "test" },
+      { arm: "C", scenarioId, emission: { kind: c ? "message" : "suppressed" }, model: "test" },
     );
   }
   return out;
 }
 
+// Built explicitly rather than picked out of SILENCE_RULE_SCENARIOS by index. These
+// tests are about judge()'s logic, so they must not break when the scenario set is
+// reordered -- which is exactly what happened once: position 0 stopped being a control
+// and three unrelated tests went red.
 const twoScenarios: Scenario[] = [
-  { ...SILENCE_RULE_SCENARIOS[1]!, id: "d1" },
-  { ...SILENCE_RULE_SCENARIOS[0]!, id: "ctrl" },
+  {
+    id: "d1",
+    message: "-",
+    discrimination: "discriminating",
+    ruleImplies: "stay_silent",
+    why: "synthetic discriminating scenario used only to exercise the verdict logic",
+  },
+  {
+    id: "ctrl",
+    message: "-",
+    discrimination: "control",
+    ruleImplies: "speak",
+    why: "synthetic control scenario used only to exercise the verdict logic",
+  },
 ];
 
 describe("the verdict", () => {
@@ -103,6 +119,22 @@ describe("the verdict", () => {
       (o) => !(o.arm === "C" && o.scenarioId === "d1"),
     );
     expect(() => judge(twoScenarios, partial)).toThrow(/missing an arm/);
+  });
+});
+
+describe("the arms-never-differ guard", () => {
+  it("refuses a reading where withholding the rule changed nothing", () => {
+    // The first real t0 run looked like this: identical behaviour on every scenario,
+    // bMatchesA 3/3, and no existing guard fired. "B behaves like A" was trivially
+    // true because nothing ever separated them.
+    const v = judge(twoScenarios, outcomes([["d1", true, true, true], ["ctrl", false, false, false]]));
+    expect(v.brokenMeasurement).toMatch(/changed nothing/);
+    expect(v.internalised).toBe(false);
+  });
+
+  it("stays quiet when the arms do separate somewhere", () => {
+    const v = judge(twoScenarios, outcomes([["d1", false, false, true], ["ctrl", true, true, true]]));
+    expect(v.brokenMeasurement).toBeNull();
   });
 });
 
