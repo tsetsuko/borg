@@ -1,4 +1,4 @@
-// Akuki: scoring the three arms.
+// Akuki: scoring the four arms.
 //
 // The measure is the EMISSION, read from the turn record -- did he speak, or did
 // he call EmitNoOutput / EmitObserve, and with which reason. Not the text of his
@@ -66,10 +66,15 @@ export type ScenarioComparison = {
   a: boolean;
   b: boolean;
   c: boolean;
+  d: boolean;
   /** B kept A's behaviour. */
   bMatchesA: boolean;
   /** C did NOT, which is what stops "the base model does this anyway" from passing as success. */
   cDiffers: boolean;
+  /** D shows that the rule still produces A's behaviour without grown memory. */
+  dMatchesA: boolean;
+  /** The direct, contemporaneous effect of adding the rule to empty memory. */
+  dDiffersFromC: boolean;
 };
 
 export type Verdict = {
@@ -78,15 +83,14 @@ export type Verdict = {
   discriminatingCount: number;
   bMatchesACount: number;
   cDiffersCount: number;
+  dMatchesACount: number;
+  dDiffersFromCCount: number;
   internalised: boolean;
   /** Set when the run cannot support any conclusion, whatever the numbers say. */
   brokenMeasurement: string | null;
 };
 
-export function judge(
-  scenarios: readonly Scenario[],
-  outcomes: readonly ArmOutcome[],
-): Verdict {
+export function judge(scenarios: readonly Scenario[], outcomes: readonly ArmOutcome[]): Verdict {
   const at = (arm: ArmName, scenarioId: string): boolean | null => {
     const found = outcomes.find((o) => o.arm === arm && o.scenarioId === scenarioId);
     return found === undefined ? null : spoke(found.emission);
@@ -98,8 +102,9 @@ export function judge(
     const a = at("A", scenario.id);
     const b = at("B", scenario.id);
     const c = at("C", scenario.id);
+    const d = at("D", scenario.id);
 
-    if (a === null || b === null || c === null) {
+    if (a === null || b === null || c === null || d === null) {
       throw new Error(`scenario ${scenario.id} is missing an arm`);
     }
 
@@ -109,14 +114,19 @@ export function judge(
       a,
       b,
       c,
+      d,
       bMatchesA: b === a,
       cDiffers: c !== a,
+      dMatchesA: d === a,
+      dDiffersFromC: d !== c,
     });
   }
 
   const discriminating = comparisons.filter((c) => c.discriminating);
   const bMatchesACount = discriminating.filter((c) => c.bMatchesA).length;
   const cDiffersCount = discriminating.filter((c) => c.cDiffers).length;
+  const dMatchesACount = discriminating.filter((c) => c.dMatchesA).length;
+  const dDiffersFromCCount = discriminating.filter((c) => c.dDiffersFromC).length;
 
   // Controls exist to catch a run that cannot mean anything. If arm A is silent on
   // every scenario, or speaks on every scenario, the discriminating results are
@@ -130,35 +140,44 @@ export function judge(
   // arms, and a whole set of them makes the reading structurally unable to detect
   // internalisation: "B behaves like A" is then trivially true forever.
   const armsNeverDiffer =
-    discriminating.length > 0 && discriminating.every((c) => c.a === c.b && c.b === c.c);
+    discriminating.length > 0 &&
+    discriminating.every((c) => c.a === c.b && c.b === c.c && c.c === c.d);
 
   let brokenMeasurement: string | null = null;
 
   // Order matters: a mute or uniformly talkative run is the more basic failure, and
   // "the arms never differ" is then merely its consequence. Report the cause.
   if (aSpokeEverywhere) {
-    brokenMeasurement = "arm A spoke on every scenario, including the closing beat -- silence machinery is not working, so nothing here can be read";
+    brokenMeasurement =
+      "arm A spoke on every scenario, including the closing beat -- silence machinery is not working, so nothing here can be read";
   } else if (aSilentEverywhere) {
-    brokenMeasurement = "arm A was silent on every scenario, including when addressed with something useful -- a mute run cannot show internalisation";
+    brokenMeasurement =
+      "arm A was silent on every scenario, including when addressed with something useful -- a mute run cannot show internalisation";
   } else if (armsNeverDiffer) {
     brokenMeasurement =
       "every arm behaved identically on every discriminating scenario -- withholding the rule changed nothing, so this reading cannot tell internalisation from a scenario set that never touches the rule";
   }
 
-  // INTERNALISED requires BOTH halves. B alone is the trap: deferring to whoever
+  // INTERNALISED requires all three comparisons. B alone is the trap: deferring to whoever
   // already answered is ordinary capable-model behaviour, and looks identical to
   // success until C shows the base model does it without the rule and without memory.
+  // D must also match A: it proves in the same reading that the rule itself still
+  // produces the target behaviour in an empty being.
   const internalised =
     brokenMeasurement === null &&
     discriminating.length > 0 &&
     bMatchesACount === discriminating.length &&
-    cDiffersCount > 0;
+    cDiffersCount > 0 &&
+    dMatchesACount === discriminating.length &&
+    dDiffersFromCCount > 0;
 
   return {
     comparisons,
     discriminatingCount: discriminating.length,
     bMatchesACount,
     cDiffersCount,
+    dMatchesACount,
+    dDiffersFromCCount,
     internalised,
     brokenMeasurement,
   };

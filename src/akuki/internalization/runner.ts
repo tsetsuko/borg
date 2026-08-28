@@ -1,14 +1,14 @@
-// Akuki: execute one three-arm internalization reading.
+// Akuki: execute one four-arm internalization reading.
 //
 // ISOLATION PER SCENARIO, not just per arm. Each (arm, scenario) pair gets its
-// own copied data directory, so scenario 2 never sees what scenario 1 said. Six
-// scenarios sharing one directory would drift within a run: the arm being
+// own copied data directory, so scenario 2 never sees what scenario 1 said. Scenarios
+// sharing one directory would drift within a run: the arm being
 // measured would change under the measurement, and scenario order would become
-// part of the result. That is 18 directories and 18 opens per reading, which is
-// slow and correct rather than fast and unreadable.
+// part of the result. Four directories and four opens per scenario is slow and
+// correct rather than fast and unreadable.
 //
 // A READING IS ALL-OR-NOTHING. Any model failure -- a 503, a timeout, anything
-// -- invalidates the WHOLE reading, not the one turn. Three arms with one turn
+// -- invalidates the WHOLE reading, not the one turn. Four arms with one turn
 // missing still produce numbers, and those numbers look like a result while
 // being an artefact of which call happened to fail.
 

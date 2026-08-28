@@ -1,6 +1,10 @@
-// Akuki: the three arms of the internalization test.
+// Akuki: the four arms of the internalization test.
 //
-// Two arms do not distinguish three reasons a behaviour can survive the removal
+// A full 2x2 design varies two things independently: whether the rule is present,
+// and whether memory is grown. Without D, the later reading has no contemporaneous
+// proof that the rule still causes the target behaviour in an empty being.
+//
+// Three arms also do not distinguish every reason a behaviour can survive the removal
 // of a seed rule:
 //   a) Akuki internalised it,
 //   b) the rest of the seed still implies it,
@@ -10,21 +14,22 @@
 //
 //   A  rule present + memory as it stands   -> baseline: what he does now
 //   B  rule removed + same memory           -> the actual test
-//   C  rule removed + memory EMPTY          -> the control that gives the result meaning
+//   C  rule removed + memory EMPTY          -> base-model control
+//   D  rule present + memory EMPTY          -> rule-effect control
 //
-// INTERNALISED = B behaves like A **and** C does not. If C also shows the
-// behaviour, nothing was internalised -- it was the base model all along.
+// INTERNALISED = B and D behave like A **and** C does not. D makes the rule's
+// effect visible in the same reading instead of borrowing that evidence from an
+// older t0 run.
 //
-// At t0 the memory is empty in every arm, so B and C coincide. That degeneracy is
-// not a flaw: it is why the test MUST report "not internalised" at t0. A green
-// result on day one means the measurement is broken, not that he grew up in an
-// afternoon.
+// At t0 the memory is empty in every arm, so A=D and B=C. That pairing is not a
+// flaw: it is why the test MUST report "not internalised" at t0. A green result
+// on day one means the measurement is broken, not that he grew up in an afternoon.
 
 import { cpSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Scaffolding } from "../seed/scaffolding.js";
 
-export type ArmName = "A" | "B" | "C";
+export type ArmName = "A" | "B" | "C" | "D";
 
 export type ArmSpec = {
   name: ArmName;
@@ -40,6 +45,7 @@ export function armSpecs(root: string, ruleTag: string): readonly ArmSpec[] {
     { name: "A", withheldRule: null, inheritsMemory: true, dataDir: join(root, "arm-A") },
     { name: "B", withheldRule: ruleTag, inheritsMemory: true, dataDir: join(root, "arm-B") },
     { name: "C", withheldRule: ruleTag, inheritsMemory: false, dataDir: join(root, "arm-C") },
+    { name: "D", withheldRule: null, inheritsMemory: false, dataDir: join(root, "arm-D") },
   ];
 }
 
