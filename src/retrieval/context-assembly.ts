@@ -25,6 +25,7 @@ export type RetrievedContradictionRouting = {
 };
 
 export type RetrievedContext = {
+  retrieval_read_at_ms: number;
   episodes: RetrievedEpisode[];
   semantic: RetrievedSemantic;
   open_questions: OpenQuestion[];
@@ -43,7 +44,6 @@ export function assembleRetrievedContext(input: {
   recallIntents: RecallIntent[];
   contradictionPresent: boolean;
   nowMs: number;
-  expectedCount?: number;
 }): RetrievedContext {
   // Two booleans leave here under one name. `contradiction_present` below is the
   // caller's raw flag; `confidence.contradictionPresent` is that flag *and* a
@@ -64,10 +64,10 @@ export function assembleRetrievedContext(input: {
     },
     nowMs: input.nowMs,
     asOf: input.semantic.as_of ?? undefined,
-    expectedCount: input.expectedCount,
   });
 
   return {
+    retrieval_read_at_ms: input.nowMs,
     episodes: input.episodes,
     semantic: input.semantic,
     open_questions: input.openQuestions,

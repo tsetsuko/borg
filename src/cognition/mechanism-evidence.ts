@@ -7,11 +7,15 @@ import type {
   GenerationSuppressionReason,
 } from "./generation/types.js";
 import type {
+  RecentRegenerationCommitment,
   RecentRegenerationEntry,
   RecentSuppressionEntry,
   WorkingMemory,
 } from "../memory/working/index.js";
-import type { AutonomySchedulerBudgetDescription } from "../autonomy/index.js";
+import type {
+  AutonomySchedulerBudgetDescription,
+  AutonomySchedulerFleetBrakeDescription,
+} from "../autonomy/index.js";
 import {
   RECENT_REGENERATIONS_LIMIT,
   RECENT_SUPPRESSIONS_LIMIT,
@@ -44,11 +48,42 @@ export type HydratedRecentRegeneration = {
   mechanism: RecentRegenerationEntry["mechanism"];
   ts: number;
   sourceStreamEntryId?: StreamEntryId;
+  commitments?: readonly RecentRegenerationCommitment[];
 };
 
+// The scheduler's `describe()` builds six top-level fields and this object used to keep one.
+// `budget` alone answers "is there room for another wake", but three of the discarded fields
+// refuse a wake independently of room: `enabled` (loop off -> nothing fires), `next_tick_at`
+// (null -> no interval handle, so nothing fires), and `fleet_brake` (empty-streak cooldown or
+// error-streak pause -- a second gate the budget line knows nothing about). Rendering only the
+// budget therefore produced a page on which "budget has headroom" and "a wake can happen" looked
+// like the same statement. The discriminators existed upstream and were dropped at the provider
+// call site; they are carried here so the surface can say which gate is holding.
+//
+// `scheduledTickAt` is carried alongside `nextTickAt` for the same reason. The scheduler floors
+// `next_tick_at` forward to the read clock so a UI never shows a "next evaluation" that has
+// already been and gone -- but the floor subtracts, and what it subtracts is exactly how overdue
+// the tick was. Rendering only the floored stamp produced a line that reports lateness by
+// refusing to be late: a tick 12s behind and a tick due this instant print the same instant, and
+// the age hung on that stamp is time since the read, not tick lateness. The unfloored value is
+// two lines away in the scheduler; carrying it here is what makes the discarded quantity
+// recoverable at the surface instead of destroyed upstream of it.
+//
+// `tickInFlight` is the third of these, and the one the stamps could not supply. `enabled` is the
+// config flag; `scheduledTickAt` says how far behind the loop is; neither says *why*, and the two
+// causes take opposite repairs. A tick stamps the anchor on entry and the interval drops every
+// fire while it runs, so a stuck tick holds one stamp while the overdue amount climbs -- the same
+// page a lagging interval draws. Telling them apart used to require two reads far enough apart to
+// watch whether the stamp moved, which is a discriminator no single prompt can carry. The flag is
+// already in the scheduler at describe() time; carrying it here makes one read enough.
 export type AutonomySchedulerMechanismEvidence = {
   observedAt: number;
+  enabled: boolean;
+  tickInFlight: boolean;
+  nextTickAt: number | null;
+  scheduledTickAt: number | null;
   budget: AutonomySchedulerBudgetDescription;
+  fleetBrake: AutonomySchedulerFleetBrakeDescription;
 };
 
 export type TurnMechanismEvidence = {
@@ -124,6 +159,20 @@ function suppressionDiagnosticFromEntry(
   };
 }
 
+// The regeneration ring has the same shape of scope trap as the suppression ring below, one
+// step further in: it holds regenerations whose redrafted answer was then emitted, not
+// regenerations. The breadcrumb is minted only under `finalAnswerRegenerated &&
+// guardedEmission.kind === "message"` (turn-action/turn-action-coordinator.ts) and appended
+// only on the message branch of post-generation-phase.ts, whose suppressed branch returns
+// first. So a draft the commitment guard redrafted and a guard then suppressed lands in the
+// suppression ring and nowhere here -- the two lists cannot share a turn id, ever. Measured on
+// the live store (2026-08-27): zero overlap across all nine sessions, one of them carrying
+// seven `commitment_violation_after_regenerate` silences beside a full regeneration ring that
+// names none of the seven. Two reason codes (`commitment_violation_after_regenerate`,
+// `invalid_tool_after_regenerate` -- the latter the finalizer's own retry, not this guard)
+// still carry the redraft in their own name; under any other one it is unrecorded in both.
+// system-prompt.ts states that scope on the rendered line, which is the fix for a gap of this
+// shape here: name it, do not widen the ring.
 function hydratedRecentRegeneration(entry: RecentRegenerationEntry): HydratedRecentRegeneration {
   return {
     turnId: entry.turn_id,
@@ -132,6 +181,9 @@ function hydratedRecentRegeneration(entry: RecentRegenerationEntry): HydratedRec
     ...(entry.source_stream_entry_id === undefined
       ? {}
       : { sourceStreamEntryId: entry.source_stream_entry_id }),
+    // Absent and empty are two different silences on the stored entry (see
+    // appendRecentRegeneration); carry both through so the render can say which.
+    ...(entry.commitments === undefined ? {} : { commitments: entry.commitments }),
   };
 }
 
@@ -148,6 +200,17 @@ function hydratedRecentRegeneration(entry: RecentRegenerationEntry): HydratedRec
 // src/stream/turn-status.ts for the independent second reason the abort's `reason` string is
 // unreadable. Consequence worth stating plainly before anyone reasons from this block: a run of
 // aborted turns renders here as an unbroken record of turns that spoke.
+//
+// Second property, independent of the first: neither list is a time window. Both are count-capped
+// rings (capNewest at RECENT_*_LIMIT in generation/discourse-state.ts), and working memory is
+// per-session (working/<session_id>.json), so an entry survives in its own session until that many
+// newer ones displace it -- days or weeks. Two entries side by side carry no implication of being
+// contemporaries, and neither list can be compared against a time-bounded census of the other.
+// Measured on the live demo store (2026-08-23), one session's suppression ring held 8 entries
+// spanning 11 days, its head a reason code from a guard that had been configured off for that
+// session's source type two hours after it fired: still rendered, no longer possible. That is why
+// system-prompt.ts renders each entry's age -- the ts is here, and dropping it at render was the
+// whole gap.
 export async function hydrateTurnMechanismEvidence(
   input: HydrateTurnMechanismEvidenceInput,
 ): Promise<TurnMechanismEvidence> {

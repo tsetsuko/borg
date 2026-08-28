@@ -154,8 +154,17 @@ export async function addActionStatesSection(context: BuilderSectionContext): Pr
   const olderThreads = orderActionThreadsBySalience(
     threadsWithSalience.filter((thread) => !renderedIds.has(thread.id)),
   );
+  const salienceDroppedThreadCount = threads.length - threadsWithSalience.length;
+  const drawSaturated = actionCandidates.length >= sourceRecordLimit;
+  // The draw stops at the limit, so this section only ever sees a prefix of the store. The size of
+  // the rest is one count away, which is what turns the below-floor field from a refusal into a
+  // measurement; a repository that cannot count leaves the field saying so rather than implying 0.
+  const sourceRecordTotal = context.repos.actions.count?.() ?? null;
 
-  if (olderThreads.length === 0) {
+  // Absent must not be the only way to say "nothing left over": a saturated draw or a
+  // salience-dropped thread is still material this section did not show, so the entry is
+  // emitted whenever any of the three populations is non-empty, including in the negative.
+  if (olderThreads.length === 0 && salienceDroppedThreadCount === 0 && !drawSaturated) {
     return;
   }
 
@@ -202,7 +211,15 @@ export async function addActionStatesSection(context: BuilderSectionContext): Pr
     session_scope: "global",
     actor: "system",
     trust_rank: ACTION_TRUST_RANK,
-    text: renderOlderActionThreadsSummary(summaryGroups),
+    text: renderOlderActionThreadsSummary({
+      groups: summaryGroups,
+      renderedThreadCount: renderedThreads.length,
+      threadsBuiltCount: threads.length,
+      consideredRecordCount: actionCandidates.length,
+      sourceRecordLimit,
+      sourceRecordTotal,
+      salienceDroppedThreadCount,
+    }),
     value: "older_action_threads",
     state: "omitted",
     taint: "none",

@@ -32,6 +32,17 @@ export type AutonomyWakeSourceCategory = "contemplative" | "operational";
 export const AUTONOMY_WAKE_OUTCOMES = ["headway", "silent", "error", "busy"] as const;
 export type AutonomyWakeOutcome = (typeof AUTONOMY_WAKE_OUTCOMES)[number];
 
+/**
+ * Distinct-detail tally for one outcome bucket over a window. `total` is the
+ * bucket's own count, so `reasons` summing short of it is not a discrepancy --
+ * `without_detail` is the named difference, and the three always reconcile.
+ */
+export type AutonomyWakeOutcomeDetailTally = {
+  total: number;
+  without_detail: number;
+  reasons: Array<{ detail: string; count: number }>;
+};
+
 export const AUTONOMY_WAKE_SOURCE_METADATA = {
   commitment_expiring: {
     type: "trigger",
@@ -118,12 +129,31 @@ export type AutonomySchedulerWakeGroupDescription = {
   trigger_name: AutonomyWakeSourceName;
   wake_count: number;
   in_flight: number;
+  /**
+   * Fire stamps of the rows counted by `in_flight`, oldest first.
+   *
+   * `in_flight` alone is identity-free: an outcome write that never lands (the
+   * bookkeeping catch around recordOutcome returns without recording one) leaves
+   * its row NULL forever, and a permanently orphaned row and a healthy transient
+   * both render as the same integer, with the block's arithmetic closing either
+   * way. Carrying the stamps makes the two separable across reads -- a stamp that
+   * repeats is one row not moving; a stamp that changes is a new wake -- which is
+   * a comparison the count cannot support at any number of reads.
+   */
+  in_flight_started_at: number[];
   outcome_counts: Record<AutonomyWakeOutcome, number>;
 };
 
 export type AutonomySchedulerBudgetDescription = {
   max_wakes_per_window: number;
   window_ms: number;
+  /**
+   * Lower edge of the rolling window the counts below are taken over, inclusive.
+   * The window is anchored at the describe call's now, so two descriptions taken
+   * minutes apart cover different intervals; without this the counts are not
+   * comparable across reads.
+   */
+  window_started_at: number;
   used_in_current_window: number;
   reserved_contemplative_wakes_per_window: number;
   contemplative_used_in_current_window: number;
@@ -147,23 +177,112 @@ export type AutonomySchedulerConditionSourceDescription = {
 };
 
 export type AutonomySchedulerSourceDescription =
-  AutonomySchedulerTriggerSourceDescription | AutonomySchedulerConditionSourceDescription;
+  | AutonomySchedulerTriggerSourceDescription
+  | AutonomySchedulerConditionSourceDescription;
 
 export type AutonomySchedulerFleetBrakeDescription = {
   enabled: boolean;
+  /**
+   * Consecutive completed operational wakes recorded `silent`. Errored and
+   * busy-skipped wakes are transparent to it -- they neither increment nor
+   * reset -- so the streak is consecutive within the *completed operational*
+   * subsequence, not within the wake sequence, and can span any number of
+   * intervening wakes and any amount of wall-clock.
+   */
   empty_streak: number;
+  empty_streak_threshold: number;
   streak_anchor_ts: number | null;
   cooldown_until: number | null;
   error_streak: number;
+  error_streak_threshold: number;
   error_paused_until: number | null;
+  /**
+   * Freshness bypasses spent -- neither a streak nor a window count. A bypass is
+   * only ever offered while the empty-streak cooldown is actively holding, so a
+   * clear cooldown freezes this rather than resetting it; a deadline bypass does
+   * not spend one. It returns to zero only on an operational wake that came back
+   * `headway` or a contemplative wake that delivered an outbound post -- not on
+   * cooldown expiry and not on the budget window rolling -- so a non-zero value
+   * can outlive the cooldown that produced it and is not a count over
+   * `window_outcomes`.
+   */
   bypass_count: number;
+  /**
+   * The bound `bypass_count` is spent against: at the cap a fresh concern stops
+   * earning a bypass and is refused with everything else the cooldown is
+   * holding. Carried here because the counter is otherwise a bare number whose
+   * distance to its own refusal is unreadable from the value alone.
+   */
+  freshness_bypass_cap: number;
+  /**
+   * Outcome tally over the *budget* window, across both source categories.
+   * A different population from `empty_streak` above: it is time-bounded where
+   * the streak is not, counts contemplative wakes where the streak ignores
+   * them, and counts errors where the streak passes over them. It does not
+   * feed the streak and cannot be differenced into one.
+   */
   window_outcomes: Record<AutonomyWakeOutcome, number>;
+  /**
+   * The `error` entry of `window_outcomes` above, split by the failure the
+   * scheduler recorded -- same rows, same window, same categories, one level of
+   * detail further down. `total` repeats that count so the split can be checked
+   * against it, and `without_detail` names the rows whose failure was not
+   * recorded (every row written before the detail column existed), so the
+   * reasons never have to be read as covering the bucket.
+   */
+  window_error_reasons: AutonomyWakeOutcomeDetailTally;
 };
 
 export type AutonomySchedulerDescription = {
+  /**
+   * The clock read every other field here is as of. `describe()` takes it once
+   * and derives the budget cutoff, the window counts and `next_tick_at` from
+   * it, so any surface that wants to say "these numbers are as of X" must use
+   * this stamp and not its own. A caller's own `now` is necessarily earlier --
+   * it was taken before it awaited `describe()` -- and quoting that instead
+   * ages every count below it by however long the caller spent in between.
+   */
+  observed_at: number;
+  /**
+   * The configuration flag the scheduler was constructed with, and nothing
+   * else: it says the loop was asked to run, never that it is alive. Every
+   * liveness question -- is a tick moving, is the interval still firing --
+   * belongs to `tick_in_flight` and `scheduled_tick_at` below.
+   */
   enabled: boolean;
+  /**
+   * Whether a tick was already running at the read. Load-bearing because the
+   * two ways the loop falls behind are indistinguishable from the stamps
+   * alone: the tick anchor is written on tick *entry*, and the interval
+   * callback early-returns on every fire while a tick is in flight, so a long
+   * tick holds `scheduled_tick_at` still while the overdue amount grows --
+   * exactly the page an interval merely running behind produces. Reading them
+   * apart used to need two reads far enough apart to see whether the stamp
+   * moved. This is the same discriminator on a single read.
+   *
+   * True by construction on an autonomous turn: that turn is running inside
+   * the tick that is being reported, so it only carries information off a
+   * live turn, and any surface rendering it has to say so.
+   */
+  tick_in_flight: boolean;
   interval_ms: number;
+  /**
+   * `max(scheduled_tick_at, observed_at)` -- a tick already due at the read is
+   * reported as the read clock rather than as a past instant, so a consumer
+   * that renders it as "next evaluation" never shows a time that has been and
+   * gone. The floor is lossy: it discards how overdue the tick was, and the
+   * relative age anything hangs on the floored stamp is time since the read,
+   * not tick lateness. `scheduled_tick_at` below is the unfloored value, so
+   * the discarded quantity is recoverable rather than destroyed here.
+   */
   next_tick_at: number | null;
+  /**
+   * `tickAnchor + interval_ms` with no floor: when the loop is behind, this is
+   * in the past of `observed_at` and the difference is exactly how overdue the
+   * tick was at the read. Null under the same condition as `next_tick_at` (no
+   * interval handle), so the pair is never half-present.
+   */
+  scheduled_tick_at: number | null;
   budget: AutonomySchedulerBudgetDescription;
   fleet_brake: AutonomySchedulerFleetBrakeDescription;
   sources: AutonomySchedulerSourceDescription[];

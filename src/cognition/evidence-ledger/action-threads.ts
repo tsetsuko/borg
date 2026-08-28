@@ -9,7 +9,8 @@ import {
 } from "../../memory/actions/index.js";
 import type { EntityRepository } from "../../memory/commitments/index.js";
 import {
-  renderMemoryDisclosureLabelForModel,
+  memoryDisclosureInternalUseNote,
+  renderMemoryDisclosureLabelFieldsForModel,
   type MemoryDisclosureLabel,
 } from "../../retrieval/index.js";
 import { DisjointSet } from "../../util/disjoint-set.js";
@@ -640,17 +641,70 @@ function actionThreadSummaryDetails(
     )
     .join(" | ");
 
-  return `threads=${threads.length} records=${recordCount} states=${stateSummary} disclosure_label=${renderMemoryDisclosureLabelForModel(disclosureLabel)} recent_samples=${samples}`;
+  // Fields only: the internal-use sentence that would follow them is a byte-identical constant on
+  // every non-public label, so it is hoisted to the summary's own line once instead of copied onto
+  // each group. What varies -- and what the reader actually decides disclosure from -- is the class
+  // and the private-to binding, which stay here.
+  return `threads=${threads.length} records=${recordCount} states=${stateSummary} disclosure_label=${renderMemoryDisclosureLabelFieldsForModel(disclosureLabel)} recent_samples=${samples}`;
 }
 
-export function renderOlderActionThreadsSummary(
-  groups: readonly OlderActionThreadSummaryGroup[],
-): string {
+export function renderOlderActionThreadsSummary(input: {
+  groups: readonly OlderActionThreadSummaryGroup[];
+  renderedThreadCount: number;
+  threadsBuiltCount: number;
+  consideredRecordCount: number;
+  sourceRecordLimit: number;
+  sourceRecordTotal: number | null;
+  salienceDroppedThreadCount: number;
+}): string {
+  const { groups } = input;
   const olderThreads = groups.flatMap((group) => group.threads);
   const olderRecordCount = olderThreads.reduce((count, thread) => count + thread.records.length, 0);
+  // The omitted-thread counts describe the render pool only. Two populations never enter it:
+  // threads whose salience class resolved to null, and records below the source draw floor
+  // (never counted, because the draw stops at the limit). Naming both keeps "omitted" from
+  // reading as a complete accounting of everything this section did not show.
+  //
+  // Three of these counts are threads and one -- `records_considered` -- is records,
+  // distinguished only by a field-name prefix, and the total that would let the thread counts
+  // be checked against each other was never printed. Without it the three populations read as
+  // summable against the record total, which they are not: every considered record lands in
+  // exactly one thread (`buildActionThreads` groups the drawn records and nothing else), so
+  // the record total exceeds the thread total by the merge surplus and the sum never closes.
+  // `threads_built` comes from the builder's own thread count rather than from adding the
+  // three, so the printed identity is falsifiable instead of tautological.
+  //
+  // `records_below_draw_floor` used to be an enumeration -- a count when the draw exhausted the
+  // source, a refusal when it stopped at the limit -- and in production only the refusal has ever
+  // rendered, because the store has never been smaller than the draw. A token whose contrast set
+  // never appears is indistinguishable from a constant to a reader holding one page, and naming
+  // the condition it refuses under only lengthens the constant: the named condition is the
+  // comparison of the two numbers printed beside it, so the token restates its own operands and
+  // can never disagree with them.
+  //
+  // The exit is to stop enumerating and measure. The source total is one COUNT away, so the field
+  // prints how many records the draw never looked at. It is rendered as the stated difference of
+  // the two totals rather than as a bare number, so it cannot be mistaken for an independent
+  // count of the below-floor rows -- it is derived from them, and says so.
+  const recordsBelowDrawFloor =
+    input.sourceRecordTotal === null
+      ? "unknown_count_source_total_unavailable"
+      : `${Math.max(0, input.sourceRecordTotal - input.consideredRecordCount)}`;
+  const sourceRecordTotalField =
+    input.sourceRecordTotal === null
+      ? "source_record_total=unavailable"
+      : `source_record_total=${input.sourceRecordTotal}; records_below_draw_floor is that total minus records_considered, not a separate count`;
+  // The internal-use sentence for the group lines below, hoisted out of them. It stays a separate
+  // line rather than joining the counts: this section truncates from the tail, and a note attached
+  // to the counts line would survive at the cost of the group lines it describes.
+  const disclosureNote = groups.some((group) => group.disclosureLabel.disclosureClass !== "public")
+    ? [`Groups below whose disclosure_class is not public: ${memoryDisclosureInternalUseNote()}.`]
+    : [];
 
   return [
     `Older action threads omitted from this section: threads=${olderThreads.length}, records=${olderRecordCount}.`,
+    `Not counted above: salience_dropped_threads=${input.salienceDroppedThreadCount}, records_below_draw_floor=${recordsBelowDrawFloor} (threads_built=${input.threadsBuiltCount} = rendered ${input.renderedThreadCount} + omitted ${olderThreads.length} + dropped ${input.salienceDroppedThreadCount}; records_considered=${input.consideredRecordCount} records, source_record_limit=${input.sourceRecordLimit}, ${sourceRecordTotalField}).`,
+    ...disclosureNote,
     ...groups.map(
       (group) =>
         `- audience_scope=${group.audienceScope} salience_class=${group.salienceClass} ${actionThreadSummaryDetails(group.threads, group.disclosureLabel)}`,

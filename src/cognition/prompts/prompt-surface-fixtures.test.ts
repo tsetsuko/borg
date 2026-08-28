@@ -79,9 +79,28 @@ const FIXTURE_AUTONOMY_SCHEDULER_STATE: NonNullable<
   NonNullable<DeliberationContext["turnMechanismEvidence"]>["autonomySchedulerState"]
 > = {
   observedAt: NOW_MS,
+  enabled: true,
+  tickInFlight: false,
+  nextTickAt: NOW_MS + 60_000,
+  scheduledTickAt: NOW_MS + 60_000,
+  fleetBrake: {
+    enabled: true,
+    empty_streak: 0,
+    empty_streak_threshold: 5,
+    streak_anchor_ts: null,
+    cooldown_until: null,
+    error_streak: 0,
+    error_streak_threshold: 3,
+    error_paused_until: null,
+    bypass_count: 0,
+    freshness_bypass_cap: 3,
+    window_outcomes: { headway: 0, silent: 0, error: 0, busy: 0 },
+    window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+  },
   budget: {
     max_wakes_per_window: 6,
     window_ms: 24 * 60 * 60_000,
+    window_started_at: NOW_MS - 24 * 60 * 60_000,
     used_in_current_window: 4,
     reserved_contemplative_wakes_per_window: 2,
     contemplative_used_in_current_window: 3,
@@ -90,6 +109,7 @@ const FIXTURE_AUTONOMY_SCHEDULER_STATE: NonNullable<
         trigger_name: "scheduled_reflection",
         wake_count: 3,
         in_flight: 0,
+        in_flight_started_at: [],
         outcome_counts: {
           headway: 1,
           silent: 2,
@@ -101,6 +121,7 @@ const FIXTURE_AUTONOMY_SCHEDULER_STATE: NonNullable<
         trigger_name: "goal_followup_due",
         wake_count: 1,
         in_flight: 0,
+        in_flight_started_at: [],
         outcome_counts: {
           headway: 0,
           silent: 0,
@@ -475,10 +496,16 @@ function makeContext(overrides: Partial<DeliberationContext> = {}): Deliberation
     retrievalConfidence: {
       overall: 0.74,
       evidenceStrength: 0.7,
-      coverage: 0.6,
+      coverage: 0.4,
       sourceDiversity: 0.5,
       contradictionPresent: true,
       sampleSize: 2,
+      semanticSampleSize: 0,
+      coverageExpected: 5,
+      diversitySources: 1,
+      diversitySampleSize: 2,
+      evidenceEpisodeStrength: 0.55,
+      evidenceSemanticStrength: 0.15,
     },
     contradictionRouting: {
       contradictions: [
@@ -639,11 +666,43 @@ function makeContext(overrides: Partial<DeliberationContext> = {}): Deliberation
           ts: NOW_MS - 800,
         },
       ],
+      // Three shapes, because the rendered line differs by shape and only the
+      // first was pinned here: an entry whose write kept no commitment field,
+      // and the two labeled forms -- one naming a row still in this turn's
+      // active draw (`makeCommitment`), one naming a row that has left it. The
+      // labeled line is what the ring actually writes now, so pinning only the
+      // bare shape left the form that reaches the page uncovered by any golden.
       recentRegenerations: [
         {
           turnId: "turn_fixture_regenerated",
           mechanism: "commitment_guard_regeneration",
           ts: NOW_MS - 700,
+        },
+        {
+          turnId: "turn_fixture_regenerated_live",
+          mechanism: "commitment_guard_regeneration",
+          ts: NOW_MS - 600,
+          commitments: [
+            {
+              id: "cmt_aaaaaaaaaaaaaaaa",
+              kind: "boundary",
+              critical_domain: "privacy",
+              directive_family: "prompt_surface_privacy",
+            },
+          ],
+        },
+        {
+          turnId: "turn_fixture_regenerated_ended",
+          mechanism: "commitment_guard_regeneration",
+          ts: NOW_MS - 500,
+          commitments: [
+            {
+              id: "cmt_bbbbbbbbbbbbbbbb",
+              kind: "participant_preference",
+              critical_domain: "explicit_no_disclosure",
+              directive_family: "session_history_opacity",
+            },
+          ],
         },
       ],
       autonomySchedulerState: FIXTURE_AUTONOMY_SCHEDULER_STATE,

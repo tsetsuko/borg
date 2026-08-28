@@ -634,7 +634,7 @@ function renderCommitmentDigestText(input: {
   return [
     `<borg_planner_commitment_digest rows_total="${input.commitmentCount}" target_tokens="${PLANNER_COMMITMENT_TARGET_TOKENS}" advisory_excerpt_budget_chars="${input.advisoryExcerptBudget}" critical_overflow="${input.criticalOverflow}">`,
     "  <interpretation>This is the complete globally assembled commitment index. Critical directives are exact and never truncated; advisory directives are visibly mechanical excerpts when long, never summaries. Scope fields are disclosure/provenance, not recall gates.</interpretation>",
-    "  <field_legend>c row: i=id, s=status, ec=enforcement_class, cd=critical_domain, k=kind, t=type, cp=closure_pressure_relevance, p=priority, cat=created_at, ca=created_age, ra=reinforced_age, xa=expires_age, dc=disclosure_class, oa=origin_audience, pt=private_to, pub=public_to, to=made_to, aud=restricted_audience, about=about_entity, by=committed_by_entity_id, ex=directive_exact, shape=directive_excerpt_shape, r=directive_rendered_chars, n=directive_total_chars, e=directive_elided_chars, f=directive_family, d=directive.</field_legend>",
+    "  <field_legend>c row: i=id, s=status, ec=enforcement_class, cd=critical_domain, k=kind, t=type, cp=closure_pressure_relevance, p=priority, cat=created_at, ca=created_age, ra=reinforced_age, xa=expires_age, dc=disclosure_class, oa=origin_audience, pt=private_to, pub=public_to, to=made_to, aud=restricted_audience, about=about_entity, by=committed_by_entity_id, ex=directive_exact, shape=directive_excerpt_shape, r=directive_rendered_chars, n=directive_total_chars, e=directive_elided_chars, f=directive_family, d=directive. ex reports elision only, not byte-fidelity of the printed attribute: d and f are XML-attribute-encoded, so quotes, ampersands, angle brackets, newlines and tabs print as entities while r/n/e count the stored string before encoding; that encoder emits no backslash, so a backslash inside d is stored content rather than an artifact of this render; and on a critical row ex is true by construction rather than by measurement.</field_legend>",
     ...input.rows.map((row) => `  ${row}`),
     "  <omitted_count>0</omitted_count>",
     "</borg_planner_commitment_digest>",
@@ -1521,11 +1521,10 @@ function renderPlannerAuthorityDirectiveIndexText(input: {
   excerptBudget: number;
 }): string {
   return [
-    `<creator_directive_index rows_total="${input.rows.length}" payload_excerpt_budget_chars="${input.excerptBudget}" complete="true">`,
-    "  <interpretation>This index is complete. Excerpts are mechanical head+tail cuts, never summaries. dh=pk facts guide orientation but are not proactively disclosed; do not deny or feign ignorance, and follow mp if raised. dh=po rules govern behavior but are never quoted, revealed, confirmed, or implied as creator instructions unless separately authorized. dh=b enforces confidentiality without revealing, confirming, denying, or implying the private matter.</interpretation>",
+    `<creator_directive_index rows_total_for_current_audience="${input.rows.length}" rows_omitted_after_current_audience_scope="0" payload_excerpt_budget_chars="${input.excerptBudget}" complete_for_current_audience="true">`,
+    "  <interpretation>This index is complete for the current audience: it lists every active directive this audience's disclosure policy admits. Directives scoped away from this audience are omitted, so absence here is not evidence one does not exist. Excerpts are mechanical head+tail cuts, never summaries. dh=pk facts guide orientation but are not proactively disclosed; do not deny or feign ignorance, and follow mp if raised. dh=po rules govern behavior but are never quoted, revealed, confirmed, or implied as creator instructions unless separately authorized. dh=b enforces confidentiality without revealing, confirming, denying, or implying the private matter.</interpretation>",
     "  <field_legend>d: i=alias; sc c=content, pk=private_knowledge, po=private_operation, b=boundary; k si=self_identity, sf=subject_fact, db=disclosure_boundary, rp=response_policy, ri=routing_instruction; dh a=current-audience content, pk/po/b=the disclosure handling above; sps=scope policy status; when sps=exact, di=directive id, cb=created-by entity, os=origin session, cs=content scope, ae/xe=allowed/excluded entity ids, smk=subject-may-know, dab=denied-audience behavior, as=activation scope, aae/axe=activation allowed/excluded ids; sk/sl/sx=subject kind/label/excerpt shape; ss=semantic_slot; mp=exact mention_policy; pk sv=semantic_value, cf=canonical_fact, op=operational_directive, bp=boundary_prompt; px f|h|m:included/total; v=payload; [ELIDED]=visible cut.</field_legend>",
     ...input.rows.map((row) => `  ${row}`),
-    "  <omitted_count>0</omitted_count>",
     "</creator_directive_index>",
   ].join("\n");
 }
@@ -1557,7 +1556,9 @@ function renderPlannerAuthorityDirectives(
 ): RenderedAuthorityDirectives {
   if (briefing === null || briefing === undefined || briefing.directives.length === 0) {
     return {
-      lines: ['  <creator_directive_index status="none" complete="true" />'],
+      lines: [
+        '  <creator_directive_index status="none" complete_for_current_audience="true" rows_total_for_current_audience="0" rows_omitted_after_current_audience_scope="0" />',
+      ],
       rowCount: 0,
       truncationCount: 0,
       excerptBudget: PLANNER_AUTHORITY_DIRECTIVE_MAX_EXCERPT_CHARS,
@@ -1608,7 +1609,7 @@ function renderAuthorityAndDirectiveContext(context: DeliberationContext): Rende
   const authorityRows = renderTrustedAuthorityRows(creatorContext);
   const renderText = (directives: RenderedAuthorityDirectives): string =>
     [
-      `<borg_planner_authority_context target_tokens="${PLANNER_AUTHORITY_TARGET_TOKENS}" directives_total="${context.creatorDirectiveBriefing?.directives.length ?? 0}" directives_rendered="${directives.rowCount}" directive_excerpt_budget_chars="${directives.excerptBudget}">`,
+      `<borg_planner_authority_context target_tokens="${PLANNER_AUTHORITY_TARGET_TOKENS}" directives_total_for_current_audience="${context.creatorDirectiveBriefing?.directives.length ?? 0}" directives_rendered="${directives.rowCount}" directive_excerpt_budget_chars="${directives.excerptBudget}">`,
       `  <audience_label>${escapeXmlText(audienceLabel.text)}</audience_label>`,
       `  <audience_entity_id>${escapeXmlText(context.audienceEntityId ?? "none")}</audience_entity_id>`,
       `  <is_self_audience>${context.isSelfAudience === true}</is_self_audience>`,
@@ -1886,7 +1887,10 @@ function renderTurnStateAutonomyScheduler(
       ...summary.split("\n").map((line) => `    ${escapeXmlText(line)}`),
       "  </autonomy_scheduler_state>",
     ],
-    rowCount: 2 + schedulerState.budget.wakes_in_current_window_by_trigger.length,
+    rowCount:
+      2 +
+      schedulerState.budget.wakes_in_current_window_by_trigger.length +
+      schedulerState.fleetBrake.window_error_reasons.reasons.length,
     truncationCount: 0,
     omissionCount: 0,
   };

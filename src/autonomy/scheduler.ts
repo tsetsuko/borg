@@ -692,6 +692,7 @@ export class AutonomyScheduler {
           trigger_name: wake.trigger_name,
           wake_count: 0,
           in_flight: 0,
+          in_flight_started_at: [],
           outcome_counts: {
             headway: 0,
             silent: 0,
@@ -705,6 +706,9 @@ export class AutonomyScheduler {
       group.wake_count += 1;
       if (wake.outcome === null) {
         group.in_flight += 1;
+        // listSince returns ts DESC; the description states oldest first so a
+        // stuck row keeps a stable leading position across reads.
+        group.in_flight_started_at.unshift(wake.ts);
       } else {
         group.outcome_counts[wake.outcome] += 1;
       }
@@ -716,13 +720,22 @@ export class AutonomyScheduler {
       return group === undefined ? [] : [group];
     });
 
+    const scheduledTickAt = this.describeScheduledTickAt(nowMs);
+
     return {
+      observed_at: nowMs,
       enabled: this.options.enabled,
+      tick_in_flight: this.activeTick !== null,
       interval_ms: this.options.intervalMs,
-      next_tick_at: this.describeNextTickAt(nowMs),
+      // Floored to the read so a "next evaluation" surface never shows a past
+      // instant. The floor is where the overdue amount used to be lost; it is
+      // preserved unfloored on the next line rather than recomputed downstream.
+      next_tick_at: scheduledTickAt === null ? null : Math.max(scheduledTickAt, nowMs),
+      scheduled_tick_at: scheduledTickAt,
       budget: {
         max_wakes_per_window: this.options.maxWakesPerWindow,
         window_ms: this.options.budgetWindowMs,
+        window_started_at: budgetCutoff,
         used_in_current_window: usedInCurrentWindow,
         reserved_contemplative_wakes_per_window: Math.min(
           this.options.maxWakesPerWindow,
@@ -740,27 +753,46 @@ export class AutonomyScheduler {
       fleet_brake: {
         enabled: this.fleetBrakeOptions.enabled,
         empty_streak: fleetBrakeMetadata.empty_streak,
+        empty_streak_threshold: this.fleetBrakeOptions.emptyStreakThreshold,
         streak_anchor_ts:
           fleetBrakeMetadata.streak_anchor_ts === 0 ? null : fleetBrakeMetadata.streak_anchor_ts,
         cooldown_until: fleetBrakeCooldownUntilMs(fleetBrakeMetadata, this.fleetBrakeOptions),
         error_streak: fleetBrakeMetadata.error_streak,
+        error_streak_threshold: this.fleetBrakeOptions.errorStreakThreshold,
         error_paused_until: fleetBrakeErrorPausedUntilMs(
           fleetBrakeMetadata,
           this.fleetBrakeOptions,
         ),
         bypass_count: fleetBrakeMetadata.bypass_count,
+        freshness_bypass_cap: this.fleetBrakeOptions.freshnessBypassCap,
         window_outcomes: {
           headway: this.options.wakeRepository.countSince(budgetCutoff, { outcome: "headway" }),
           silent: this.options.wakeRepository.countSince(budgetCutoff, { outcome: "silent" }),
           error: this.options.wakeRepository.countSince(budgetCutoff, { outcome: "error" }),
           busy: this.options.wakeRepository.countSince(budgetCutoff, { outcome: "busy" }),
         },
+        // Same rows as window_outcomes.error, one level down. The scheduler
+        // formats the failure that ends a wake and writes it to the stream; it
+        // used to drop it before this table, leaving `error=N` as a count whose
+        // discriminator had been computed and discarded a line earlier -- a
+        // provider outage and N distinct faults printed identically.
+        window_error_reasons: this.options.wakeRepository.summarizeOutcomeDetailsSince(
+          budgetCutoff,
+          "error",
+        ),
       },
       sources,
     };
   }
 
-  private describeNextTickAt(nowMs: number): number | null {
+  // When the tick the interval handle is counting toward is due, unfloored. The
+  // handle is what actually fires; this is a derivation from the anchor for
+  // description only, and it can sit in the past of `nowMs` -- an interval that
+  // is behind (event-loop pressure, a long-running tick) has a due time that has
+  // already passed. That difference is the only place "how late is the loop" is
+  // expressible, which is why the floor is applied at the field that needs it
+  // rather than here.
+  private describeScheduledTickAt(nowMs: number): number | null {
     if (this.intervalHandle === null) {
       return null;
     }
@@ -770,7 +802,7 @@ export class AutonomyScheduler {
         ? (this.lastTickTs ?? this.intervalStartedTs ?? nowMs)
         : Math.max(this.lastTickTs, this.intervalStartedTs);
 
-    return Math.max(tickAnchor + this.options.intervalMs, nowMs);
+    return tickAnchor + this.options.intervalMs;
   }
 
   private async tickOnce(): Promise<TickResult> {
@@ -925,7 +957,7 @@ export class AutonomyScheduler {
             errorCount += 1;
             sourceErrorCount += 1;
             const outcomeSummary = `Autonomous preparation failed: ${preparedEvent.toolError}`;
-            this.options.wakeRepository.recordOutcome(wakeRecord.id, "error");
+            this.options.wakeRepository.recordOutcome(wakeRecord.id, "error", outcomeSummary);
             this.consumeFleetFreshnessBypass(
               dueEvent,
               fleetAdmission.bypassKind,
@@ -965,7 +997,7 @@ export class AutonomyScheduler {
             sourceErrorCount += 1;
             const preparationError = new AutonomySourcePreparationError(dueEvent.sourceName, error);
             const outcomeSummary = `Autonomous source preparation failed: ${formatError(error)}`;
-            this.options.wakeRepository.recordOutcome(wakeRecord.id, "error");
+            this.options.wakeRepository.recordOutcome(wakeRecord.id, "error", outcomeSummary);
             this.consumeFleetFreshnessBypass(
               dueEvent,
               fleetAdmission.bypassKind,
@@ -1025,10 +1057,10 @@ export class AutonomyScheduler {
 
             if (busy) {
               busySkipped += 1;
-              this.options.wakeRepository.recordOutcome(wakeRecord.id, "busy");
+              this.options.wakeRepository.recordOutcome(wakeRecord.id, "busy", outcomeSummary);
             } else {
               errorCount += 1;
-              this.options.wakeRepository.recordOutcome(wakeRecord.id, "error");
+              this.options.wakeRepository.recordOutcome(wakeRecord.id, "error", outcomeSummary);
               if (isGlobalCircuitFailure(error)) {
                 this.updateFleetBrakeAfterGlobalError(
                   dueEvent,

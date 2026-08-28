@@ -6,8 +6,14 @@ import {
 } from "../../test-support/factories/memory.js";
 import { createEntityId } from "../../util/ids.js";
 import {
+  MEMORY_DISCLOSURE_INTERNAL_USE_NOTE,
+  publicMemoryDisclosureLabel,
+  selfPrivateMemoryDisclosureLabel,
+} from "../../retrieval/index.js";
+import {
   actionSalienceClass,
   allocateActionThreadRenderSlots,
+  renderOlderActionThreadsSummary,
   type ActionThread,
   type ActionThreadWithSalience,
 } from "./action-threads.js";
@@ -233,5 +239,107 @@ describe("allocateActionThreadRenderSlots", () => {
       ...Array.from({ length: 5 }, () => "borg_memory_tracking_action"),
       "completed_recent",
     ]);
+  });
+});
+
+describe("renderOlderActionThreadsSummary", () => {
+  const summaryInput = (overrides: {
+    consideredRecordCount: number;
+    sourceRecordLimit: number;
+    sourceRecordTotal?: number | null;
+  }) => ({
+    groups: [
+      {
+        audienceScope: "global" as const,
+        salienceClass: "completed_recent" as const,
+        threads: [makeCompletedThread({ audienceEntityId: QUIET_AUDIENCE_A, updatedAt: 10 })],
+        disclosureLabel: selfPrivateMemoryDisclosureLabel([QUIET_AUDIENCE_A]),
+      },
+    ],
+    renderedThreadCount: 1,
+    threadsBuiltCount: 2,
+    salienceDroppedThreadCount: 0,
+    sourceRecordTotal: 8,
+    ...overrides,
+  });
+
+  // The floor is a measurement, not an enumeration: it must move with the store rather than name
+  // a condition. Two totals over one draw is what separates a live figure from a frozen token --
+  // a reader holding a single page can only tell the difference if the field can differ.
+  it("counts the records below the draw floor instead of naming the condition", () => {
+    const saturated = renderOlderActionThreadsSummary(
+      summaryInput({ consideredRecordCount: 256, sourceRecordLimit: 256, sourceRecordTotal: 2706 }),
+    );
+    const larger = renderOlderActionThreadsSummary(
+      summaryInput({ consideredRecordCount: 256, sourceRecordLimit: 256, sourceRecordTotal: 2707 }),
+    );
+    const exhausted = renderOlderActionThreadsSummary(
+      summaryInput({ consideredRecordCount: 4, sourceRecordLimit: 256, sourceRecordTotal: 4 }),
+    );
+
+    expect(saturated).toContain("records_below_draw_floor=2450");
+    expect(larger).toContain("records_below_draw_floor=2451");
+    expect(exhausted).toContain("records_below_draw_floor=0");
+    expect(saturated).not.toContain("unknown_count");
+  });
+
+  // The floor is the stated difference of two printed totals, never an independent count of the
+  // rows below it. Printing it bare would let a derived figure pose as its own witness.
+  it("states the floor's derivation beside it", () => {
+    const summary = renderOlderActionThreadsSummary(
+      summaryInput({ consideredRecordCount: 256, sourceRecordLimit: 256, sourceRecordTotal: 2706 }),
+    );
+
+    expect(summary).toContain(
+      "records_considered=256 records, source_record_limit=256, source_record_total=2706; " +
+        "records_below_draw_floor is that total minus records_considered, not a separate count",
+    );
+  });
+
+  // A repository that cannot count says so. Falling back to 0 would claim the draw saw everything.
+  it("names an unavailable source total instead of implying an empty floor", () => {
+    const summary = renderOlderActionThreadsSummary(
+      summaryInput({ consideredRecordCount: 256, sourceRecordLimit: 256, sourceRecordTotal: null }),
+    );
+
+    expect(summary).toContain("records_below_draw_floor=unknown_count_source_total_unavailable");
+    expect(summary).toContain("source_record_total=unavailable");
+  });
+
+  // The internal-use sentence is byte-identical on every non-public label, so it is stated once
+  // for the section instead of once per group: this section truncates from the tail, and the
+  // copies were spending the space the surviving group lines need.
+  it("states the internal-use note once for the section, not per group", () => {
+    const summary = renderOlderActionThreadsSummary(
+      summaryInput({ consideredRecordCount: 4, sourceRecordLimit: 256 }),
+    );
+    const noteCount = summary.split(MEMORY_DISCLOSURE_INTERNAL_USE_NOTE).length - 1;
+    const groupLine = summary.split("\n").find((line) => line.startsWith("- audience_scope="));
+
+    expect(noteCount).toBe(1);
+    expect(summary.indexOf(MEMORY_DISCLOSURE_INTERNAL_USE_NOTE)).toBeLessThan(
+      summary.indexOf("- audience_scope="),
+    );
+    // What varies per group -- the class and the private-to binding -- stays on the group line.
+    expect(groupLine).toContain(
+      `disclosure_label=disclosure_class=self_private origin_audience=${QUIET_AUDIENCE_A} private-to=${QUIET_AUDIENCE_A} recent_samples=`,
+    );
+  });
+
+  it("omits the note when no group is non-public", () => {
+    const summary = renderOlderActionThreadsSummary({
+      ...summaryInput({ consideredRecordCount: 4, sourceRecordLimit: 256 }),
+      groups: [
+        {
+          audienceScope: "global" as const,
+          salienceClass: "completed_recent" as const,
+          threads: [makeCompletedThread({ audienceEntityId: QUIET_AUDIENCE_A, updatedAt: 10 })],
+          disclosureLabel: publicMemoryDisclosureLabel(),
+        },
+      ],
+    });
+
+    expect(summary).not.toContain(MEMORY_DISCLOSURE_INTERNAL_USE_NOTE);
+    expect(summary).toContain("disclosure_label=disclosure_class=public recent_samples=");
   });
 });

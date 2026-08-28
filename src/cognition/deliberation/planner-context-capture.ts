@@ -451,18 +451,36 @@ function projectTurnMechanismEvidence(value: DeliberationContext["turnMechanismE
       turnId: entry.turnId,
       mechanism: entry.mechanism,
       ts: entry.ts,
+      ...(entry.commitments === undefined
+        ? {}
+        : { commitments: entry.commitments.map((commitment) => ({ ...commitment })) }),
     })),
     ...(value.autonomySchedulerState === undefined
       ? {}
       : {
           autonomySchedulerState: {
             observedAt: value.autonomySchedulerState.observedAt,
+            enabled: value.autonomySchedulerState.enabled,
+            tickInFlight: value.autonomySchedulerState.tickInFlight,
+            nextTickAt: value.autonomySchedulerState.nextTickAt,
+            scheduledTickAt: value.autonomySchedulerState.scheduledTickAt,
+            fleetBrake: {
+              ...value.autonomySchedulerState.fleetBrake,
+              window_outcomes: { ...value.autonomySchedulerState.fleetBrake.window_outcomes },
+              window_error_reasons: {
+                ...value.autonomySchedulerState.fleetBrake.window_error_reasons,
+                reasons: value.autonomySchedulerState.fleetBrake.window_error_reasons.reasons.map(
+                  (reason) => ({ ...reason }),
+                ),
+              },
+            },
             budget: {
               ...value.autonomySchedulerState.budget,
               wakes_in_current_window_by_trigger:
                 value.autonomySchedulerState.budget.wakes_in_current_window_by_trigger.map(
                   (group) => ({
                     ...group,
+                    in_flight_started_at: [...group.in_flight_started_at],
                     outcome_counts: { ...group.outcome_counts },
                   }),
                 ),

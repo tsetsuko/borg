@@ -147,7 +147,14 @@ const STABLE_AUTHORITY_FRAMING = [
 ].join(" ");
 
 const TERMINAL_ADVISORY_COMMITMENT_EXCERPT_CHARS = 480;
-const TERMINAL_CREATOR_DIRECTIVE_FACT_EXCERPT_CHARS = 480;
+// The head+tail cut is deliberately meaning-blind (see `buildHeadTailPlannerExcerpt`), so whatever
+// sits in the middle of a fact is what disappears. At 480 that was routine rather than exceptional:
+// 13 of 112 active directives exceeded it, and a directive row costs ~1,240 chars to render of
+// which the fact was capped at 417 -- the structural scope attributes, most of them at their
+// defaults, outweighed the payload roughly three to one. Raising the cap above the longest fact an
+// operator has written (1,132) costs ~2,715 chars across the whole directive set and makes elision
+// the exception. Revisit by measuring the distribution again, not by trimming to fit one row.
+const TERMINAL_CREATOR_DIRECTIVE_FACT_EXCERPT_CHARS = 1_200;
 const TERMINAL_CREATOR_DIRECTIVE_LABEL_EXCERPT_CHARS = 240;
 
 function escapeXmlAttribute(value: string): string {
@@ -399,6 +406,16 @@ function renderLedgerOnlyCommitmentRecord(entry: EvidenceLedgerEntry): {
 // render, not a report on the store -- reading `none` across all rows says nothing
 // about whether the retirement paths ever fire. complete="true" and rows_total are
 // likewise statements about the active set, not about the commitments table.
+//
+// rows_total here is NOT a union across two scopes: both arms come from the same array.
+// evidenceLedger.audienceStanding.commitmentEntries is a straight 1:1 map of the very
+// applicableCommitments this render already walks (buildCommitmentEntries in
+// evidence-ledger/audience-standing.ts), so every ledger entry matches a canonical row
+// by id and ledgerOnlyRendered is empty by construction. ledger_only_rows is a
+// divergence check on two inputs that are currently one, not a second population's
+// contribution -- reading 0 there says nothing about what an audience-scoped standing
+// ledger would add, because nothing in this path can add anything. rows_total therefore
+// equals canonical_rows on every turn, and neither is a second scope.
 function renderCommitments(context: DeliberationContext): RenderedTerminalSection {
   const commitments = context.applicableCommitments ?? [];
   const ledgerEntries = context.evidenceLedger?.audienceStanding?.commitmentEntries ?? [];
@@ -422,8 +439,8 @@ function renderCommitments(context: DeliberationContext): RenderedTerminalSectio
     "terminal_durable_global",
     [
       `<borg_terminal_commitments complete="true" rows_total="${rows.length}" canonical_rows="${canonicalRendered.length}" ledger_only_rows="${ledgerOnlyRendered.length}" advisory_excerpt_budget_chars="${TERMINAL_ADVISORY_COMMITMENT_EXCERPT_CHARS}">`,
-      "  <interpretation>One row per globally assembled commitment: canonical records first, then any distinct standing-ledger-only records. Critical directives are exact. A long advisory directive is a visibly annotated mechanical head+tail cut carrying both included and total source-character counts, never a clean-looking summary. Entity scope and disclosure are exact provenance and handling constraints, never audience-dependent recall selection. Relative ages are intentionally separated into the turn-local overlay keyed by id.</interpretation>",
-      "  <field_legend>Absolute record fields and the semantic field-set union of canonical scope/detail and standing-ledger rows are carried by each durable row plus its ID-keyed turn overlay. directive_exact, directive_excerpt_shape, directive_included_chars, and directive_total_chars state whether the directive is complete and, when cut, exactly how much source text is present.</field_legend>",
+      "  <interpretation>One row per commitment: canonical records first, then any standing-ledger record that matched none of them by id. Both arms are built from the same active-commitment draw -- the standing ledger maps that draw one-for-one -- so ledger_only_rows is 0 by construction and rows_total always equals canonical_rows. A non-zero ledger_only_rows would mean the two inputs had diverged; a zero is not evidence that an audience-scoped ledger had nothing to add, because this path cannot receive such a contribution. Critical directives are exact. A long advisory directive is a visibly annotated mechanical head+tail cut carrying both included and total source-character counts, never a clean-looking summary. Entity scope and disclosure are exact provenance and handling constraints, never audience-dependent recall selection. Relative ages are intentionally separated into the turn-local overlay keyed by id.</interpretation>",
+      "  <field_legend>Absolute record fields and the semantic field-set union of canonical scope/detail and standing-ledger rows are carried by each durable row plus its ID-keyed turn overlay. directive_exact, directive_excerpt_shape, directive_included_chars, and directive_total_chars state whether the directive is complete and, when cut, exactly how much source text is present. directive_exact reports elision only, not byte-fidelity of the printed attribute: values here are XML-attribute-encoded, so quotes, ampersands, angle brackets, newlines and tabs print as entities and the printed attribute runs longer than the counts beside it, which measure the stored string before encoding. That encoder emits no backslash, so a backslash inside a directive is stored content rather than an artifact of this render. On a critical row directive_exact is true by construction rather than by measurement, since critical directives are never cut.</field_legend>",
       ...rows.map((row) => `  ${row}`),
       "  <omitted_count>0</omitted_count>",
       "</borg_terminal_commitments>",
@@ -684,7 +701,7 @@ function renderCompactCreatorDirectives(
   if (briefing === null || briefing === undefined || briefing.directives.length === 0) {
     return {
       lines: [
-        '  <creator_directive_index complete="true" rows_total="0"><omitted_count>0</omitted_count></creator_directive_index>',
+        '  <creator_directive_index status="none" complete_for_current_audience="true" rows_total_for_current_audience="0" rows_omitted_after_current_audience_scope="0" />',
       ],
       rowCount: 0,
       truncationCount: 0,
@@ -698,10 +715,9 @@ function renderCompactCreatorDirectives(
   });
   return {
     lines: [
-      `  <creator_directive_index complete="true" rows_total="${rows.length}" fact_excerpt_budget_chars="${TERMINAL_CREATOR_DIRECTIVE_FACT_EXCERPT_CHARS}">`,
-      "    <interpretation>Boundary and operational directives are exact. Fact-bearing payloads may be visibly annotated mechanical head+tail excerpts with included and total source-character counts. Every structural disclosure and activation scope field is exact; none is inferred from payload language.</interpretation>",
+      `  <creator_directive_index complete_for_current_audience="true" rows_total_for_current_audience="${rows.length}" rows_omitted_after_current_audience_scope="0" fact_excerpt_budget_chars="${TERMINAL_CREATOR_DIRECTIVE_FACT_EXCERPT_CHARS}">`,
+      "    <interpretation>This index is complete for the current audience: it lists every active directive this audience's disclosure policy admits. Directives scoped away from this audience are omitted, so absence here is not evidence one does not exist. Boundary and operational directives are exact. Fact-bearing payloads may be visibly annotated mechanical head+tail excerpts with included and total source-character counts. Every structural disclosure and activation scope field is exact; none is inferred from payload language.</interpretation>",
       ...rows.map((row) => `    ${row}`),
-      "    <omitted_count>0</omitted_count>",
       "  </creator_directive_index>",
     ],
     rowCount: rows.length,
@@ -947,25 +963,46 @@ function renderCompleteStandingMemoryIndexes(
     standing?.recentLivedExperienceEntries ?? [],
     "cross_session_row",
   );
+  // Each group states the predicate of its OWN draw, because the groups do not share
+  // one -- and because a draw's scope is not recoverable from the rows it produced.
+  // Rows carrying foreign origin_audience labels are equally consistent with a global
+  // draw and with a scoped draw that kept foreign provenance: origin_audience records
+  // where a memory came from, which is a different axis from which assembly selected
+  // it. So the predicate is named here rather than left to be inferred from contents.
+  //
+  // relational_slots (context.relationalSlots) and relational_standing
+  // (audienceStanding.relationalEntries) both list per active participant, filtering on
+  // subject_entity_id, and fall back to an unfiltered list when the roster is empty --
+  // hence a computed value rather than a fixed one. social_standing is a global
+  // observed-event draw (listRecentGlobal + listRecurringGlobal); current participants
+  // add a by-speaker lane and a score boost, which widen and rank but never filter.
+  // cross_session_entries is the self's own cross-session activity in a time window;
+  // the current audience enters it only as a label on the return-silence row. Neither
+  // of the last two is audience-scoped, and saying they were was wrong in the direction
+  // that understates what the entity is holding.
+  const relationalDrawScope =
+    (context.activeParticipants ?? []).length === 0 ? "global" : "active_participant_subjects";
   const groups = [
-    { tag: "relational_slots", rows: relationalSlots.rows },
-    { tag: "relational_standing", rows: relationalStanding.rows },
-    { tag: "social_standing", rows: socialStanding.rows },
-    { tag: "cross_session_entries", rows: crossSession.rows },
+    { tag: "relational_slots", rows: relationalSlots.rows, drawScope: relationalDrawScope },
+    { tag: "relational_standing", rows: relationalStanding.rows, drawScope: relationalDrawScope },
+    { tag: "social_standing", rows: socialStanding.rows, drawScope: "global" },
+    { tag: "cross_session_entries", rows: crossSession.rows, drawScope: "global" },
   ];
   const rowCount = groups.reduce((sum, group) => sum + group.rows.length, 0);
   return terminalSection(
     "standing_memory_indexes",
     "terminal_turn_context",
     [
-      `<borg_terminal_standing_memory_indexes complete="true" rows_total="${rowCount}" standing_cadence_due="${standing?.renderRecentLivedExperience === true}">`,
-      "  <interpretation>Complete membership indexes for relational slots, relational standing, social/observed-event memory, and cross-session lived entries. Payload fields are mechanical head+tail excerpts; an excerpt is never a summary. Disclosure labels survive on every row and govern mention, not recall.</interpretation>",
-      ...groups.flatMap((group) => [
-        `  <${group.tag} complete="true" rows_total="${group.rows.length}">`,
-        ...group.rows.map((row) => `    ${row}`),
-        "    <omitted_count>0</omitted_count>",
-        `  </${group.tag}>`,
-      ]),
+      `<borg_terminal_standing_memory_indexes rows_total_across_groups="${rowCount}" standing_cadence_due="${standing?.renderRecentLivedExperience === true}">`,
+      "  <interpretation>Complete membership indexes for relational slots, relational standing, social/observed-event memory, and cross-session lived entries. The groups are drawn by different predicates, so each carries draw_scope naming its own: active_participant_subjects means the draw filtered on subject_entity_id against the current roster; global means it did not filter by audience, participant, or session at all. Scope is not inferable from the rows -- a row whose origin_audience is elsewhere is consistent with either -- so read draw_scope, not the contents. Where draw_scope is global, the current audience may still rank or annotate; ranking is never a filter. rows_total is per group and rows_total_across_groups is their sum, which is therefore not a total at any single scope. Payload fields are mechanical head+tail excerpts; an excerpt is never a summary. Disclosure labels survive on every row and govern mention, not recall.</interpretation>",
+      ...groups.flatMap((group) => {
+        return [
+          `  <${group.tag} complete="true" rows_total="${group.rows.length}" draw_scope="${group.drawScope}">`,
+          ...group.rows.map((row) => `    ${row}`),
+          "    <omitted_count>0</omitted_count>",
+          `  </${group.tag}>`,
+        ];
+      }),
       "  <omitted_count>0</omitted_count>",
       "</borg_terminal_standing_memory_indexes>",
     ].join("\n"),

@@ -4081,6 +4081,7 @@ describe("AutonomyScheduler", () => {
             trigger_name: "scheduled_wake",
             wake_count: 2,
             in_flight: 0,
+            in_flight_started_at: [],
             outcome_counts: {
               headway: 1,
               silent: 1,
@@ -4092,6 +4093,11 @@ describe("AutonomyScheduler", () => {
             trigger_name: "commitment_revoked",
             wake_count: 3,
             in_flight: 1,
+            // The fire stamp of the row counted by in_flight. Nothing ever
+            // writes an outcome for a row whose bookkeeping threw, so the count
+            // alone cannot tell a permanent orphan from a healthy transient --
+            // only a stamp that repeats across two reads can.
+            in_flight_started_at: [980_000],
             outcome_counts: {
               headway: 0,
               silent: 0,
@@ -4307,21 +4313,27 @@ describe("AutonomyScheduler", () => {
     scheduler.start();
     await expect(scheduler.describe()).resolves.toMatchObject({
       next_tick_at: 1_005_000,
+      scheduled_tick_at: 1_005_000,
     });
     await scheduler.tick();
     clock.advance(20_000);
+    // The tick came due at 1_005_000 and the read is at 1_020_000: next_tick_at floors to the read
+    // and loses the 15s the loop is behind by, scheduled_tick_at keeps it.
     await expect(scheduler.describe()).resolves.toMatchObject({
       next_tick_at: 1_020_000,
+      scheduled_tick_at: 1_005_000,
     });
     await scheduler.stop();
     await expect(scheduler.describe()).resolves.toMatchObject({
       next_tick_at: null,
+      scheduled_tick_at: null,
     });
 
     clock.advance(10_000);
     scheduler.start();
     await expect(scheduler.describe()).resolves.toMatchObject({
       next_tick_at: 1_035_000,
+      scheduled_tick_at: 1_035_000,
     });
   });
 

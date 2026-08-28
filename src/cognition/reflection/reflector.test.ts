@@ -195,6 +195,12 @@ function createRetrievalConfidence(
     sourceDiversity: overrides.sourceDiversity ?? 1,
     contradictionPresent: overrides.contradictionPresent ?? false,
     sampleSize: overrides.sampleSize ?? 3,
+    semanticSampleSize: overrides.semanticSampleSize ?? 0,
+    coverageExpected: overrides.coverageExpected ?? 3,
+    diversitySources: overrides.diversitySources ?? 3,
+    diversitySampleSize: overrides.diversitySampleSize ?? 3,
+    evidenceEpisodeStrength: overrides.evidenceEpisodeStrength ?? 0,
+    evidenceSemanticStrength: overrides.evidenceSemanticStrength ?? 0,
   };
 }
 

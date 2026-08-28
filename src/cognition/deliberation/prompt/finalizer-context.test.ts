@@ -262,7 +262,7 @@ describe("compact terminal finalizer context", () => {
     const excludedId = createEntityId();
     const exactOperation = `PRIVATE-OP-${"o".repeat(800)}-END`;
     const exactSlottedOperation = `SLOTTED-OP-${"s".repeat(800)}-END`;
-    const fact = `FACT-HEAD-${"f".repeat(900)}-FACT-TAIL`;
+    const fact = `FACT-HEAD-${"f".repeat(1_400)}-FACT-TAIL`;
     const scope = {
       directiveId: createCreatorDirectiveId(),
       createdByEntityId: creatorId,
@@ -333,8 +333,13 @@ describe("compact terminal finalizer context", () => {
         }),
       ),
     );
-    const factExcerpt = headTailPlannerExcerpt(fact, 480);
+    const factExcerpt = headTailPlannerExcerpt(fact, 1_200);
+    const directiveIndex =
+      rendered.match(/<creator_directive_index[\s\S]*?<\/creator_directive_index>/)?.[0] ?? "";
 
+    expect(directiveIndex).toContain('rows_total_for_current_audience="4"');
+    expect(directiveIndex).toContain('rows_omitted_after_current_audience_scope="0"');
+    expect(directiveIndex.match(/<creator_directive id_alias=/g)).toHaveLength(4);
     expect(rendered).toContain(`payload="${exactOperation}"`);
     expect(rendered).toContain(`payload="${exactSlottedOperation}"`);
     expect(rendered).toContain('payload_kind="operational_directive" payload_status="exact"');
@@ -344,9 +349,9 @@ describe("compact terminal finalizer context", () => {
     expect(rendered).toContain(`directive_id="${factDirectiveId}"`);
     expect(rendered).toContain('payload_status="head+tail_excerpt"');
     expect(rendered).toContain(`payload_included_chars="${factExcerpt.renderedChars}"`);
-    expect(rendered).toContain('payload_total_chars="920"');
+    expect(rendered).toContain(`payload_total_chars="${fact.length}"`);
     expect(rendered).toContain(
-      `HEAD+TAIL EXCERPT; rendered=${factExcerpt.renderedChars}/total=920`,
+      `HEAD+TAIL EXCERPT; rendered=${factExcerpt.renderedChars}/total=${fact.length}`,
     );
     expect(rendered).toContain('scope_status="exact"');
     expect(rendered).toContain('content_scope="allow_list"');
@@ -354,6 +359,14 @@ describe("compact terminal finalizer context", () => {
     expect(rendered).toContain(`excluded_entity_ids="${excludedId}"`);
     expect(rendered).toContain('mention_policy="never_mention"');
     expect(rendered).toContain('activation_scope="allow_list"');
+  });
+
+  it("keeps the empty directive index count explicitly audience-relative", () => {
+    const rendered = text(build(context({ creatorDirectiveBriefing: null })));
+
+    expect(rendered).toContain(
+      '<creator_directive_index status="none" complete_for_current_audience="true" rows_total_for_current_audience="0" rows_omitted_after_current_audience_scope="0" />',
+    );
   });
 
   it("marks historical directive scope fields unknown instead of exact-empty", () => {
@@ -779,8 +792,54 @@ describe("compact terminal finalizer context", () => {
       );
     }
     expect(turn).toContain("HEAD+TAIL EXCERPT");
+    // The observed-event and cross-session draws never filter by audience: they are
+    // global lists that the current participants rank, so draw_scope must not claim
+    // otherwise. With no roster the two relational draws are unfiltered as well.
+    for (const tag of [
+      "relational_slots",
+      "relational_standing",
+      "social_standing",
+      "cross_session_entries",
+    ]) {
+      expect(turn).toContain(`<${tag} complete="true" rows_total="1" draw_scope="global">`);
+    }
     expect(result.traceSummary.sections.standing_memory_indexes?.truncationCount).toBeGreaterThan(
       0,
+    );
+  });
+
+  it("names the relational draw as participant-scoped only when a roster constrains it", () => {
+    const alice = createEntityId();
+    const observed: EvidenceLedgerEntry = {
+      id: "observed-event",
+      source_type: "system_metadata",
+      session_scope: "prior_session",
+      actor: "memory",
+      trust_rank: 70,
+      text: "observed payload",
+    };
+    const turn = build(
+      context({
+        activeParticipants: [{ entityId: alice, displayName: "Alice", role: "audience" }],
+        evidenceLedger: {
+          ...ledger(),
+          audienceStanding: {
+            ...ledger().audienceStanding!,
+            observedEventIntrospectionEntries: [observed],
+          },
+        },
+      }),
+    ).system[3]!.text;
+    expect(turn).toContain(
+      '<relational_slots complete="true" rows_total="0" draw_scope="active_participant_subjects">',
+    );
+    expect(turn).toContain(
+      '<relational_standing complete="true" rows_total="0" draw_scope="active_participant_subjects">',
+    );
+    // A roster constrains the relational lists; it does not constrain these two.
+    expect(turn).toContain('<social_standing complete="true" rows_total="1" draw_scope="global">');
+    expect(turn).toContain(
+      '<cross_session_entries complete="true" rows_total="0" draw_scope="global">',
     );
   });
 
