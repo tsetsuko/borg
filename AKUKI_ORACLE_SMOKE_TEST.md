@@ -18,11 +18,26 @@ sudo install -d -o akuki -g akuki -m 0750 /var/lib/akuki/data/akuki-smoke
 sudoedit /etc/akuki/akuki-smoke.env
 ```
 
-Enter the secret only through `sudoedit`. Never put the real key in a command, the repository, or
-shell history. Put the following content in the file:
+Enter the secret only through `sudoedit`. Never put the real key or token in a command, the
+repository, or shell history. Choose exactly one authentication block.
+
+For direct Anthropic access use:
 
 ```sh
 ANTHROPIC_API_KEY=<secret>
+```
+
+For Tomek's explicitly approved AI proxy use only these transport settings:
+
+```sh
+ANTHROPIC_AUTH_TOKEN=<secret>
+ANTHROPIC_BASE_URL=https://<aiproxy-host>
+AKUKI_ANTHROPIC_PROXY=1
+```
+
+Then add the common smoke-test settings:
+
+```sh
 AKUKI_ANTHROPIC_ONLY=1
 AKUKI_DATA_DIR=/var/lib/akuki/data/akuki-smoke
 
@@ -43,8 +58,20 @@ The smoke guard runs before `Borg.open()`. It rejects a missing/non-`claude-*` m
 missing embedding endpoint/model/dimensions, invalid dimensions, and fake embeddings. In this
 mode no missing volume role is populated from the normal Kratos default. An explicitly set
 `AKUKI_ENDPOINT_MODEL=claude-...` may still populate the four volume roles; validation checks
-the final values Borg will read. It also rejects `ANTHROPIC_BASE_URL`, ensuring the Anthropic SDK
-uses its direct default endpoint rather than a proxy.
+the final values Borg will read.
+
+Authentication is deliberately unambiguous. Direct mode requires a non-empty
+`ANTHROPIC_API_KEY` and no `ANTHROPIC_BASE_URL`. Proxy mode requires
+`AKUKI_ANTHROPIC_PROXY=1`, a non-empty `ANTHROPIC_AUTH_TOKEN`, and an absolute HTTP(S)
+`ANTHROPIC_BASE_URL`; it rejects a simultaneously configured `ANTHROPIC_API_KEY`. Without the
+approval flag, any `ANTHROPIC_BASE_URL` is rejected. The guard also rejects the known Kratos
+hosts `inference.kratos.p4.int` and `inference.kratos.omc.hdp.it.p4`. Authentication secrets are
+never included in validation errors or logs. The legacy `AKUKI_ANTHROPIC_API_KEY` override is
+not accepted in this smoke mode, so it cannot silently supersede the selected standard auth
+variables.
+
+All five model ids must be supplied by the operator according to Tomek's proxy configuration.
+Do not probe the proxy with `GET /v1/models`; support for that endpoint is not assumed.
 
 ## Checks and the one turn
 
@@ -61,7 +88,7 @@ fresh tenant can initialize storage and therefore must use the same 1024D embedd
 
 ```sh
 sudo -u akuki -H sh -c '
-  unset ANTHROPIC_BASE_URL
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL AKUKI_ANTHROPIC_PROXY
   set -a
   . /etc/akuki/akuki-smoke.env
   set +a
@@ -74,7 +101,7 @@ Run exactly one turn (quote the message so it remains one argument):
 
 ```sh
 sudo -u akuki -H sh -c '
-  unset ANTHROPIC_BASE_URL
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL AKUKI_ANTHROPIC_PROXY
   set -a
   . /etc/akuki/akuki-smoke.env
   set +a
