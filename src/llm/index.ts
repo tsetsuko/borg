@@ -412,6 +412,9 @@ export type LLMConverseResult = {
 
 export type TokenUsageEvent = {
   budget: string;
+  // Provider-returned model id when the response exposes one; otherwise the
+  // requested id. This keeps aliases observable without dropping clients whose
+  // compatible API omits response.model.
   model: string;
   input_tokens: number;
   output_tokens: number;
@@ -2320,6 +2323,7 @@ export class AnthropicLLMClient implements LLMClient {
       LLMCompleteResult,
       "input_tokens" | "output_tokens" | "cache_creation_input_tokens" | "cache_read_input_tokens"
     >,
+    providerModel?: string,
   ): Promise<void> {
     if (this.usageSink === undefined) {
       return;
@@ -2327,7 +2331,7 @@ export class AnthropicLLMClient implements LLMClient {
 
     await this.usageSink({
       budget: options.budget,
-      model: options.model,
+      model: providerModel?.trim() || options.model,
       input_tokens: result.input_tokens,
       output_tokens: result.output_tokens,
       ...(result.cache_creation_input_tokens === undefined
@@ -2372,7 +2376,7 @@ export class AnthropicLLMClient implements LLMClient {
       tool_calls: extractToolCalls(response),
       ...(options.output_config === undefined ? {} : { structured_output: structuredOutput }),
     } satisfies LLMCompleteResult;
-    await this.emitUsage(options, result);
+    await this.emitUsage(options, result, response.model);
     return result;
   }
 
@@ -2406,7 +2410,7 @@ export class AnthropicLLMClient implements LLMClient {
       tool_calls: extractToolCalls(response),
       ...(options.output_config === undefined ? {} : { structured_output: structuredOutput }),
     } satisfies LLMCompleteResult;
-    await this.emitUsage(options, result);
+    await this.emitUsage(options, result, response.model);
     return result;
   }
 
@@ -2444,7 +2448,7 @@ export class AnthropicLLMClient implements LLMClient {
       stop_reason: response.stop_reason,
       ...(options.output_config === undefined ? {} : { structured_output: structuredOutput }),
     } satisfies LLMConverseResult;
-    await this.emitUsage(options, result);
+    await this.emitUsage(options, result, response.model);
     return result;
   }
 
@@ -2479,7 +2483,7 @@ export class AnthropicLLMClient implements LLMClient {
       stop_reason: response.stop_reason,
       ...(options.output_config === undefined ? {} : { structured_output: structuredOutput }),
     } satisfies LLMConverseResult;
-    await this.emitUsage(options, result);
+    await this.emitUsage(options, result, response.model);
     return result;
   }
 

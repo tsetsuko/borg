@@ -53,6 +53,7 @@ type OpenAIChatMessageParam = {
 };
 
 type OpenAIChatCompletionResponse = {
+  model?: string;
   choices: ReadonlyArray<{
     message: {
       content: string | null;
@@ -289,7 +290,7 @@ export class OpenAICompatibleLLMClient implements LLMClient {
       throw new LLMError("OpenAI-compatible completion returned no choices");
     }
 
-    await this.reportUsage(options.budget, options.model, response.usage);
+    await this.reportUsage(options.budget, response.model?.trim() || options.model, response.usage);
 
     return {
       text: choice.message.content ?? "",
@@ -313,7 +314,7 @@ export class OpenAICompatibleLLMClient implements LLMClient {
       throw new LLMError("OpenAI-compatible completion returned no choices");
     }
 
-    await this.reportUsage(options.budget, options.model, response.usage);
+    await this.reportUsage(options.budget, response.model?.trim() || options.model, response.usage);
 
     const messageBlocks: LLMContentBlock[] = [];
     if (choice.message.content) {

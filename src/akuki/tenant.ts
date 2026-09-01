@@ -11,6 +11,11 @@ import {
 } from "../embeddings/index.js";
 import type { LLMClient, TokenUsageSink } from "../llm/index.js";
 import { AkukiLLMRouter } from "./llm-router.js";
+import {
+  isAkukiAnthropicOnly,
+  validateAkukiAnthropicOnlyModels,
+  validateAkukiSmokeEmbeddings,
+} from "./smoke-config.js";
 
 export const AKUKI_DEFAULT_ENDPOINT_MODEL = "generative-apis/qwen3-235b-a22b-instruct-2507";
 export const AKUKI_DEFAULT_BASE_URL = "https://inference.kratos.p4.int/v1";
@@ -64,12 +69,26 @@ export function buildAkukiClients(options: AkukiClientOptions = {}): AkukiClient
   const env = options.env ?? process.env;
   const mode: AkukiEmbeddingMode = options.embeddings ?? "endpoint";
 
+  const anthropicOnly = isAkukiAnthropicOnly(env);
+
   const baseUrl = env.AKUKI_LLM_BASE_URL ?? AKUKI_DEFAULT_BASE_URL;
   const endpointApiKey = env.AKUKI_LLM_API_KEY ?? "";
   const anthropicApiKey = env.AKUKI_ANTHROPIC_API_KEY ?? "";
 
-  const endpointModel = env.AKUKI_ENDPOINT_MODEL ?? AKUKI_DEFAULT_ENDPOINT_MODEL;
-  applyAkukiModelSlots(env, endpointModel);
+  // In normal operation the historical Kratos default remains intact. The smoke
+  // mode never fills a missing role with that default: only an explicitly set
+  // AKUKI_ENDPOINT_MODEL may populate the volume roles before validation.
+  const endpointModel = anthropicOnly
+    ? env.AKUKI_ENDPOINT_MODEL?.trim()
+    : (env.AKUKI_ENDPOINT_MODEL ?? AKUKI_DEFAULT_ENDPOINT_MODEL);
+  if (endpointModel) {
+    applyAkukiModelSlots(env, endpointModel);
+  }
+
+  if (anthropicOnly) {
+    validateAkukiAnthropicOnlyModels(env);
+    validateAkukiSmokeEmbeddings(env, mode);
+  }
 
   const llmClient = new AkukiLLMRouter({
     anthropicApiKey,

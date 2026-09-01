@@ -58,6 +58,18 @@ function toolCallResponse(args: string) {
 }
 
 describe("OpenAICompatibleLLMClient", () => {
+  it("reports a provider-returned model id to the usage sink", async () => {
+    const usageSink = vi.fn();
+    const client = new OpenAICompatibleLLMClient({
+      client: fakeClient({ ...toolCallResponse("{}"), model: "provider-model" }),
+      usageSink,
+    });
+
+    await client.complete(completeOptions({ model: "requested-alias" }));
+
+    expect(usageSink).toHaveBeenCalledWith(expect.objectContaining({ model: "provider-model" }));
+  });
+
   it("maps a forced tool_choice to OpenAI function-forcing and decodes tool args", async () => {
     let captured: CapturedParams = {};
     const client = new OpenAICompatibleLLMClient({

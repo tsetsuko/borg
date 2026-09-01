@@ -8,6 +8,7 @@ import { Borg } from "../index.js";
 import { parseSessionId } from "../util/ids.js";
 import { applyAkukiSeed } from "./seed/apply.js";
 import { buildAkukiClients, type AkukiEmbeddingMode } from "./tenant.js";
+import { createAkukiTokenUsageCollector, type AkukiTokenUsageReport } from "./token-usage.js";
 
 export type RunAkukiTurnOptions = {
   dataDir: string;
@@ -25,6 +26,7 @@ export type RunAkukiTurnResult = {
   identityEventsBefore: number;
   identityEventsAfter: number;
   plumbingOnly: boolean;
+  tokenUsage: AkukiTokenUsageReport;
 };
 
 // listEvents has no time range and defaults to limit 50
@@ -33,7 +35,12 @@ const EVENT_SCAN_LIMIT = 5_000;
 
 export async function runAkukiTurn(options: RunAkukiTurnOptions): Promise<RunAkukiTurnResult> {
   const env = options.env ?? process.env;
-  const clients = buildAkukiClients({ env, embeddings: options.embeddings });
+  const usage = createAkukiTokenUsageCollector();
+  const clients = buildAkukiClients({
+    env,
+    embeddings: options.embeddings,
+    usageSink: usage.usageSink,
+  });
 
   const borg = await Borg.open({
     dataDir: options.dataDir,
@@ -73,6 +80,7 @@ export async function runAkukiTurn(options: RunAkukiTurnOptions): Promise<RunAku
       identityEventsBefore: before,
       identityEventsAfter: after,
       plumbingOnly: clients.plumbingOnly,
+      tokenUsage: usage.report(),
     };
   } finally {
     await borg.close();

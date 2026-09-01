@@ -229,6 +229,31 @@ describe("llm", () => {
     ]);
   });
 
+  it("reports the model id returned by Anthropic rather than the requested alias", async () => {
+    const usageSink = vi.fn();
+    const client = new AnthropicLLMClient({
+      client: {
+        messages: {
+          create: vi
+            .fn()
+            .mockResolvedValue(createMessageBody({ model: "claude-sonnet-provider-snapshot" })),
+        },
+      },
+      usageSink,
+    });
+
+    await client.complete({
+      model: "claude-sonnet-alias",
+      messages: [{ role: "user", content: "hello" }],
+      max_tokens: 32,
+      budget: "test",
+    });
+
+    expect(usageSink).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "claude-sonnet-provider-snapshot" }),
+    );
+  });
+
   it("clamps explicit Anthropic output requests to the model ceiling", async () => {
     const create = vi.fn().mockResolvedValue(createMessageBody());
     const client = new AnthropicLLMClient({

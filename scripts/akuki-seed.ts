@@ -6,8 +6,9 @@
 
 import { Borg } from "../src/index.js";
 import { applyAkukiSeed } from "../src/akuki/seed/apply.js";
+import { requireAkukiDataDir } from "../src/akuki/smoke-config.js";
 
-const dataDir = process.env.AKUKI_DATA_DIR ?? "/home/zosia/projects/ai/akuki/data/akuki";
+const dataDir = requireAkukiDataDir(process.env);
 
 const borg = await Borg.open({ dataDir, env: process.env });
 
