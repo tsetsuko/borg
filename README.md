@@ -11,7 +11,7 @@ over time.
 ![node](https://img.shields.io/badge/node-%E2%89%A522-339933?style=flat-square&logo=node.js&logoColor=white)
 ![typescript](https://img.shields.io/badge/TypeScript-strict-3178C6?style=flat-square&logo=typescript&logoColor=white)
 ![status](https://img.shields.io/badge/status-experimental-e8a317?style=flat-square)
-![targets](https://img.shields.io/badge/targets-Opus%204.6-d97757?style=flat-square)
+![targets](https://img.shields.io/badge/cognition-Opus%204.8-d97757?style=flat-square)
 
 </div>
 
@@ -247,9 +247,10 @@ borg social profile|upsert|adjust-trust
   either side with `BORG_ANTHROPIC_AUTH=api-key|oauth`; run `borg auth status`
   to see what resolves.
 
-The being targets **Opus 4.6**. The substrate co-produces identity with the
-model, so the design accepts drift when migrating to a successor rather than
-chasing model-swap conformance.
+The being's cognition targets **Opus 4.8**. Background and extraction remain
+on Opus 5. The substrate co-produces identity with the cognition model, so the
+design accepts drift when migrating to a successor rather than chasing
+model-swap conformance.
 
 ## Development
 
