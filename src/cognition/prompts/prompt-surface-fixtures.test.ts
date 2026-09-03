@@ -231,6 +231,12 @@ const REGISTRY_ENTRY_FIXTURE_EXEMPTIONS = new Map<string, string>([
   ["contradiction_signal", "contradiction routing signal is covered by separate routing tests"],
   // Reflective-mode open questions are not rendered in the problem-solving/relational fixtures.
   ["borg_open_questions", "open-question base prompt rendering is reflective-mode gated"],
+  // Needs live social and prediction repositories to compute the inhibition signal;
+  // the deterministic fixture contexts wire neither. inhibition-context tests cover it.
+  [
+    "borg_speech_inhibition",
+    "speech inhibition needs live social and prediction repositories the fixtures do not wire",
+  ],
   // Requires an intentionally invalid finalizer tool response; finalizer retry behavior tests cover it.
   [
     "finalizer_invalid_tool_retry_instruction",
