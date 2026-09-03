@@ -2,6 +2,7 @@
 // (tsconfig.json excludes "scripts").
 import { runAkukiTurn } from "../src/akuki/turn.js";
 import { requireAkukiDataDir } from "../src/akuki/smoke-config.js";
+import { runAkukiInspect, formatAkukiInspectReport } from "../src/akuki/inspect.js";
 
 const dataDir = requireAkukiDataDir(process.env);
 const sessionId = process.env.AKUKI_SESSION ?? "default";
@@ -26,3 +27,15 @@ if (result.plumbingOnly) {
 }
 console.log("--- token usage JSON ---");
 console.log(JSON.stringify(result.tokenUsage, null, 2));
+
+// Opt-in M2/M3 snapshot after the turn (re-opens the tenant read-only).
+if (process.env.AKUKI_INSPECT === "1") {
+  const report = await runAkukiInspect({
+    dataDir,
+    env: process.env,
+    sessionId,
+    audience: process.env.AKUKI_AUDIENCE ?? "Zosia",
+  });
+  console.log("\n=== M2/M3 po turze ===");
+  console.log(formatAkukiInspectReport(report));
+}

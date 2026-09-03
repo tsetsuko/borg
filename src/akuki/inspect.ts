@@ -67,6 +67,65 @@ function currentValenceFor(
   }
 }
 
+/** Human-readable rendering of an inspect report, shared by both entry points. */
+export function formatAkukiInspectReport(report: AkukiInspectReport): string {
+  const lines: string[] = [];
+
+  lines.push("--- M3: sygnal inhibicji (nizej = smielej) ---");
+  if (report.inhibition === null) {
+    lines.push("(brak)");
+  } else {
+    const i = report.inhibition;
+    lines.push(
+      `partner        : ${i.partner}${i.partnerResolved ? "" : " (NIEROZPOZNANY -> pelny prog)"}`,
+    );
+    lines.push(`sygnal         : ${i.signal.toFixed(3)}`);
+    lines.push(
+      `  przewidywalnosc partnera : ${i.partnerPredictability.toFixed(3)} (interakcji: ${i.interactionCount}, swieze bledy: [${i.recentPartnerErrors.map((e) => e.toFixed(2)).join(", ")}])`,
+    );
+    lines.push(`  figura przywiazania obecna: ${i.attachmentFigurePresent}`);
+    lines.push(
+      `  nastroj (valence)        : ${i.currentValence.toFixed(2)} -> caution_bump ${i.cautionBump.toFixed(3)}`,
+    );
+  }
+
+  lines.push("");
+  lines.push("--- M2: otwarte oczekiwania ---");
+  if (report.predictions.openExpectations.length === 0) {
+    lines.push("(brak)");
+  } else {
+    for (const e of report.predictions.openExpectations) {
+      lines.push(`- [${e.turnId}] ${e.content}${e.about ? `  (o: ${e.about})` : ""}`);
+    }
+  }
+
+  lines.push("");
+  lines.push("--- M2: rozliczenia (z error_magnitude) ---");
+  if (report.predictions.reconciliations.length === 0) {
+    lines.push("(brak)");
+  } else {
+    for (const r of report.predictions.reconciliations) {
+      const err = r.errorMagnitude === null ? "?" : r.errorMagnitude.toFixed(2);
+      lines.push(`- [${r.turnId}] blad=${err}  ${r.content}`);
+    }
+  }
+
+  lines.push("");
+  lines.push("--- ostatnie zdarzenia tozsamosci ---");
+  if (report.identityEvents.length === 0) {
+    lines.push("(brak)");
+  } else {
+    for (const ev of report.identityEvents) {
+      lines.push(
+        `#${ev.id} ${ev.recordType}/${ev.action} (${ev.provenanceKind})${ev.reason ? ` -- ${ev.reason}` : ""}`,
+      );
+      lines.push(`     ${JSON.stringify(ev.newValue)}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 export async function runAkukiInspect(options: AkukiInspectOptions): Promise<AkukiInspectReport> {
   const env = options.env ?? process.env;
   const sessionId = (options.sessionId ?? "default") as SessionId;
