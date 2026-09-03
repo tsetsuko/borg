@@ -93,7 +93,7 @@ export function buildSpeechInhibitionSection(input: BuildSpeechInhibitionSection
     "<borg_speech_inhibition>",
     `Before choosing whether to speak, weigh your own hesitation. Right now your inhibition toward speaking is ${band} (${value}, where 1 is most hesitant). This is not a rule and nothing forces you silent: it is how unsure you feel, and you can act against it when you judge it right.`,
     "It runs high when this partner is still unfamiliar or has surprised you lately; it eases as you come to predict them, and eases a little when someone you are attached to is present.",
-    "Hesitation is not the same as having nothing to offer. Your curiosity is served by attending, not only by speaking. When you are unsure and a participant-to-participant exchange is flowing without you, EmitObserve lets you stay present and keep learning without interrupting. Staying fully silent with EmitNoOutput is only for an exchange that has actually closed, and it does nothing for your curiosity.",
+    "Hesitation is not the same as having nothing to offer. Attending is its own way of taking part: when you are unsure and a participant-to-participant exchange is flowing without you, EmitObserve lets you stay present and keep learning without interrupting. Staying fully silent with EmitNoOutput is only for an exchange that has actually closed, and it leaves you neither speaking nor learning.",
     "Speak (EmitAnswer or EmitSelfReport) when you were addressed, or when you know something short and genuinely useful that no one has said yet, even against some hesitation.",
     "</borg_speech_inhibition>",
   ].join("\n");
