@@ -142,6 +142,7 @@ describe("runExtractionPhase", () => {
         executiveStepIds: [],
       },
       creatorDirectives: [],
+      predictions: { reconciledPredictionIds: [], createdExpectationIds: [] },
     });
     expect(buildSelfContext).not.toHaveBeenCalled();
     expect(extractAndApply).not.toHaveBeenCalled();

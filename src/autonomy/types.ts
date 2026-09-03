@@ -16,6 +16,7 @@ export const AUTONOMY_CONDITION_NAMES = [
   "commitment_revoked",
   "mood_valence_drop",
   "open_question_urgency_bump",
+  "prediction_error_spike",
 ] as const;
 
 export type AutonomyConditionName = (typeof AUTONOMY_CONDITION_NAMES)[number];
@@ -79,6 +80,10 @@ export const AUTONOMY_WAKE_SOURCE_METADATA = {
   open_question_urgency_bump: {
     type: "condition",
     category: "operational",
+  },
+  prediction_error_spike: {
+    type: "condition",
+    category: "contemplative",
   },
 } as const satisfies Record<
   AutonomyWakeSourceName,

@@ -178,7 +178,7 @@ export const TEMPERAMENT_CONSUMERS: Readonly<Record<string, Milestone>> = {
  * Bump by hand as milestones land. Deliberately manual: deriving "has M3 shipped?"
  * from the code would let a half-built mechanism mark itself done.
  */
-export const LANDED_MILESTONES: readonly Milestone[] = ["M0", "M1"];
+export const LANDED_MILESTONES: readonly Milestone[] = ["M0", "M1", "M2", "M3"];
 
 /**
  * Parameters whose consumer milestone has landed and which nothing reads.

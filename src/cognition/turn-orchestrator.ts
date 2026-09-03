@@ -27,6 +27,7 @@ import type { ObservedEventRepository } from "../memory/observed-events/index.js
 import { SkillSelector } from "../memory/procedural/index.js";
 import { RelationalSlotRepository } from "../memory/relational-slots/index.js";
 import type { SelfDecisionRepository } from "../memory/self-decisions/index.js";
+import type { PredictionRepository } from "../memory/predictions/index.js";
 import type { TrainOfThoughtRepository } from "../memory/train-of-thought/index.js";
 import {
   AutobiographicalRepository,
@@ -58,6 +59,7 @@ import { DEFAULT_SESSION_ID, type EntityId, type SessionId } from "../util/ids.j
 import type { ToolLoopCallRecord } from "./turn-action/index.js";
 import { TurnActionCoordinator } from "./turn-action/turn-action-coordinator.js";
 import { TurnActionStateService } from "./actions/turn-action-state-service.js";
+import { PredictionTurnService } from "./predictions/index.js";
 import { AttributionLifecycleService } from "./attribution/lifecycle-service.js";
 import { CommitmentGuardRunner } from "./commitments/guard-runner.js";
 import { CorrectivePreferenceTurnService } from "./commitments/corrective-preference-service.js";
@@ -141,6 +143,7 @@ export type TurnOrchestratorOptions = {
   activityRepository?: ActivityRepository;
   livedExperienceDaySummaryRepository?: LivedExperienceDaySummaryRepository;
   selfDecisionRepository?: SelfDecisionRepository;
+  predictionRepository?: PredictionRepository;
   trainOfThoughtRepository?: TrainOfThoughtRepository;
   observedEventRepository?: ObservedEventRepository;
   identityService: IdentityService;
@@ -295,6 +298,28 @@ export class TurnOrchestrator {
       clock: this.clock,
       tracer: this.tracer,
     });
+    const predictionTurnService =
+      options.predictionRepository === undefined
+        ? undefined
+        : new PredictionTurnService({
+            model: options.config.anthropic.models.extraction,
+            predictionRepository: options.predictionRepository,
+            episodicRepository: options.episodicRepository,
+            entityRepository: options.entityRepository,
+            params: {
+              surpriseWeight: options.config.prediction.surpriseWeight,
+              curiosityGain: options.config.prediction.curiosityGain,
+              targetErrorBand: [
+                options.config.prediction.targetErrorBandLow,
+                options.config.prediction.targetErrorBandHigh,
+              ],
+              attachmentMemoryWeight: options.config.prediction.attachmentMemoryWeight,
+              significanceStep: options.config.prediction.significanceStep,
+            },
+            attachmentFigureName: options.config.prediction.attachmentFigureName,
+            clock: this.clock,
+            tracer: this.tracer,
+          });
     const turnGoalPromotionService = new TurnGoalPromotionService({
       model: options.config.anthropic.models.recallExpansion,
       identityService: options.identityService,
@@ -398,6 +423,10 @@ export class TurnOrchestrator {
       correctivePreferenceTurnService,
       creatorDirectiveTurnService,
       turnActionStateService,
+      predictionTurnService,
+      ...(options.predictionRepository === undefined
+        ? {}
+        : { predictionRepository: options.predictionRepository }),
       turnGoalPromotionService,
       selfContextBuilder: this.selfContextBuilder,
       turnRetrievalCoordinator,

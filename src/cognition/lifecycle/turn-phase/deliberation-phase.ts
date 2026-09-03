@@ -18,6 +18,7 @@ import type { WorkingMemory } from "../../../memory/working/index.js";
 import type { SessionParticipationPolicy } from "../../../sessions/index.js";
 import type { TurnPhaseCoordinatorOptions, TurnPhaseInput } from "./types.js";
 import { sharedStateRenderOptions } from "./utils.js";
+import { buildSpeechInhibitionSection } from "../../inhibition/index.js";
 import type { TurnRetrievalPhaseResult } from "./retrieval-phase.js";
 
 export type TurnDeliberationPhaseResult = {
@@ -113,9 +114,44 @@ export async function runDeliberationPhase(input: {
     sharedStateRenderOptions: sharedStateRenderOptions(input.options.config),
     maxImagesPerLlmCall: input.options.config.attachments.maxImagesPerLedger,
   });
+  // M3 advisory speech-inhibition signal. Skipped on self-audience turns and when no
+  // prediction ledger is wired (partial harnesses); it is guidance, never a gate. All
+  // config/repository reads live inside the branch so a skipped turn touches none.
+  const predictionRepository = input.options.predictionRepository;
+  const speechInhibitionPromptSection =
+    (input.isSelfAudience ?? false) || predictionRepository === undefined
+      ? null
+      : (() => {
+          const inhibitionConfig = input.options.config.inhibition;
+          const attachmentFigureName = input.options.config.prediction.attachmentFigureName;
+          const attachmentFigureEntityId =
+            attachmentFigureName === null
+              ? null
+              : input.options.entityRepository.findByName(attachmentFigureName);
+          return buildSpeechInhibitionSection({
+            params: {
+              baseThreshold: inhibitionConfig.baseThreshold,
+              uncertaintyWeight: inhibitionConfig.uncertaintyWeight,
+              presenceRelief: inhibitionConfig.presenceRelief,
+              cautionWeight: inhibitionConfig.cautionWeight,
+              familiarityScale: inhibitionConfig.familiarityScale,
+              recentErrorWindow: inhibitionConfig.recentErrorWindow,
+            },
+            partnerEntityId: input.audienceEntityId,
+            participantEntityIds: input.activeParticipants.map(
+              (participant) => participant.entityId,
+            ),
+            attachmentFigureEntityId,
+            currentValence: input.workingMemory.mood?.valence ?? 0,
+            predictionRepository,
+            socialRepository: input.options.socialRepository,
+          });
+        })();
+
   const deliberation = await deliberator.run(
     {
       sessionId: input.sessionId,
+      speechInhibitionPromptSection,
       currentTimeContext: input.retrievalPhase.currentTimeContext,
       participationPolicy: input.participationPolicy,
       creatorIdentity: input.creatorIdentity,

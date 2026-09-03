@@ -8,6 +8,8 @@ import type {
 } from "../../../attachments/index.js";
 import type { TurnActionCoordinator } from "../../turn-action/turn-action-coordinator.js";
 import type { TurnActionStateService } from "../../actions/turn-action-state-service.js";
+import type { PredictionTurnService } from "../../predictions/index.js";
+import type { PredictionRepository } from "../../../memory/predictions/index.js";
 import type { AttributionLifecycleService } from "../../attribution/lifecycle-service.js";
 import type { AutonomyTriggerContext } from "../../autonomy-trigger.js";
 import type { CorrectivePreferenceTurnService } from "../../commitments/corrective-preference-service.js";
@@ -124,6 +126,9 @@ export type TurnPhaseCoordinatorOptions = {
   workingMemoryStore: WorkingMemoryStore;
   entityRepository: EntityRepository;
   socialRepository: SocialRepository;
+  // Optional so partial test harnesses that omit it still typecheck; production
+  // always wires it. M3 speech inhibition reads it for partner predictability.
+  predictionRepository?: PredictionRepository;
   relationalSlotRepository: RelationalSlotRepository;
   actionRepository: Pick<ActionRepository, "get" | "list" | "update"> &
     Partial<Pick<ActionRepository, "findSimilarDescriptionPairs">>;
@@ -195,6 +200,9 @@ export type TurnPhaseCoordinatorOptions = {
   correctivePreferenceTurnService: CorrectivePreferenceTurnService;
   creatorDirectiveTurnService: CreatorDirectiveTurnService;
   turnActionStateService: TurnActionStateService;
+  // Optional so partial test harnesses that omit it still typecheck; production
+  // always wires it. The extraction phase skips prediction reflection when absent.
+  predictionTurnService?: PredictionTurnService;
   turnGoalPromotionService: TurnGoalPromotionService;
   selfContextBuilder: TurnSelfContextBuilder;
   turnRetrievalCoordinator: TurnRetrievalCoordinator;

@@ -218,6 +218,14 @@ export function createTestConfig(
       ...DEFAULT_CONFIG.affective,
       ...overrides.affective,
     },
+    prediction: {
+      ...DEFAULT_CONFIG.prediction,
+      ...overrides.prediction,
+    },
+    inhibition: {
+      ...DEFAULT_CONFIG.inhibition,
+      ...overrides.inhibition,
+    },
     embedding: {
       ...DEFAULT_CONFIG.embedding,
       ...overrides.embedding,
@@ -501,6 +509,10 @@ export function createTestConfig(
         openQuestionUrgencyBump: {
           ...DEFAULT_CONFIG.autonomy.conditions.openQuestionUrgencyBump,
           ...overrides.autonomy?.conditions?.openQuestionUrgencyBump,
+        },
+        predictionErrorSpike: {
+          ...DEFAULT_CONFIG.autonomy.conditions.predictionErrorSpike,
+          ...overrides.autonomy?.conditions?.predictionErrorSpike,
         },
       },
     },

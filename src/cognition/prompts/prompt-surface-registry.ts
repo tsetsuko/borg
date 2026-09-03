@@ -649,6 +649,19 @@ export const PROMPT_SURFACE_BLOCKS = [
     ],
   }),
   block({
+    id: "borg_speech_inhibition",
+    owner: "cognition.inhibition",
+    purpose:
+      "M3 advisory speech-inhibition signal: the computed shyness the entity weighs before choosing to speak, observe, or stay silent.",
+    renderCondition: "user-facing turn with a computed inhibition section",
+    source: {
+      file: "src/cognition/inhibition/inhibition-context.ts",
+      exportName: "buildSpeechInhibitionSection",
+    },
+    tag: "borg_speech_inhibition",
+    surfaces: [{ surface: PROMPT_SURFACES.finalizerDynamicSystem, order: 45 }],
+  }),
+  block({
     id: "borg_compact_planner_ledger",
     owner: "cognition.evidence_ledger",
     purpose: "Compact S2 planner evidence ledger framing.",

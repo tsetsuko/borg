@@ -109,6 +109,8 @@ export async function createEvalBorg(options: CreateEvalBorgOptions): Promise<Bo
       ...DEFAULT_CONFIG.frameAnomaly,
       peerChannelSourceTypes: [...DEFAULT_CONFIG.frameAnomaly.peerChannelSourceTypes],
     },
+    prediction: { ...DEFAULT_CONFIG.prediction },
+    inhibition: { ...DEFAULT_CONFIG.inhibition },
     internalIdentifierGuard: {
       ...DEFAULT_CONFIG.internalIdentifierGuard,
       ...options.config?.internalIdentifierGuard,

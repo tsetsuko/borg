@@ -7,6 +7,7 @@
 import { Borg } from "../index.js";
 import { parseSessionId } from "../util/ids.js";
 import { applyAkukiSeed } from "./seed/apply.js";
+import { applyAkukiPredictionEnv } from "./prediction-config.js";
 import { buildAkukiClients, type AkukiEmbeddingMode } from "./tenant.js";
 import { createAkukiTokenUsageCollector, type AkukiTokenUsageReport } from "./token-usage.js";
 
@@ -41,6 +42,9 @@ export async function runAkukiTurn(options: RunAkukiTurnOptions): Promise<RunAku
     embeddings: options.embeddings,
     usageSink: usage.usageSink,
   });
+
+  // Push temperament-driven M2 prediction params into the env Borg.open resolves.
+  applyAkukiPredictionEnv(env);
 
   const borg = await Borg.open({
     dataDir: options.dataDir,

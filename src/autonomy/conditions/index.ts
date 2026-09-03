@@ -10,3 +10,7 @@ export {
   createOpenQuestionUrgencyBumpCondition,
   type OpenQuestionUrgencyBumpConditionOptions,
 } from "./open-question-urgency-bump.js";
+export {
+  createPredictionErrorSpikeCondition,
+  type PredictionErrorSpikeConditionOptions,
+} from "./prediction-error-spike.js";

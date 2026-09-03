@@ -422,6 +422,58 @@ When affective classification degrades, Borg falls back to neutral affect with
 observability. It is better to proceed honestly with no affective signal than
 to invent one deterministically.
 
+### Prediction Memory
+
+Prediction Memory is the ledger behind the M2 prediction→surprise loop (entry
+point: `src/memory/predictions/index.ts`). It stores the expectations the entity
+forms about what will happen next and, later, how those expectations actually
+resolved. `prediction_events` is append-only with two kinds — `expectation` and
+`reconciliation` — linked by a shared `prediction_id`. A `UNIQUE(prediction_id,
+kind)` index makes an expectation immutable once recorded: it is locked before
+its outcome can be known and cannot be back-dated afterwards.
+
+Prediction Memory exists so the entity can learn from being wrong. The gap
+between what it expected and what happened is a first-class developmental signal
+that feeds memory priority, curiosity, and later inhibition (M3).
+
+The loop has four parts, and every semantic judgment in it belongs to the model,
+never to the harness:
+
+- **Producer.** The post-turn extraction pass (the same class of work as the
+  semantic and action-state extractors — an LLM reading the turn to emit
+  structured data) records the expectations the entity now holds and reconciles
+  any open expectation this turn resolved. The surprise itself is the model's own
+  appraisal, an `error_magnitude` in `[0,1]` carried verbatim; the harness never
+  derives it from a text diff, keyword list, or regex. Reconciliations that cite
+  a `prediction_id` the entity was not actually holding open are dropped as
+  hallucinated references. The entity is never forced to emit a prediction — a
+  quiet turn with none is normal.
+- **Consumer — memory priority.** On reconciliation, the significance of the
+  episode the expectation grew from is raised (each expectation stores its
+  forming turn's `source_stream_ids`, and the reconciliation boosts the episodes
+  containing them). The increment is scaled by the model's `error_magnitude`,
+  `memory.surprise_weight`, and `curiosity.gain`, and is gated to the zone of
+  proximal development (`curiosity.target_error_band`): intermediate surprise is
+  the interesting kind, so negligible or overwhelming surprise is left alone. A
+  reconciliation about the attachment figure is boosted further by
+  `attachment.memory_weight`. This is pure arithmetic over a model-supplied
+  number; it feeds retrieval ranking through episode salience.
+- **Consumer — autonomy.** A large surprise can wake the entity to ruminate on
+  it, via the `prediction_error_spike` autonomy condition (audience `self`). It
+  is off by default until observed.
+- **Recall is global.** Open expectations are recalled without any session or
+  audience gate; `origin_audience` rides along only as a provenance label.
+
+The M2 parameters live in `config.prediction`, with defaults mirroring Akuki's
+`temperament.yaml`; the Akuki layer reads temperament and injects those values
+so the temperament keys have a real reader (`src/akuki/prediction-config.ts`).
+
+Prediction Memory is deliberately kept off the hot prompt path: the producer and
+consumer run in post-turn extraction and the autonomy scan runs in the
+scheduler, so nothing here is written into the cacheable system-prompt prefix and
+prompt caching is unaffected. Surfacing open expectations into the live prompt
+(so the entity reasons over them mid-turn) is a separate, optional extension.
+
 ### Self Memory
 
 Self Memory stores Borg's durable self-model (entry point:
@@ -907,8 +959,10 @@ Extraction turns the current message into structured candidates before
 retrieval (entry point:
 `src/cognition/lifecycle/turn-phase/extraction-phase.ts`). It can extract
 corrective preferences, action state changes, goal promotion candidates, links
-between current action assertions and existing self context, and -- when the
-creator speaks in an operator session -- creator directives.
+between current action assertions and existing self context, the entity's
+predictions about what comes next and their reconciliation (see Prediction
+Memory), and -- when the creator speaks in an operator session -- creator
+directives.
 
 Extraction exists because some current-turn signals must be available to
 retrieval and deliberation immediately. If the user corrects a preference or
@@ -1223,6 +1277,33 @@ Finalization also owns reply targeting. In a group, Borg may speak to the
 audience as a whole or address a specific visible participant. That target is
 persisted with the Stream entry so later attribution and social memory can
 distinguish channel-level speech from person-directed speech.
+
+### Speech Inhibition
+
+The finalizer's terminal choice carries an advisory speech-inhibition signal --
+the M3 developmental mechanism (entry point:
+`src/cognition/inhibition/index.ts`). It replaces a flat prose "default to
+silence" rule with a number in [0,1] (higher = shyer) that the deliberation
+phase computes and renders into the finalizer's dynamic prompt. It is a signal,
+not a gate: the model still chooses the terminal tool, and the framing is a
+child's uncertainty it can act against, never a gag. Nothing here inspects or
+suppresses output, and because the section rides the dynamic finalizer surface
+rather than the cacheable prefix, prompt caching is unaffected.
+
+The signal is `base_threshold - uncertainty_weight * partner_predictability -
+presence_relief + caution_bump`, clamped to [0,1]. Partner predictability comes
+from Prediction Memory (how well the entity has lately predicted this partner)
+weighted by familiarity (social-memory interaction count), so a stranger scores
+zero and the threshold sits at its base -- genuinely unsure, not neutral -- and
+falls only as real low-error predictions accumulate. This is the concrete reason
+M2 precedes M3: it produces the partner-predictability signal M3 consumes. The
+attachment figure's presence lowers the threshold a little (a safe base), and a
+recent drop in affective-mood valence raises it (a transient caution that fades
+on mood's own decay). Shyness governs speaking; curiosity governs learning, and
+its outlet is EmitObserve -- so the shy entity attends and learns rather than
+falling fully silent, which is why silence is never the free-optimal move. The
+`base_threshold` and `uncertainty_weight` come from Akuki's temperament; the
+rest are calibration constants in `config.inhibition`.
 
 ### Post-Generation Guards
 
@@ -1908,9 +1989,11 @@ library defaults enable `commitment_revoked`, `open_question_urgency_bump`,
 executive-focus due checks, and the deliberate `scheduled_wake` lever.
 Long-lived deployments can and do enable the time-threshold sources once their
 records have matured, including `commitment_expiring`, `open_question_dormant`,
-`goal_followup_due`, and scheduled reflection. Both trigger classes are scanned
-the same way; the split is a taxonomy of why something became due, not two
-separate engines.
+`goal_followup_due`, and scheduled reflection. Off by default until observed,
+`prediction_error_spike` wakes the entity to ruminate on a prediction it
+resolved with high surprise (see Prediction Memory). Both trigger classes are
+scanned the same way; the split is a taxonomy of why something became due, not
+two separate engines.
 
 The scheduler decides only whether and when to wake, structurally. Each due
 event is deduped through a watermark keyed on the state version that made it

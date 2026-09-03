@@ -59,9 +59,11 @@ export {
   createCommitmentRevokedCondition,
   createMoodValenceDropCondition,
   createOpenQuestionUrgencyBumpCondition,
+  createPredictionErrorSpikeCondition,
   type CommitmentRevokedConditionOptions,
   type MoodValenceDropConditionOptions,
   type OpenQuestionUrgencyBumpConditionOptions,
+  type PredictionErrorSpikeConditionOptions,
 } from "./conditions/index.js";
 export {
   AutonomyWakesRepository,

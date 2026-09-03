@@ -19,6 +19,7 @@ import { Borg } from "../../index.js";
 import type { TokenUsageEvent } from "../../llm/index.js";
 import { parseSessionId } from "../../util/ids.js";
 import { applyAkukiSeed } from "../seed/apply.js";
+import { applyAkukiPredictionEnv } from "../prediction-config.js";
 import { loadScaffolding, type Scaffolding } from "../seed/scaffolding.js";
 import { buildAkukiClients } from "../tenant.js";
 import { armSpecs, prepareArmDirectory, scaffoldingForArm } from "./arms.js";
@@ -87,6 +88,7 @@ export async function runInternalizationReading(options: ReadingOptions): Promis
         };
 
         const clients = buildAkukiClients({ env, usageSink });
+        applyAkukiPredictionEnv(env);
         const borg = await Borg.open({
           dataDir: arm.dataDir,
           env,

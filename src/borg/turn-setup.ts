@@ -35,6 +35,7 @@ import type {
 } from "../memory/procedural/index.js";
 import type { RelationalSlotRepository } from "../memory/relational-slots/index.js";
 import type { SelfDecisionRepository } from "../memory/self-decisions/index.js";
+import type { PredictionRepository } from "../memory/predictions/index.js";
 import type { TrainOfThoughtRepository } from "../memory/train-of-thought/index.js";
 import type {
   AutobiographicalRepository,
@@ -73,6 +74,7 @@ export type BuildTurnOrchestratorOptions = {
   activityRepository: ActivityRepository;
   livedExperienceDaySummaryRepository: LivedExperienceDaySummaryRepository;
   selfDecisionRepository: SelfDecisionRepository;
+  predictionRepository: PredictionRepository;
   trainOfThoughtRepository: TrainOfThoughtRepository;
   observedEventRepository: ObservedEventRepository;
   reviewQueueRepository: ReviewQueueRepository;
@@ -127,6 +129,7 @@ export function buildTurnOrchestrator(options: BuildTurnOrchestratorOptions): Tu
     activityRepository: options.activityRepository,
     livedExperienceDaySummaryRepository: options.livedExperienceDaySummaryRepository,
     selfDecisionRepository: options.selfDecisionRepository,
+    predictionRepository: options.predictionRepository,
     trainOfThoughtRepository: options.trainOfThoughtRepository,
     observedEventRepository: options.observedEventRepository,
     identityService: options.identityService,

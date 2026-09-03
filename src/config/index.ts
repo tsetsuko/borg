@@ -344,6 +344,34 @@ const anthropicConfigSchema = z
   })
   .prefault({});
 
+// M2 prediction->surprise loop. Defaults mirror Akuki's temperament.yaml; the
+// Akuki layer overrides them from temperament at open (see applyAkukiPredictionEnv),
+// which is also where those temperament keys earn their reader.
+const predictionConfigSchema = z
+  .object({
+    surpriseWeight: z.number().default(2.0),
+    curiosityGain: z.number().default(0.7),
+    targetErrorBandLow: z.number().min(0).max(1).default(0.25),
+    targetErrorBandHigh: z.number().min(0).max(1).default(0.6),
+    attachmentMemoryWeight: z.number().default(1.5),
+    significanceStep: z.number().min(0).default(0.1),
+    attachmentFigureName: z.string().min(1).nullable().default(null),
+  })
+  .prefault({});
+
+// M3 speech-inhibition signal. base/uncertainty mirror temperament.yaml (injected by
+// the Akuki layer); the rest are calibration constants for the advisory signal.
+const inhibitionConfigSchema = z
+  .object({
+    baseThreshold: z.number().min(0).max(1).default(0.75),
+    uncertaintyWeight: z.number().default(0.5),
+    presenceRelief: z.number().min(0).default(0.1),
+    cautionWeight: z.number().min(0).default(0.3),
+    familiarityScale: z.number().positive().default(5),
+    recentErrorWindow: z.number().int().positive().default(10),
+  })
+  .prefault({});
+
 const configBaseSchema = z.object({
   dataDir: z.string().min(1).default(DEFAULT_DATA_DIR).transform(expandPath),
   defaultUser: z.string().min(1).optional(),
@@ -428,6 +456,8 @@ const configBaseSchema = z.object({
   attachments: attachmentsConfigSchema,
   cognition: cognitionConfigSchema,
   deliberation: deliberationConfigSchema,
+  prediction: predictionConfigSchema,
+  inhibition: inhibitionConfigSchema,
   episodic: episodicConfigSchema,
   generation: z
     .object({
@@ -812,6 +842,14 @@ const configBaseSchema = z.object({
               threshold: z.number().min(0).max(1).default(0.9),
             })
             .prefault({}),
+          predictionErrorSpike: z
+            .object({
+              // Default OFF until observed, like moodValenceDrop.
+              enabled: z.boolean().default(false),
+              threshold: z.number().min(0).max(1).default(0.6),
+              scanLimit: z.number().int().positive().default(20),
+            })
+            .prefault({}),
         })
         .prefault({}),
     })
@@ -1098,6 +1136,51 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["episodic", "salienceGateEnabled"],
     readOptionalEnvBoolean(env, "BORG_EPISODIC_SALIENCE_GATE_ENABLED"),
+  );
+  setConfigOverride(
+    overrides,
+    ["prediction", "surpriseWeight"],
+    readOptionalEnvNumber(env, "BORG_PREDICTION_SURPRISE_WEIGHT"),
+  );
+  setConfigOverride(
+    overrides,
+    ["prediction", "curiosityGain"],
+    readOptionalEnvNumber(env, "BORG_PREDICTION_CURIOSITY_GAIN"),
+  );
+  setConfigOverride(
+    overrides,
+    ["prediction", "targetErrorBandLow"],
+    readOptionalEnvNumber(env, "BORG_PREDICTION_TARGET_ERROR_BAND_LOW"),
+  );
+  setConfigOverride(
+    overrides,
+    ["prediction", "targetErrorBandHigh"],
+    readOptionalEnvNumber(env, "BORG_PREDICTION_TARGET_ERROR_BAND_HIGH"),
+  );
+  setConfigOverride(
+    overrides,
+    ["prediction", "attachmentMemoryWeight"],
+    readOptionalEnvNumber(env, "BORG_PREDICTION_ATTACHMENT_MEMORY_WEIGHT"),
+  );
+  setConfigOverride(
+    overrides,
+    ["prediction", "attachmentFigureName"],
+    readOptionalEnvString(env, "BORG_PREDICTION_ATTACHMENT_FIGURE_NAME"),
+  );
+  setConfigOverride(
+    overrides,
+    ["inhibition", "baseThreshold"],
+    readOptionalEnvNumber(env, "BORG_INHIBITION_BASE_THRESHOLD"),
+  );
+  setConfigOverride(
+    overrides,
+    ["inhibition", "uncertaintyWeight"],
+    readOptionalEnvNumber(env, "BORG_INHIBITION_UNCERTAINTY_WEIGHT"),
+  );
+  setConfigOverride(
+    overrides,
+    ["inhibition", "presenceRelief"],
+    readOptionalEnvNumber(env, "BORG_INHIBITION_PRESENCE_RELIEF"),
   );
   setConfigOverride(
     overrides,
@@ -2077,6 +2160,16 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["autonomy", "conditions", "openQuestionUrgencyBump", "threshold"],
     readOptionalEnvFloat(env, "BORG_AUTONOMY_CONDITION_OPEN_QUESTION_URGENCY_BUMP_THRESHOLD"),
+  );
+  setConfigOverride(
+    overrides,
+    ["autonomy", "conditions", "predictionErrorSpike", "enabled"],
+    readOptionalEnvBoolean(env, "BORG_AUTONOMY_CONDITION_PREDICTION_ERROR_SPIKE_ENABLED"),
+  );
+  setConfigOverride(
+    overrides,
+    ["autonomy", "conditions", "predictionErrorSpike", "threshold"],
+    readOptionalEnvFloat(env, "BORG_AUTONOMY_CONDITION_PREDICTION_ERROR_SPIKE_THRESHOLD"),
   );
 
   return overrides;

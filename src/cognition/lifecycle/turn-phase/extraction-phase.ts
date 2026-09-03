@@ -15,6 +15,12 @@ import { isCreatorInOperatorContext } from "../../authority.js";
 import type { CurrentTurnUserInputSenderAttribution } from "../../turn-input.js";
 import type { TurnPhaseCoordinatorOptions, TurnPhaseInput } from "./types.js";
 import type { AppendHookFailureEvent } from "./utils.js";
+import type { PredictionExtractionResult } from "../../predictions/index.js";
+
+const EMPTY_PREDICTION_RESULT: PredictionExtractionResult = {
+  reconciledPredictionIds: [],
+  createdExpectationIds: [],
+};
 
 // Most recently active other audiences offered to the corrective-preference
 // extractor as cross-audience targets (only on creator-in-operator turns).
@@ -87,6 +93,7 @@ export type TurnExtractionPhaseResult = {
     ReturnType<TurnPhaseCoordinatorOptions["turnGoalPromotionService"]["extractAndPersist"]>
   >;
   creatorDirectives: Awaited<ReturnType<CreatorDirectiveTurnService["extractAndPersist"]>>;
+  predictions: PredictionExtractionResult;
 };
 
 export async function runExtractionPhase(input: {
@@ -132,6 +139,7 @@ export async function runExtractionPhase(input: {
         executiveStepIds: [],
       },
       creatorDirectives: [],
+      predictions: EMPTY_PREDICTION_RESULT,
     };
   }
 
@@ -197,8 +205,13 @@ export async function runExtractionPhase(input: {
         )
       : [];
 
-  const [correctivePreferenceTurn, createdActionIds, persistedPromotions, creatorDirectives] =
-    await Promise.all([
+  const [
+    correctivePreferenceTurn,
+    createdActionIds,
+    persistedPromotions,
+    creatorDirectives,
+    predictions,
+  ] = await Promise.all([
       input.currentTurnFrameAnomaly === null
         ? input.options.correctivePreferenceTurnService.extractAndApply({
             llmClient: input.llmClient,
@@ -288,6 +301,22 @@ export async function runExtractionPhase(input: {
         sessionAudienceRole: input.sessionAudienceRole,
         participantRoster: input.participantRoster,
       }),
+      // Post-turn prediction reflection: reconcile open expectations this turn
+      // resolved (with the model's own surprise appraisal) and record new ones.
+      // Extract-only -- it reads the turn and writes the ledger, never the reply.
+      input.currentTurnFrameAnomaly === null && input.options.predictionTurnService !== undefined
+        ? input.options.predictionTurnService.extractAndReconcile({
+            llmClient: input.llmClient,
+            turnId: input.turnId,
+            isUserTurn: input.isUserTurn,
+            userMessage: input.turnInput.userMessage,
+            recentHistory: input.recentHistory,
+            sessionId: input.sessionId,
+            sourceStreamEntryIds:
+              input.sourceUserEntryIds ??
+              (input.persistedUserEntryId === undefined ? [] : [input.persistedUserEntryId]),
+          })
+        : Promise.resolve(EMPTY_PREDICTION_RESULT),
     ]);
 
   return {
@@ -299,5 +328,6 @@ export async function runExtractionPhase(input: {
     createdActionIds,
     persistedPromotions,
     creatorDirectives,
+    predictions,
   };
 }

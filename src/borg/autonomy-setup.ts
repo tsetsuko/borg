@@ -9,6 +9,7 @@ import {
   createExecutiveFocusDueTrigger,
   createGoalFollowupDueTrigger,
   createMoodValenceDropCondition,
+  createPredictionErrorSpikeCondition,
   createOpenQuestionDormantTrigger,
   createOpenQuestionUrgencyBumpCondition,
   createScheduledReflectionTrigger,
@@ -20,6 +21,7 @@ import type { Config } from "../config/index.js";
 import type { EmbeddingClient } from "../embeddings/index.js";
 import type { ExecutiveStepsRepository } from "../executive/index.js";
 import type { MoodRepository } from "../memory/affective/index.js";
+import type { PredictionRepository } from "../memory/predictions/index.js";
 import type { CommitmentRepository } from "../memory/commitments/index.js";
 import type { EpisodicRepository } from "../memory/episodic/index.js";
 import type { SelfDecisionRepository } from "../memory/self-decisions/index.js";
@@ -43,6 +45,7 @@ export type BuildAutonomySchedulerOptions = {
   executiveStepsRepository: ExecutiveStepsRepository;
   openQuestionsRepository: OpenQuestionsRepository;
   moodRepository: MoodRepository;
+  predictionRepository: PredictionRepository;
   streamWatermarkRepository: StreamWatermarkRepository;
   autonomyWakesRepository: AutonomyWakesRepository;
   scheduledWakesRepository: ScheduledWakesRepository;
@@ -202,6 +205,17 @@ export function buildAutonomyScheduler(options: BuildAutonomySchedulerOptions): 
             openQuestionsRepository: options.openQuestionsRepository,
             watermarkRepository: options.streamWatermarkRepository,
             threshold: options.config.autonomy.conditions.openQuestionUrgencyBump.threshold,
+            clock: options.clock,
+          }),
+        ]
+      : []),
+    ...(options.config.autonomy.conditions.predictionErrorSpike.enabled
+      ? [
+          createPredictionErrorSpikeCondition({
+            predictionRepository: options.predictionRepository,
+            watermarkRepository: options.streamWatermarkRepository,
+            threshold: options.config.autonomy.conditions.predictionErrorSpike.threshold,
+            scanLimit: options.config.autonomy.conditions.predictionErrorSpike.scanLimit,
             clock: options.clock,
           }),
         ]

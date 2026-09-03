@@ -24,6 +24,7 @@ import { EpisodicRepository } from "../memory/episodic/index.js";
 import { IdentityEventRepository, IdentityService } from "../memory/identity/index.js";
 import { ObservedEventRepository } from "../memory/observed-events/index.js";
 import { SelfDecisionRepository } from "../memory/self-decisions/index.js";
+import { PredictionRepository } from "../memory/predictions/index.js";
 import { TrainOfThoughtRepository } from "../memory/train-of-thought/index.js";
 import {
   ProceduralContextStatsRepository,
@@ -110,6 +111,7 @@ export type BorgRepositorySetup = Pick<
   | "activityRepository"
   | "livedExperienceDaySummaryRepository"
   | "selfDecisionRepository"
+  | "predictionRepository"
   | "trainOfThoughtRepository"
   | "observedEventRepository"
   | "correctionService"
@@ -342,6 +344,10 @@ export async function buildBorgRepositories(
     clock,
   });
   const selfDecisionRepository = new SelfDecisionRepository({
+    db: sqlite,
+    clock,
+  });
+  const predictionRepository = new PredictionRepository({
     db: sqlite,
     clock,
   });
@@ -603,6 +609,7 @@ export async function buildBorgRepositories(
     activityRepository,
     livedExperienceDaySummaryRepository,
     selfDecisionRepository,
+    predictionRepository,
     trainOfThoughtRepository,
     observedEventRepository,
     correctionService,

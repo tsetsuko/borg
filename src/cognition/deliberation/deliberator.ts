@@ -972,6 +972,10 @@ export class Deliberator {
         "borg_session_reentry_continuity",
         context.sessionReentryContinuityPromptSection,
       ),
+      promptSurfaceAdditionalSection(
+        "borg_speech_inhibition",
+        context.speechInhibitionPromptSection,
+      ),
     ]);
     const dialogueBlockMessages = withLedgerImageContentBlocks(
       currentUserBlockMessages,

@@ -236,6 +236,8 @@ export type DeliberationContext = {
   isSelfAudience?: boolean;
   audienceEntityId?: EntityId | null;
   senderEntityId?: EntityId;
+  /** M3 advisory speech-inhibition section, precomputed by the deliberation phase. */
+  speechInhibitionPromptSection?: string | null;
   userMessage: string;
   currentUserContent?: readonly BorgUserContentBlock[];
   userEntryId?: string;

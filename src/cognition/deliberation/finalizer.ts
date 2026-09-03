@@ -534,6 +534,7 @@ function createFinalizerPromptSurfaceRenderContext(
           return options.cacheableSystemPrompt?.dynamicContent ?? options.baseSystemPrompt;
         case "borg_session_reentry_continuity":
         case "borg_evidence_ledger":
+        case "borg_speech_inhibition":
         case "borg_additional_retrieval":
         case "borg_s2_plan":
         case "borg_commitment_regeneration_instruction":
