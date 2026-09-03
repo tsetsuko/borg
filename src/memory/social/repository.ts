@@ -589,6 +589,12 @@ export class SocialRepository {
    * (the partner was responsive/reliable here), otherwise to beta (ignored, wrong,
    * let down). Evidence-driven only -- never a calendar tick. Creates the row at
    * the flat prior on first evidence.
+   *
+   * The legacy `social_profiles.trust` scalar is kept as a derived projection of
+   * the per-domain posteriors (D2), refreshed in the same transaction so existing
+   * scalar readers cannot observe a stale aggregate. No `social_events` row is
+   * written for it: `social_trust_domains` is itself the ledger of this evidence,
+   * and the scalar move is a recomputation, not an independent adjustment.
    */
   adjustDomainTrust(
     entityId: EntityId,
@@ -602,13 +608,15 @@ export class SocialRepository {
       });
     }
 
+    this.upsertProfile(entityId);
     const nowMs = this.clock.now();
     const alphaDelta = input.positive ? weight : 0;
     const betaDelta = input.positive ? 0 : weight;
 
-    this.db
-      .prepare(
-        `
+    const record = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `
           INSERT INTO social_trust_domains (entity_id, domain, alpha, beta, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?)
           ON CONFLICT(entity_id, domain) DO UPDATE SET
@@ -616,18 +624,36 @@ export class SocialRepository {
             beta = beta + ?,
             updated_at = ?
         `,
-      )
-      .run(
-        entityId,
-        domain,
-        SOCIAL_TRUST_DOMAIN_PRIOR + alphaDelta,
-        SOCIAL_TRUST_DOMAIN_PRIOR + betaDelta,
-        nowMs,
-        nowMs,
-        alphaDelta,
-        betaDelta,
-        nowMs,
-      );
+        )
+        .run(
+          entityId,
+          domain,
+          SOCIAL_TRUST_DOMAIN_PRIOR + alphaDelta,
+          SOCIAL_TRUST_DOMAIN_PRIOR + betaDelta,
+          nowMs,
+          nowMs,
+          alphaDelta,
+          betaDelta,
+          nowMs,
+        );
+
+      const overall = this.overallDomainTrust(entityId);
+
+      if (overall !== null) {
+        const result = this.db
+          .prepare(
+            `
+              UPDATE social_profiles
+              SET trust = ?, updated_at = ?, record_version = record_version + 1
+              WHERE entity_id = ?
+            `,
+          )
+          .run(overall, nowMs, entityId);
+
+        this.assertAtomicProfileUpdated(result, entityId);
+      }
+    });
+    record();
 
     return this.getDomainTrust(entityId, domain);
   }

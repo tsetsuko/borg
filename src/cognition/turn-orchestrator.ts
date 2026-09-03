@@ -60,6 +60,7 @@ import type { ToolLoopCallRecord } from "./turn-action/index.js";
 import { TurnActionCoordinator } from "./turn-action/turn-action-coordinator.js";
 import { TurnActionStateService } from "./actions/turn-action-state-service.js";
 import { PredictionTurnService } from "./predictions/index.js";
+import { DomainTrustTurnService } from "./social-trust/index.js";
 import { AttributionLifecycleService } from "./attribution/lifecycle-service.js";
 import { CommitmentGuardRunner } from "./commitments/guard-runner.js";
 import { CorrectivePreferenceTurnService } from "./commitments/corrective-preference-service.js";
@@ -320,6 +321,12 @@ export class TurnOrchestrator {
             clock: this.clock,
             tracer: this.tracer,
           });
+    const domainTrustTurnService = new DomainTrustTurnService({
+      model: options.config.anthropic.models.extraction,
+      socialRepository: options.socialRepository,
+      entityRepository: options.entityRepository,
+      tracer: this.tracer,
+    });
     const turnGoalPromotionService = new TurnGoalPromotionService({
       model: options.config.anthropic.models.recallExpansion,
       identityService: options.identityService,
@@ -427,6 +434,7 @@ export class TurnOrchestrator {
       ...(options.predictionRepository === undefined
         ? {}
         : { predictionRepository: options.predictionRepository }),
+      domainTrustTurnService,
       turnGoalPromotionService,
       selfContextBuilder: this.selfContextBuilder,
       turnRetrievalCoordinator,

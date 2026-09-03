@@ -16,11 +16,14 @@ import type { CurrentTurnUserInputSenderAttribution } from "../../turn-input.js"
 import type { TurnPhaseCoordinatorOptions, TurnPhaseInput } from "./types.js";
 import type { AppendHookFailureEvent } from "./utils.js";
 import type { PredictionExtractionResult } from "../../predictions/index.js";
+import type { DomainTrustExtractionResult } from "../../social-trust/index.js";
 
 const EMPTY_PREDICTION_RESULT: PredictionExtractionResult = {
   reconciledPredictionIds: [],
   createdExpectationIds: [],
 };
+
+const EMPTY_DOMAIN_TRUST_RESULT: DomainTrustExtractionResult = { readings: [] };
 
 // Most recently active other audiences offered to the corrective-preference
 // extractor as cross-audience targets (only on creator-in-operator turns).
@@ -94,6 +97,7 @@ export type TurnExtractionPhaseResult = {
   >;
   creatorDirectives: Awaited<ReturnType<CreatorDirectiveTurnService["extractAndPersist"]>>;
   predictions: PredictionExtractionResult;
+  domainTrust: DomainTrustExtractionResult;
 };
 
 export async function runExtractionPhase(input: {
@@ -140,6 +144,7 @@ export async function runExtractionPhase(input: {
       },
       creatorDirectives: [],
       predictions: EMPTY_PREDICTION_RESULT,
+      domainTrust: EMPTY_DOMAIN_TRUST_RESULT,
     };
   }
 
@@ -211,6 +216,7 @@ export async function runExtractionPhase(input: {
     persistedPromotions,
     creatorDirectives,
     predictions,
+    domainTrust,
   ] = await Promise.all([
       input.currentTurnFrameAnomaly === null
         ? input.options.correctivePreferenceTurnService.extractAndApply({
@@ -317,6 +323,20 @@ export async function runExtractionPhase(input: {
               (input.persistedUserEntryId === undefined ? [] : [input.persistedUserEntryId]),
           })
         : Promise.resolve(EMPTY_PREDICTION_RESULT),
+      // Post-turn trust appraisal: did this partner turn out to be responsive,
+      // and about what? Folds into their per-domain Beta posteriors. Attributed
+      // to the resolved speaker when the turn has one, else the audience.
+      input.currentTurnFrameAnomaly === null && input.options.domainTrustTurnService !== undefined
+        ? input.options.domainTrustTurnService.extract({
+            llmClient: input.llmClient,
+            turnId: input.turnId,
+            isUserTurn: input.isUserTurn,
+            userMessage: input.turnInput.userMessage,
+            recentHistory: input.recentHistory,
+            sessionId: input.sessionId,
+            partnerEntityId: actionSpeaker.entityId ?? input.audienceEntityId,
+          })
+        : Promise.resolve(EMPTY_DOMAIN_TRUST_RESULT),
     ]);
 
   return {
@@ -329,5 +349,6 @@ export async function runExtractionPhase(input: {
     persistedPromotions,
     creatorDirectives,
     predictions,
+    domainTrust,
   };
 }

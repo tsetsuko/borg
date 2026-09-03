@@ -93,4 +93,25 @@ describe("SocialRepository per-domain trust", () => {
 
     expect(repo.overallDomainTrust(createEntityId())).toBeNull();
   });
+
+  it("keeps the legacy trust scalar as a derived projection of the domains (D2)", () => {
+    const repo = openRepository();
+    const entity = createEntityId();
+
+    // No domain evidence yet: the profile default stands.
+    expect(repo.upsertProfile(entity).trust).toBeCloseTo(0.5, 5);
+
+    for (let i = 0; i < 8; i += 1) repo.adjustDomainTrust(entity, "programming", { positive: true });
+
+    const afterPositive = repo.getProfile(entity);
+    expect(afterPositive!.trust).toBeCloseTo(repo.overallDomainTrust(entity)!, 5);
+    expect(afterPositive!.trust).toBeGreaterThan(0.5);
+
+    // A second domain that goes badly pulls the aggregate back down.
+    for (let i = 0; i < 8; i += 1) repo.adjustDomainTrust(entity, "cooking", { positive: false });
+
+    const afterNegative = repo.getProfile(entity);
+    expect(afterNegative!.trust).toBeCloseTo(repo.overallDomainTrust(entity)!, 5);
+    expect(afterNegative!.trust).toBeLessThan(afterPositive!.trust);
+  });
 });

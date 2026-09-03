@@ -143,6 +143,7 @@ describe("runExtractionPhase", () => {
       },
       creatorDirectives: [],
       predictions: { reconciledPredictionIds: [], createdExpectationIds: [] },
+      domainTrust: { readings: [] },
     });
     expect(buildSelfContext).not.toHaveBeenCalled();
     expect(extractAndApply).not.toHaveBeenCalled();

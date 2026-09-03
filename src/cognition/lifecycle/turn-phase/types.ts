@@ -9,6 +9,7 @@ import type {
 import type { TurnActionCoordinator } from "../../turn-action/turn-action-coordinator.js";
 import type { TurnActionStateService } from "../../actions/turn-action-state-service.js";
 import type { PredictionTurnService } from "../../predictions/index.js";
+import type { DomainTrustTurnService } from "../../social-trust/index.js";
 import type { PredictionRepository } from "../../../memory/predictions/index.js";
 import type { AttributionLifecycleService } from "../../attribution/lifecycle-service.js";
 import type { AutonomyTriggerContext } from "../../autonomy-trigger.js";
@@ -203,6 +204,9 @@ export type TurnPhaseCoordinatorOptions = {
   // Optional so partial test harnesses that omit it still typecheck; production
   // always wires it. The extraction phase skips prediction reflection when absent.
   predictionTurnService?: PredictionTurnService;
+  // Optional for the same reason as predictionTurnService: partial test harnesses
+  // omit it, production always wires it. Absent means no per-domain trust update.
+  domainTrustTurnService?: DomainTrustTurnService;
   turnGoalPromotionService: TurnGoalPromotionService;
   selfContextBuilder: TurnSelfContextBuilder;
   turnRetrievalCoordinator: TurnRetrievalCoordinator;
