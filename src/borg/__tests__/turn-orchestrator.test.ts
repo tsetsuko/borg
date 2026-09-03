@@ -869,6 +869,8 @@ describe("Borg", () => {
           request.budget !== "corrective-preference-extractor" &&
           request.budget !== "action-state-extractor" &&
           request.budget !== "goal-promotion-extractor" &&
+          request.budget !== "prediction-extractor" &&
+          request.budget !== "domain-trust-extractor" &&
           request.budget !== "frame-anomaly-classifier" &&
           request.budget !== "perception-entity-fallback" &&
           request.budget !== "perception-mode-fallback" &&

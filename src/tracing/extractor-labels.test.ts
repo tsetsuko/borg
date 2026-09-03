@@ -21,7 +21,9 @@ const EXTRACTOR_MAX_TOKEN_CONSUMER_LABELS = {
   "perception/entity-extractor.ts": ["entity_extractor", "perception-entity-fallback"],
   "perception/mode-detector.ts": ["mode_detector", "perception-mode-fallback"],
   "perception/temporal-cue.ts": ["perception-temporal-cue", "temporal_cue_extractor"],
+  "predictions/prediction-extractor.ts": ["prediction-extractor", "prediction_extractor"],
   "procedural/context-extractor.ts": ["procedural-context", "procedural_context_extractor"],
+  "social-trust/domain-trust-extractor.ts": ["domain-trust-extractor", "domain_trust_extractor"],
   "turn-action/pending-action-judge.ts": ["pending-action-judge", "pending_action_judge"],
 } as const satisfies Record<string, readonly string[]>;
 

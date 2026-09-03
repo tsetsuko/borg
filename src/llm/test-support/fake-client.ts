@@ -419,6 +419,14 @@ function isClosureResponseAuditorFallbackRequest(options: LLMCompleteOptions): b
   return options.budget === "closure-response-auditor";
 }
 
+function isPredictionExtractorFallbackRequest(options: LLMCompleteOptions): boolean {
+  return options.budget === "prediction-extractor";
+}
+
+function isDomainTrustExtractorFallbackRequest(options: LLMCompleteOptions): boolean {
+  return options.budget === "domain-trust-extractor";
+}
+
 function isRecallExpansionFallbackRequest(options: LLMCompleteOptions): boolean {
   return options.budget === "recall-expansion";
 }
@@ -487,6 +495,24 @@ function isCorrectivePreferenceResponse(response: FakeLLMResponse | undefined): 
   return false;
 }
 
+function responseCallsTool(response: FakeLLMResponse | undefined, toolName: string): boolean {
+  if (response === undefined || typeof response === "function" || typeof response !== "object") {
+    return false;
+  }
+
+  if ("tool_calls" in response) {
+    return response.tool_calls.some((toolCall) => toolCall.name === toolName);
+  }
+
+  if ("messageBlocks" in response) {
+    return response.messageBlocks.some(
+      (block) => block.type === "tool_use" && block.name === toolName,
+    );
+  }
+
+  return false;
+}
+
 function isGoalPromotionResponse(response: FakeLLMResponse | undefined): boolean {
   if (response === undefined || typeof response === "function" || typeof response !== "object") {
     return false;
@@ -503,6 +529,14 @@ function isGoalPromotionResponse(response: FakeLLMResponse | undefined): boolean
   }
 
   return false;
+}
+
+function isPredictionResponse(response: FakeLLMResponse | undefined): boolean {
+  return responseCallsTool(response, "EmitPredictionUpdate");
+}
+
+function isDomainTrustResponse(response: FakeLLMResponse | undefined): boolean {
+  return responseCallsTool(response, "EmitDomainTrustEvidence");
 }
 
 function isActionStateResponse(response: FakeLLMResponse | undefined): boolean {
@@ -720,6 +754,47 @@ function defaultGoalPromotionResponse(): LLMCompleteResult {
         name: "EmitGoalPromotion",
         input: {
           promotions: [],
+        },
+      },
+    ],
+  };
+}
+
+// Post-turn reflection extractors run on every user turn. A test that does not
+// care about them should not have to script them: without these fallbacks each
+// one eats a scripted response meant for the reply, and the turn dies further
+// down with "no scripted response available".
+function defaultPredictionResponse(): LLMCompleteResult {
+  return {
+    text: "",
+    input_tokens: 0,
+    output_tokens: 0,
+    stop_reason: "tool_use",
+    tool_calls: [
+      {
+        id: "toolu_default_prediction",
+        name: "EmitPredictionUpdate",
+        input: {
+          reconciliations: [],
+          new_expectations: [],
+        },
+      },
+    ],
+  };
+}
+
+function defaultDomainTrustResponse(): LLMCompleteResult {
+  return {
+    text: "",
+    input_tokens: 0,
+    output_tokens: 0,
+    stop_reason: "tool_use",
+    tool_calls: [
+      {
+        id: "toolu_default_domain_trust",
+        name: "EmitDomainTrustEvidence",
+        input: {
+          evidence: [],
         },
       },
     ],
@@ -971,6 +1046,22 @@ export class FakeLLMClient implements LLMClient {
       !isActionStateResponse(response)
     ) {
       return defaultActionStateResponse();
+    }
+
+    if (
+      isPredictionExtractorFallbackRequest(options) &&
+      scriptedResponseBudget(response) !== "prediction-extractor" &&
+      !isPredictionResponse(response)
+    ) {
+      return defaultPredictionResponse();
+    }
+
+    if (
+      isDomainTrustExtractorFallbackRequest(options) &&
+      scriptedResponseBudget(response) !== "domain-trust-extractor" &&
+      !isDomainTrustResponse(response)
+    ) {
+      return defaultDomainTrustResponse();
     }
 
     if (
