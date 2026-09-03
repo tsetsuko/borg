@@ -57,6 +57,8 @@ import {
   type SemanticNodeSearchCandidate,
   type SemanticNodeSearchOptions,
   type SemanticNodeStatus,
+  semanticAcquiredFromEntityIdSchema,
+  semanticAcquisitionModeSchema,
   type SemanticObservationMetadata,
 } from "./types.js";
 import { canonicalizeDomain } from "./domain.js";
@@ -86,13 +88,29 @@ type SemanticNodeRow = {
   superseded_by: string | null;
   _distance?: number;
 };
-type SemanticNodeLifecycleRow = {
+// Columns that live only in SQL: the vector mirror carries the searchable body of
+// a node, while lifecycle and acquisition provenance stay authoritative here and
+// are merged back on read.
+type SemanticNodeSqlOnlyRow = {
   archived: number | boolean;
   superseded_by: string | null;
   status: string | null;
   corrected_by: string | null;
   superseded_at: number | null;
+  acquisition_mode: string | null;
+  acquired_from_entity_id: string | null;
 };
+
+type SemanticNodeSqlOnlyFields = Pick<
+  SemanticNode,
+  | "archived"
+  | "superseded_by"
+  | "status"
+  | "corrected_by"
+  | "superseded_at"
+  | "acquisition_mode"
+  | "acquired_from_entity_id"
+>;
 
 type SemanticNodeCursorPayload = {
   updatedAt: number;
@@ -278,9 +296,7 @@ function nodeFromRow(row: Record<string, unknown>): SemanticNode {
   return parsed.data;
 }
 
-function lifecycleFromRow(
-  row: SemanticNodeLifecycleRow,
-): Pick<SemanticNode, "archived" | "superseded_by" | "status" | "corrected_by" | "superseded_at"> {
+function sqlOnlyFieldsFromRow(row: SemanticNodeSqlOnlyRow): SemanticNodeSqlOnlyFields {
   const parsed = z
     .object({
       archived: z.boolean(),
@@ -288,6 +304,8 @@ function lifecycleFromRow(
       status: semanticNodeStatusSchema,
       corrected_by: semanticNodeCorrectionRefSchema.nullable(),
       superseded_at: z.number().finite().nullable(),
+      acquisition_mode: semanticAcquisitionModeSchema.nullable(),
+      acquired_from_entity_id: semanticAcquiredFromEntityIdSchema.nullable(),
     })
     .safeParse({
       archived: row.archived === true || Number(row.archived) === 1,
@@ -301,10 +319,12 @@ function lifecycleFromRow(
         row.superseded_at === null || row.superseded_at === undefined
           ? null
           : Number(row.superseded_at),
+      acquisition_mode: row.acquisition_mode ?? null,
+      acquired_from_entity_id: row.acquired_from_entity_id ?? null,
     });
 
   if (!parsed.success) {
-    throw new SemanticError("Semantic node lifecycle row failed validation", {
+    throw new SemanticError("Semantic node SQL-only fields failed validation", {
       cause: parsed.error,
       code: "SEMANTIC_ROW_INVALID",
     });
@@ -468,7 +488,8 @@ export class SemanticNodeRepository {
         `
           SELECT id, kind, label, description, domain, aliases, confidence, source_episode_ids,
                  created_at, updated_at, last_verified_at, archived, superseded_by,
-                 status, corrected_by, superseded_at, observation_metadata
+                 status, corrected_by, superseded_at, observation_metadata,
+                 acquisition_mode, acquired_from_entity_id
           FROM semantic_nodes
           WHERE id = ?
         `,
@@ -478,33 +499,29 @@ export class SemanticNodeRepository {
     return row ?? null;
   }
 
-  private getSqlNodeLifecycle(
-    id: SemanticNodeId,
-  ): Pick<
-    SemanticNode,
-    "archived" | "superseded_by" | "status" | "corrected_by" | "superseded_at"
-  > | null {
+  private getSqlOnlyFields(id: SemanticNodeId): SemanticNodeSqlOnlyFields | null {
     const row = this.db
       .prepare(
         `
-          SELECT archived, superseded_by, status, corrected_by, superseded_at
+          SELECT archived, superseded_by, status, corrected_by, superseded_at,
+                 acquisition_mode, acquired_from_entity_id
           FROM semantic_nodes
           WHERE id = ?
         `,
       )
-      .get(id) as SemanticNodeLifecycleRow | undefined;
+      .get(id) as SemanticNodeSqlOnlyRow | undefined;
 
-    return row === undefined ? null : lifecycleFromRow(row);
+    return row === undefined ? null : sqlOnlyFieldsFromRow(row);
   }
 
-  private withSqlLifecycle(node: SemanticNode): SemanticNode {
-    const lifecycle = this.getSqlNodeLifecycle(node.id);
+  private withSqlOnlyFields(node: SemanticNode): SemanticNode {
+    const sqlOnly = this.getSqlOnlyFields(node.id);
 
-    return lifecycle === null
+    return sqlOnly === null
       ? node
       : semanticNodeSchema.parse({
           ...node,
-          ...lifecycle,
+          ...sqlOnly,
         });
   }
 
@@ -683,8 +700,8 @@ export class SemanticNodeRepository {
           INSERT INTO semantic_nodes (
             id, kind, label, description, domain, aliases, observation_metadata, confidence, source_episode_ids,
             created_at, updated_at, last_verified_at, archived, superseded_by, status,
-            corrected_by, superseded_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            corrected_by, superseded_at, acquisition_mode, acquired_from_entity_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT (id) DO UPDATE SET
             kind = excluded.kind,
             label = excluded.label,
@@ -700,7 +717,9 @@ export class SemanticNodeRepository {
             superseded_by = excluded.superseded_by,
             status = excluded.status,
             corrected_by = excluded.corrected_by,
-            superseded_at = excluded.superseded_at
+            superseded_at = excluded.superseded_at,
+            acquisition_mode = excluded.acquisition_mode,
+            acquired_from_entity_id = excluded.acquired_from_entity_id
         `,
       )
       .run(
@@ -721,6 +740,8 @@ export class SemanticNodeRepository {
         node.status,
         node.corrected_by,
         node.superseded_at,
+        node.acquisition_mode,
+        node.acquired_from_entity_id,
       );
   }
 
@@ -803,7 +824,7 @@ export class SemanticNodeRepository {
     });
     const row = rows[0];
 
-    return row === undefined ? null : this.withSqlLifecycle(nodeFromRow(row));
+    return row === undefined ? null : this.withSqlOnlyFields(nodeFromRow(row));
   }
 
   getStoredConfidence(id: SemanticNodeId): number | null {
@@ -949,7 +970,7 @@ export class SemanticNodeRepository {
       where,
     });
     const byId = new Map(
-      rows.map((row) => [String(row.id), this.withSqlLifecycle(nodeFromRow(row))]),
+      rows.map((row) => [String(row.id), this.withSqlOnlyFields(nodeFromRow(row))]),
     );
 
     return ids.map((id) => {
@@ -1033,7 +1054,7 @@ export class SemanticNodeRepository {
     const results: SemanticNodeSearchCandidate[] = [];
 
     for (const row of rows) {
-      const node = this.withSqlLifecycle(nodeFromRow(row));
+      const node = this.withSqlOnlyFields(nodeFromRow(row));
       const similarity = toSimilarity(getDistance(row));
 
       if (options.minSimilarity !== undefined && similarity < options.minSimilarity) {
@@ -1089,12 +1110,14 @@ export class SemanticNodeRepository {
       return null;
     }
 
-    const lifecycle = lifecycleFromRow({
+    const lifecycle = sqlOnlyFieldsFromRow({
       archived: current.archived as number | boolean,
       superseded_by: current.superseded_by as string | null,
       status: current.status as string | null,
       corrected_by: current.corrected_by as string | null,
       superseded_at: current.superseded_at as number | null,
+      acquisition_mode: current.acquisition_mode as string | null,
+      acquired_from_entity_id: current.acquired_from_entity_id as string | null,
     });
     const updatedAt = supersededAt ?? this.clock.now();
     const result = this.db
@@ -1316,6 +1339,8 @@ export class SemanticNodeRepository {
       "corrected_by",
       "superseded_at",
       "observation_metadata",
+      "acquisition_mode",
+      "acquired_from_entity_id",
     ] as const) {
       if (!patchKeys.has(field)) {
         delete appliedPatch[field];

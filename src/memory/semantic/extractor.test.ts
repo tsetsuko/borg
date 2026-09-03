@@ -292,6 +292,76 @@ describe("semantic extractor", () => {
     expect(prompt).toContain("A person identity anchor must use kind person");
   });
 
+  it("records how a belief was acquired and from whom", async () => {
+    const selfId = createEntityId();
+    const solId = createEntityId();
+    const run = await runIdentityGuardExtraction({
+      cleanup,
+      records: [identityEntity(selfId, "team-agent", "self", ["self"]), identityEntity(solId, "Sol", "person")],
+      selfEntityId: selfId,
+      nodes: [
+        {
+          kind: "proposition",
+          label: "Small commits are easier to review",
+          description: "Sol splits work into small commits and reviews land faster.",
+          domain: "process",
+          aliases: [],
+          observation_metadata: null,
+          relationship_claims: [],
+          identity_entity_id: null,
+          description_perspective: "impersonal",
+          confidence: 0.6,
+          source_episode_ids: [IDENTITY_GUARD_EPISODE_ID],
+          acquisition_mode: "observed_from",
+          acquired_from_entity_id: solId,
+        },
+      ],
+    });
+
+    await expect(run.nodeRepository.list()).resolves.toEqual([
+      expect.objectContaining({
+        acquisition_mode: "observed_from",
+        acquired_from_entity_id: solId,
+      }),
+    ]);
+    const prompt = String(run.llm.requests[0]?.messages[0]?.content ?? "");
+    expect(prompt).toContain("Set acquisition_mode to how the knowledge in the node was acquired");
+  });
+
+  it("drops an acquisition source that is not a supplied identity anchor", async () => {
+    const selfId = createEntityId();
+    const run = await runIdentityGuardExtraction({
+      cleanup,
+      records: [identityEntity(selfId, "team-agent", "self", ["self"])],
+      selfEntityId: selfId,
+      nodes: [
+        {
+          kind: "proposition",
+          label: "Rollback planning helps",
+          description: "Planning a rollback ahead of a release reduces mistakes.",
+          domain: "process",
+          aliases: [],
+          observation_metadata: null,
+          relationship_claims: [],
+          identity_entity_id: null,
+          description_perspective: "impersonal",
+          confidence: 0.6,
+          source_episode_ids: [IDENTITY_GUARD_EPISODE_ID],
+          acquisition_mode: "told_by",
+          acquired_from_entity_id: createEntityId(),
+        },
+      ],
+    });
+
+    // The mode still stands; only the unknown source is dropped.
+    await expect(run.nodeRepository.list()).resolves.toEqual([
+      expect.objectContaining({
+        acquisition_mode: "told_by",
+        acquired_from_entity_id: null,
+      }),
+    ]);
+  });
+
   it("rejects first-person descriptions on anchored non-self people", async () => {
     const selfId = createEntityId();
     const humanId = createEntityId();

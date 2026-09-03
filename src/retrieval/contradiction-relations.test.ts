@@ -28,6 +28,8 @@ function node(id: SemanticNode["id"]): SemanticNode {
     domain: null,
     aliases: [],
     observation_metadata: null,
+    acquisition_mode: null,
+    acquired_from_entity_id: null,
     confidence: 0.9,
     source_episode_ids: [EPISODE],
     created_at: NOW,

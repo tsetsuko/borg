@@ -47,6 +47,7 @@ import type { SemanticReviewService } from "./review-service.js";
 import type { ReviewQueueInsertInput } from "../review-queue/review-queue.js";
 import { canonicalizeDomain } from "./domain.js";
 import {
+  semanticAcquisitionModeSchema,
   semanticNodeKindSchema,
   semanticObservationMetadataSchema,
   semanticRelationSchema,
@@ -68,6 +69,8 @@ const extractorNodeBaseSchema = z.object({
   relationship_claims: z.array(relationshipClaimSchema).optional().default([]),
   confidence: z.number().min(0).max(1),
   source_episode_ids: z.array(z.string().min(1)).min(1),
+  acquisition_mode: semanticAcquisitionModeSchema.nullable().default(null),
+  acquired_from_entity_id: z.string().min(1).nullable().default(null),
 });
 const extractorDescriptionPerspectiveSchema = z.enum([
   "first_person",
@@ -91,6 +94,16 @@ const extractorNodeToolSchema = extractorNodeBaseSchema.extend({
   description_perspective: extractorDescriptionPerspectiveSchema.describe(
     "Grammatical perspective of the description, used for identity attribution validation.",
   ),
+  acquisition_mode: semanticAcquisitionModeSchema
+    .nullable()
+    .describe("How this knowledge was acquired; null when the episodes do not settle it."),
+  acquired_from_entity_id: z
+    .string()
+    .min(1)
+    .nullable()
+    .describe(
+      "Identity-anchor entity id the knowledge was acquired from, when acquisition_mode implies a person; null otherwise.",
+    ),
 });
 
 const extractorEdgeSchema = z.object({
@@ -183,6 +196,22 @@ type SemanticInsertSkipReason =
   | "relationship_claim_ungrounded"
   | "other";
 
+// An acquisition source is only recorded when it names an identity anchor we were
+// actually given: an id the model invented would point at nobody, and the field
+// exists precisely so a belief can be traced back to whose it was.
+function resolveAcquiredFromEntityId(
+  candidate: { acquired_from_entity_id: string | null },
+  anchors: readonly SemanticIdentityAnchor[],
+): EntityId | null {
+  if (candidate.acquired_from_entity_id === null) {
+    return null;
+  }
+
+  const anchor = anchors.find((item) => item.id === candidate.acquired_from_entity_id);
+
+  return anchor?.id ?? null;
+}
+
 function buildPrompt(input: {
   episodes: readonly Episode[];
   participantRoster?: ParticipantRosterForRendering | null;
@@ -210,6 +239,9 @@ function buildPrompt(input: {
     "If the source wording is ambiguous, prefer the narrower event-scoped interpretation.",
     "For observation-type propositions, decide by meaning whether the node records that someone observed something happened. When it does, populate observation_metadata with any directly stated witness, timeframe/date, count_or_intensity, source_kind, confidence, and status. Use null for unknown fields and null observation_metadata for non-observation nodes.",
     "Do not merge multiple observations into one proposition merely because they concern the same topic. Distinct witness, timeframe/date, count_or_intensity, source_kind, confidence, or status belongs in observation_metadata so identity can preserve separate observations.",
+    "Set acquisition_mode to how the knowledge in the node was acquired, judged by meaning: \"told_by\" when someone stated it, \"observed_from\" when it was seen in how someone behaved rather than said, \"inferred\" when it was reasoned out from other things rather than received, and \"tested_independently\" when it was tried or checked first-hand. Use null when the episodes do not settle it -- guessing here is worse than leaving it open.",
+    "When acquisition_mode implies a person the knowledge came from and that person is in identity_anchors_by_entity_id, copy their entity id into acquired_from_entity_id. Use null otherwise, and never invent an entity id.",
+    "Acquisition mode is about how the knowledge reached us, not about how confident we are in it or where the episode itself came from. Something heard from a reliable person is still told_by, and something worked out from good evidence is still inferred.",
     "Each node must cite source_episode_ids from the provided episode ids only.",
     "Each edge must use from_label and to_label values that match node labels exactly.",
     "Only use relation values allowed by the tool schema.",
@@ -818,6 +850,8 @@ export class SemanticExtractor {
           domain: canonicalizeDomain(candidate.domain),
           aliases: candidateAliases,
           observation_metadata: candidate.observation_metadata,
+          acquisition_mode: candidate.acquisition_mode,
+          acquired_from_entity_id: resolveAcquiredFromEntityId(candidate, identityAnchors),
           confidence: Math.min(candidate.confidence, this.confidenceCeiling),
           source_episode_ids: sourceEpisodeIds,
           created_at: nowMs,
@@ -858,6 +892,12 @@ export class SemanticExtractor {
         domain: existing.domain ?? canonicalizeDomain(candidate.domain),
         aliases: nextAliases,
         observation_metadata: existing.observation_metadata,
+        // Last stated acquisition wins: a belief first taken on someone's word and
+        // later tested first-hand has genuinely changed standing, and that is the
+        // difference this field exists to record.
+        acquisition_mode: candidate.acquisition_mode ?? existing.acquisition_mode,
+        acquired_from_entity_id:
+          resolveAcquiredFromEntityId(candidate, identityAnchors) ?? existing.acquired_from_entity_id,
         confidence: Math.max(
           existing.confidence * 0.99,
           Math.min(candidate.confidence, this.confidenceCeiling),

@@ -118,6 +118,8 @@ function makeSemanticNode(input: {
     domain: null,
     aliases: [],
     observation_metadata: null,
+    acquisition_mode: null,
+    acquired_from_entity_id: null,
     confidence: 0.7,
     source_episode_ids: [input.episodeId],
     created_at: NOW_MS,

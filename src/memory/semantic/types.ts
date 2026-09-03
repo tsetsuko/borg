@@ -2,8 +2,10 @@ import { z } from "zod";
 
 import { episodeIdSchema, streamEntryIdSchema } from "../episodic/types.js";
 import {
+  entityIdHelpers,
   semanticEdgeIdHelpers,
   semanticNodeIdHelpers,
+  type EntityId,
   type SemanticEdgeId,
   type SemanticNodeId,
 } from "../../util/ids.js";
@@ -24,6 +26,17 @@ export const SEMANTIC_RELATIONS = [
   "contradicts",
   "related_to",
   "instance_of",
+] as const;
+// M4: how a belief was ACQUIRED, which is a different axis from where it came
+// from in the pipeline (provenance_kind). "Sol does it this way, I tried it, it
+// suits me" only means something if hearsay is distinguishable from what the
+// entity tested for itself -- without that, anything picked up from a stronger
+// peer silently becomes the entity's own, which is mimicry.
+export const SEMANTIC_ACQUISITION_MODES = [
+  "told_by",
+  "observed_from",
+  "inferred",
+  "tested_independently",
 ] as const;
 export const INVALIDATION_PROCESSES = [
   "extractor",
@@ -58,6 +71,13 @@ export const semanticNodeKindSchema = z.string().regex(/^[a-z][a-z0-9_]*$/, {
 export const semanticNodeStatusSchema = z.enum(SEMANTIC_NODE_STATUSES);
 export const semanticRelationSchema = z.enum(SEMANTIC_RELATIONS);
 export const invalidationProcessSchema = z.enum(INVALIDATION_PROCESSES);
+export const semanticAcquisitionModeSchema = z.enum(SEMANTIC_ACQUISITION_MODES);
+export const semanticAcquiredFromEntityIdSchema = z
+  .string()
+  .refine((value) => entityIdHelpers.is(value), {
+    message: "Invalid entity id",
+  })
+  .transform((value) => value as EntityId);
 export const semanticNodeCorrectionRefSchema = z.union([
   semanticNodeIdSchema,
   semanticEdgeIdSchema,
@@ -98,6 +118,11 @@ export const semanticNodeSchema = z.object({
   status: semanticNodeStatusSchema.default("active"),
   corrected_by: semanticNodeCorrectionRefSchema.nullable().default(null),
   superseded_at: z.number().finite().nullable().default(null),
+  acquisition_mode: semanticAcquisitionModeSchema.nullable().default(null),
+  // Who the belief was acquired from, when the mode implies someone: a repository
+  // entity id, so it joins to that person's per-domain trust rather than to a
+  // name string. Null when the source is not a known entity.
+  acquired_from_entity_id: semanticAcquiredFromEntityIdSchema.nullable().default(null),
 });
 
 export const semanticNodeInsertSchema = semanticNodeSchema;

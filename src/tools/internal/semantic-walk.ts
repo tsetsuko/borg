@@ -82,6 +82,8 @@ function toSemanticWalkNodeOutput(
     superseded_by: node.superseded_by,
     status: node.status,
     superseded_at: node.superseded_at,
+    acquisition_mode: node.acquisition_mode,
+    acquired_from_entity_id: node.acquired_from_entity_id,
     ...(node.partial_source_visibility === undefined
       ? {}
       : { partial_source_visibility: node.partial_source_visibility }),

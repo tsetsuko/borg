@@ -107,4 +107,28 @@ export const semanticMigrations = [
       `);
     },
   },
+  {
+    id: 2,
+    name: "semantic_nodes_acquisition_mode",
+    up: (db) => {
+      // M4: HOW a belief was acquired, as opposed to where it came from in the
+      // pipeline (provenance_kind). Hearsay, something watched in someone else's
+      // behaviour, something reasoned out, and something the entity tested for
+      // itself are four different standings for the same proposition, and only
+      // the last one is properly the entity's own.
+      db.exec(`
+        ALTER TABLE semantic_nodes
+          ADD COLUMN acquisition_mode TEXT NULL CHECK (
+            acquisition_mode IS NULL OR acquisition_mode IN (
+              'told_by', 'observed_from', 'inferred', 'tested_independently'
+            )
+          );
+        ALTER TABLE semantic_nodes
+          ADD COLUMN acquired_from_entity_id TEXT NULL;
+        CREATE INDEX semantic_nodes_acquisition_mode_idx
+          ON semantic_nodes(acquisition_mode)
+          WHERE acquisition_mode IS NOT NULL;
+      `);
+    },
+  },
 ] as const satisfies readonly Migration[];

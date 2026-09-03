@@ -95,6 +95,8 @@ function makeNode(overrides: Partial<SemanticNode> = {}): SemanticNode {
     domain: overrides.domain ?? null,
     aliases: overrides.aliases ?? [],
     observation_metadata: overrides.observation_metadata ?? null,
+    acquisition_mode: overrides.acquisition_mode ?? null,
+    acquired_from_entity_id: overrides.acquired_from_entity_id ?? null,
     confidence: overrides.confidence ?? 0.7,
     source_episode_ids:
       overrides.source_episode_ids ??
