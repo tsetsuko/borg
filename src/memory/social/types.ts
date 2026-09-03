@@ -10,6 +10,22 @@ export const socialSentimentPointSchema = z.object({
 
 export const socialEventKindSchema = z.enum(["interaction", "trust_adjustment", "baseline"]);
 
+// M4: per-(entity, domain) trust as a Beta posterior. A fresh (entity, domain)
+// starts at the flat prior Beta(1,1) = "unknown": mean 0.5 but maximally wide, so
+// it reads as no evidence rather than a confident 0.5.
+export const SOCIAL_TRUST_DOMAIN_PRIOR = 1;
+
+export const socialTrustDomainSchema = z.object({
+  entity_id: entityIdSchema,
+  domain: z.string().min(1),
+  alpha: z.number().positive(),
+  beta: z.number().positive(),
+  created_at: z.number().finite(),
+  updated_at: z.number().finite(),
+});
+
+export type SocialTrustDomain = z.infer<typeof socialTrustDomainSchema>;
+
 export const socialProfileSchema = z.object({
   entity_id: entityIdSchema,
   record_version: z.number().int().positive().optional(),

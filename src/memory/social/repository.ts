@@ -22,10 +22,39 @@ import {
   socialEventKindSchema,
   socialProfileSchema,
   socialSentimentPointSchema,
+  SOCIAL_TRUST_DOMAIN_PRIOR,
   type SocialEvent,
   type SocialProfile,
   type SocialSentimentPoint,
 } from "./types.js";
+import { computeBetaStats } from "../procedural/bayes.js";
+
+/**
+ * A read of per-domain trust. `mean` is the trust level; `ci95` width is the
+ * confidence (a wide interval = "unknown"); `observations` is how much real
+ * evidence there is beyond the flat prior, so an unknown domain is legible even
+ * though its mean is also 0.5.
+ */
+export type DomainTrustReading = {
+  domain: string;
+  alpha: number;
+  beta: number;
+  mean: number;
+  ci95: [number, number];
+  observations: number;
+};
+
+function domainTrustReading(domain: string, alpha: number, beta: number): DomainTrustReading {
+  const stats = computeBetaStats(alpha, beta);
+  return {
+    domain,
+    alpha,
+    beta,
+    mean: stats.mean,
+    ci95: stats.ci_95,
+    observations: Math.max(0, alpha + beta - 2 * SOCIAL_TRUST_DOMAIN_PRIOR),
+  };
+}
 
 function parseSentimentHistory(value: string): SocialSentimentPoint[] {
   let parsed: unknown;
@@ -525,6 +554,104 @@ export class SocialRepository {
     adjust();
 
     return this.requireProfile(entityId);
+  }
+
+  /**
+   * Per-domain trust reading. Returns the flat prior (unknown) when no evidence
+   * has been recorded for this (entity, domain) yet -- never null, so callers get
+   * a legible "I don't know this person here" rather than a missing value.
+   */
+  getDomainTrust(entityId: EntityId, domain: string): DomainTrustReading {
+    const row = this.db
+      .prepare(`SELECT alpha, beta FROM social_trust_domains WHERE entity_id = ? AND domain = ?`)
+      .get(entityId, domain) as { alpha: number; beta: number } | undefined;
+
+    if (row === undefined) {
+      return domainTrustReading(domain, SOCIAL_TRUST_DOMAIN_PRIOR, SOCIAL_TRUST_DOMAIN_PRIOR);
+    }
+
+    return domainTrustReading(domain, Number(row.alpha), Number(row.beta));
+  }
+
+  /** Every domain in which this entity has recorded trust evidence, newest first. */
+  listDomainTrust(entityId: EntityId): DomainTrustReading[] {
+    const rows = this.db
+      .prepare(
+        `SELECT domain, alpha, beta FROM social_trust_domains WHERE entity_id = ? ORDER BY updated_at DESC`,
+      )
+      .all(entityId) as { domain: string; alpha: number; beta: number }[];
+
+    return rows.map((row) => domainTrustReading(row.domain, Number(row.alpha), Number(row.beta)));
+  }
+
+  /**
+   * Record one piece of trust evidence about a domain: `positive` adds to alpha
+   * (the partner was responsive/reliable here), otherwise to beta (ignored, wrong,
+   * let down). Evidence-driven only -- never a calendar tick. Creates the row at
+   * the flat prior on first evidence.
+   */
+  adjustDomainTrust(
+    entityId: EntityId,
+    domain: string,
+    input: { positive: boolean; weight?: number },
+  ): DomainTrustReading {
+    const weight = input.weight ?? 1;
+    if (!Number.isFinite(weight) || weight <= 0) {
+      throw new StorageError("Domain trust evidence weight must be a positive number", {
+        code: "SOCIAL_TRUST_DOMAIN_WEIGHT_INVALID",
+      });
+    }
+
+    const nowMs = this.clock.now();
+    const alphaDelta = input.positive ? weight : 0;
+    const betaDelta = input.positive ? 0 : weight;
+
+    this.db
+      .prepare(
+        `
+          INSERT INTO social_trust_domains (entity_id, domain, alpha, beta, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(entity_id, domain) DO UPDATE SET
+            alpha = alpha + ?,
+            beta = beta + ?,
+            updated_at = ?
+        `,
+      )
+      .run(
+        entityId,
+        domain,
+        SOCIAL_TRUST_DOMAIN_PRIOR + alphaDelta,
+        SOCIAL_TRUST_DOMAIN_PRIOR + betaDelta,
+        nowMs,
+        nowMs,
+        alphaDelta,
+        betaDelta,
+        nowMs,
+      );
+
+    return this.getDomainTrust(entityId, domain);
+  }
+
+  /**
+   * Evidence-weighted overall trust across domains -- the value the legacy scalar
+   * is derived from. Null when no domain evidence exists (the caller keeps the
+   * profile default rather than inventing a number).
+   */
+  overallDomainTrust(entityId: EntityId): number | null {
+    const readings = this.listDomainTrust(entityId);
+    if (readings.length === 0) {
+      return null;
+    }
+
+    let weightedSum = 0;
+    let weightTotal = 0;
+    for (const reading of readings) {
+      const weight = reading.alpha + reading.beta;
+      weightedSum += reading.mean * weight;
+      weightTotal += weight;
+    }
+
+    return weightTotal === 0 ? null : weightedSum / weightTotal;
   }
 
   recomputeCommitmentCount(
