@@ -208,6 +208,8 @@ export function semanticNodeStateMetadata(node: {
   superseded_at?: number | null;
   partial_source_visibility?: boolean;
   source_visibility_fraction?: number;
+  acquisition_mode?: string | null;
+  acquired_from_entity_id?: string | null;
 }): Record<string, unknown> | undefined {
   const nonActiveStatus = node.status !== undefined && node.status !== "active";
   const metadata: Record<string, unknown> = {
@@ -220,6 +222,16 @@ export function semanticNodeStateMetadata(node: {
       ? {}
       : { source_episode_ids: [...node.source_episode_ids] }),
   };
+
+  // How the belief was acquired travels with it: hearsay and something tested
+  // first-hand read the same once the wording is stripped, and they should not.
+  if (node.acquisition_mode !== undefined && node.acquisition_mode !== null) {
+    metadata.acquisition_mode = node.acquisition_mode;
+
+    if (node.acquired_from_entity_id !== undefined && node.acquired_from_entity_id !== null) {
+      metadata.acquired_from_entity_id = node.acquired_from_entity_id;
+    }
+  }
 
   if (node.partial_source_visibility === true) {
     metadata.partial_source_visibility = true;

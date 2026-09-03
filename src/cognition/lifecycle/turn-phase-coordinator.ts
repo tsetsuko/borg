@@ -10,6 +10,7 @@ import { orderedPendingResponseUserRecords } from "../ingestion/backlog-prefix.j
 import { buildParticipantRosterFromRepositories } from "../perception/index.js";
 import {
   resolveActiveParticipants,
+  resolveDomainTrustByEntityId,
   resolveParticipantProfiles,
   scanRecentParticipantStreamEntries,
 } from "../participants.js";
@@ -1227,6 +1228,13 @@ export class TurnPhaseCoordinator {
       activeParticipants,
       this.options.socialRepository,
     );
+    // Per-domain trust for everyone in the room. Recall is global; this is the
+    // relational reading the model gets to reason with, alongside the aggregate
+    // scalar on each profile.
+    const domainTrustByEntityId = resolveDomainTrustByEntityId(
+      [audienceEntityId, ...activeParticipants.map((participant) => participant.entityId)],
+      this.options.socialRepository,
+    );
     if (activeParticipants.length > 0) {
       audienceProfile = audienceProfileForParticipants(participantProfiles, audienceEntityId);
     }
@@ -1572,6 +1580,7 @@ export class TurnPhaseCoordinator {
           participantRoster,
           participantProfiles,
           audienceProfile,
+          domainTrustByEntityId,
           recencyMessages: recencyWindow.messages,
           currentTurnFrameAnomaly,
           retrievalPhase,

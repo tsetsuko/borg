@@ -1,7 +1,11 @@
 import { DEFAULT_ACTIVE_PARTICIPANT_LIMIT } from "../config/index.js";
 import type { EntityRepository } from "../memory/commitments/index.js";
 import { episodeParticipantEntityIds, type Episode } from "../memory/episodic/index.js";
-import type { SocialProfile, SocialRepository } from "../memory/social/index.js";
+import type {
+  DomainTrustReading,
+  SocialProfile,
+  SocialRepository,
+} from "../memory/social/index.js";
 import {
   filterActiveStreamEntries,
   isAbortedTurnMarker,
@@ -296,4 +300,31 @@ export function resolveParticipantProfiles(
     ...participant,
     profile: socialRepository.getProfile(participant.entityId),
   }));
+}
+
+/**
+ * Per-domain trust readings for everyone in the room, keyed by entity id so both
+ * the single-audience and multi-participant prompt renderings can look theirs up.
+ * Only domains with recorded evidence appear: a person the entity has no domain
+ * evidence about renders nothing rather than a row of flat priors.
+ */
+export function resolveDomainTrustByEntityId(
+  entityIds: readonly (EntityId | null)[],
+  socialRepository: Pick<SocialRepository, "listDomainTrust">,
+): Record<EntityId, readonly DomainTrustReading[]> {
+  const byEntityId: Record<EntityId, readonly DomainTrustReading[]> = {};
+
+  for (const entityId of entityIds) {
+    if (entityId === null || byEntityId[entityId] !== undefined) {
+      continue;
+    }
+
+    const readings = socialRepository.listDomainTrust(entityId);
+
+    if (readings.length > 0) {
+      byEntityId[entityId] = readings;
+    }
+  }
+
+  return byEntityId;
 }

@@ -13,7 +13,7 @@ import type {
   GrowthMarker,
   OpenQuestion,
 } from "../../../memory/self/index.js";
-import type { SocialProfile } from "../../../memory/social/index.js";
+import type { DomainTrustReading, SocialProfile } from "../../../memory/social/index.js";
 import type { SessionParticipationPolicy } from "../../../sessions/index.js";
 import type {
   SkillSelectionCandidate,
@@ -1142,7 +1142,11 @@ function buildUntrustedBasePromptSections(
     },
     {
       tag: "borg_audience_profile",
-      content: summarizeParticipantProfiles(context.participantProfiles, context.audienceProfile),
+      content: summarizeParticipantProfiles(
+        context.participantProfiles,
+        context.audienceProfile,
+        context.domainTrustByEntityId,
+      ),
     },
     {
       tag: "borg_thread_roster",
@@ -2570,7 +2574,35 @@ function summarizeRecentGrowth(markers: readonly GrowthMarker[] | undefined): st
   return lines.length === 1 ? null : [...lines, SELF_IDENTITY_DISCLOSURE_LINE].join("\n");
 }
 
-function summarizeSingleAudienceProfile(profile: SocialProfile | null | undefined): string | null {
+// How many domains to render per person. Ordered newest-evidence-first by the
+// repository, so the cap drops the stalest readings rather than the strongest.
+const TRUST_DOMAIN_RENDER_CAP = 6;
+
+/**
+ * Per-domain trust, rendered so the WIDTH is legible and not just the value: a
+ * domain with almost no evidence sits at 0.5 with a near-full interval, which
+ * means "I don't know this person here" -- a different thing from a settled 0.5.
+ */
+function summarizeDomainTrust(readings: readonly DomainTrustReading[] | undefined): string | null {
+  if (readings === undefined || readings.length === 0) {
+    return null;
+  }
+
+  const rendered = readings
+    .slice(0, TRUST_DOMAIN_RENDER_CAP)
+    .map(
+      (reading) =>
+        `${reading.domain} ${reading.mean.toFixed(2)} (${reading.ci95[0].toFixed(2)}-${reading.ci95[1].toFixed(2)}, n=${reading.observations})`,
+    )
+    .join("; ");
+
+  return `trust_by_domain=[${rendered}] (wider interval = less settled, not less trusted)`;
+}
+
+function summarizeSingleAudienceProfile(
+  profile: SocialProfile | null | undefined,
+  domainTrust?: readonly DomainTrustReading[],
+): string | null {
   if (profile === null || profile === undefined) {
     return null;
   }
@@ -2598,10 +2630,19 @@ function summarizeSingleAudienceProfile(profile: SocialProfile | null | undefine
     parts.push(`style=${profile.communication_style.trim()}`);
   }
 
+  const domains = summarizeDomainTrust(domainTrust);
+
+  if (domains !== null) {
+    parts.push(domains);
+  }
+
   return parts.join(" | ");
 }
 
-function summarizeParticipantProfileLine(participant: ParticipantProfileContext): string {
+function summarizeParticipantProfileLine(
+  participant: ParticipantProfileContext,
+  domainTrust?: readonly DomainTrustReading[],
+): string {
   const label = participant.displayName ?? participant.entityId;
   const role = participant.role;
   const profile = participant.profile;
@@ -2627,24 +2668,43 @@ function summarizeParticipantProfileLine(participant: ParticipantProfileContext)
     parts.push(`style=${profile.communication_style.trim()}`);
   }
 
+  const domains = summarizeDomainTrust(domainTrust);
+
+  if (domains !== null) {
+    parts.push(domains);
+  }
+
   return `- ${label} (${role}): ${parts.join(" | ")}`;
 }
 
 function summarizeParticipantProfiles(
   participants: readonly ParticipantProfileContext[] | undefined,
   audienceProfile: SocialProfile | null | undefined,
+  domainTrustByEntityId: Readonly<Record<string, readonly DomainTrustReading[]>> | undefined,
 ): string | null {
+  const domainTrustFor = (
+    entityId: string | null | undefined,
+  ): readonly DomainTrustReading[] | undefined =>
+    entityId === null || entityId === undefined ? undefined : domainTrustByEntityId?.[entityId];
+
   if (participants === undefined || participants.length === 0) {
-    return summarizeSingleAudienceProfile(audienceProfile);
+    return summarizeSingleAudienceProfile(
+      audienceProfile,
+      domainTrustFor(audienceProfile?.entity_id),
+    );
   }
 
   if (participants.length === 1) {
-    return summarizeSingleAudienceProfile(participants[0]?.profile ?? audienceProfile);
+    const profile = participants[0]?.profile ?? audienceProfile;
+
+    return summarizeSingleAudienceProfile(profile, domainTrustFor(profile?.entity_id));
   }
 
   return [
     "Participants:",
-    ...participants.map((participant) => summarizeParticipantProfileLine(participant)),
+    ...participants.map((participant) =>
+      summarizeParticipantProfileLine(participant, domainTrustFor(participant.entityId)),
+    ),
   ].join("\n");
 }
 

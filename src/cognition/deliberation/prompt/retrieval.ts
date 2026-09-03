@@ -455,6 +455,8 @@ function verificationFallbackCandidates(
         source_episode_ids: node.source_episode_ids.join(","),
         partial_source_visibility: node.partial_source_visibility === true,
         source_visibility_fraction: node.source_visibility_fraction ?? null,
+        acquisition_mode: node.acquisition_mode,
+        acquired_from_entity_id: node.acquired_from_entity_id,
       },
       payload: {
         label: node.label,

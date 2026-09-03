@@ -15,6 +15,7 @@ import type { BorgUserContentBlock } from "../../../attachments/index.js";
 import type { EntityId, SessionId } from "../../../util/ids.js";
 import type { StreamEntry, StreamWriter } from "../../../stream/index.js";
 import type { WorkingMemory } from "../../../memory/working/index.js";
+import type { DomainTrustReading } from "../../../memory/social/index.js";
 import type { SessionParticipationPolicy } from "../../../sessions/index.js";
 import type { TurnPhaseCoordinatorOptions, TurnPhaseInput } from "./types.js";
 import { sharedStateRenderOptions } from "./utils.js";
@@ -87,6 +88,7 @@ export async function runDeliberationPhase(input: {
   activeParticipants: readonly ActiveParticipant[];
   participantProfiles: readonly ParticipantProfileContext[];
   audienceProfile: ReturnType<TurnPhaseCoordinatorOptions["socialRepository"]["getProfile"]>;
+  domainTrustByEntityId: Readonly<Record<string, readonly DomainTrustReading[]>>;
   recencyMessages: readonly RecencyMessage[];
   currentTurnFrameAnomaly: ActualFrameAnomalyClassification | null;
   retrievalPhase: TurnRetrievalPhaseResult;
@@ -199,6 +201,7 @@ export async function runDeliberationPhase(input: {
       selfSnapshot: input.retrievalPhase.selfSnapshot,
       executiveFocus: input.retrievalPhase.executiveFocusWithStep,
       audienceProfile: input.audienceProfile,
+      domainTrustByEntityId: input.domainTrustByEntityId,
       recencyMessages: input.recencyMessages,
       frameAnomaly: input.currentTurnFrameAnomaly,
       evidenceLedgerPromptSection: input.retrievalPhase.evidenceLedgerContext.promptSection,

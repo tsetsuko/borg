@@ -26,7 +26,7 @@ import type {
   TraitRecord,
   ValueRecord,
 } from "../../memory/self/index.js";
-import type { SocialProfile } from "../../memory/social/index.js";
+import type { DomainTrustReading, SocialProfile } from "../../memory/social/index.js";
 import type { SkillSelectionResult } from "../../memory/procedural/index.js";
 import type { MemoryDisclosureLabelMetadata } from "../../retrieval/recall-context.js";
 import type {
@@ -291,6 +291,13 @@ export type DeliberationContext = {
    * rather than treating every audience as a cold first contact.
    */
   audienceProfile?: SocialProfile | null;
+  /**
+   * Per-domain trust for the people in the room, keyed by entity id. Trust is not
+   * one number about a person but "how much do I trust them about this kind of
+   * thing", and how settled that reading is; the scalar on the profile is only the
+   * aggregate. Entities with no domain evidence are absent rather than flat.
+   */
+  domainTrustByEntityId?: Readonly<Record<string, readonly DomainTrustReading[]>>;
   /**
    * Recent dialogue from this session's stream, pre-compiled as LLM-ready
    * messages. If omitted, the deliberator behaves as it did pre-Phase-A:

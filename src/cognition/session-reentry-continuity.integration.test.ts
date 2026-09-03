@@ -411,6 +411,7 @@ async function runDeliberationFixture(input: {
     participantProfiles: [],
     workingMemory: input.workingMemory,
     audienceProfile: null,
+    domainTrustByEntityId: {},
     recencyMessages: [],
     currentTurnFrameAnomaly: null,
     retrievalPhase: input.retrievalPhase,

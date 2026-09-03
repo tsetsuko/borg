@@ -3909,6 +3909,68 @@ describe("buildBaseSystemPrompt", () => {
     expect(block).not.toContain("Talking to:");
   });
 
+  it("renders per-domain trust with its confidence width for the single audience", () => {
+    const alice = createEntityId();
+    const prompt = buildBaseSystemPrompt(
+      makeContext({
+        participantProfiles: [
+          {
+            entityId: alice,
+            displayName: "Alice",
+            role: "audience",
+            profile: makeSocialProfile(alice, { trust: 0.7, interaction_count: 5 }),
+          },
+        ],
+        domainTrustByEntityId: {
+          [alice]: [
+            {
+              domain: "programming",
+              alpha: 9,
+              beta: 2,
+              mean: 0.82,
+              ci95: [0.55, 0.96] as [number, number],
+              observations: 9,
+            },
+            {
+              domain: "social_advice",
+              alpha: 1.2,
+              beta: 1.1,
+              mean: 0.52,
+              ci95: [0.09, 0.93] as [number, number],
+              observations: 0.3,
+            },
+          ],
+        },
+      }),
+      PROMPT_OPTIONS,
+    );
+    const block = extractBlock(prompt, "borg_audience_profile");
+
+    expect(block).toContain("programming 0.82 (0.55-0.96");
+    // The unsettled domain is legible by the width of its interval, not its value.
+    expect(block).toContain("social_advice 0.52 (0.09-0.93");
+    expect(block).toContain("wider interval = less settled");
+  });
+
+  it("omits per-domain trust for a person with no domain evidence", () => {
+    const alice = createEntityId();
+    const prompt = buildBaseSystemPrompt(
+      makeContext({
+        participantProfiles: [
+          {
+            entityId: alice,
+            displayName: "Alice",
+            role: "audience",
+            profile: makeSocialProfile(alice, { trust: 0.7, interaction_count: 5 }),
+          },
+        ],
+      }),
+      PROMPT_OPTIONS,
+    );
+
+    expect(extractBlock(prompt, "borg_audience_profile")).not.toContain("trust_by_domain");
+  });
+
   it("keeps single-user social profile wording", () => {
     const alice = createEntityId();
     const prompt = buildBaseSystemPrompt(
