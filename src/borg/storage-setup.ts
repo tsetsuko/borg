@@ -268,10 +268,14 @@ export function createMigrations(): Migration[] {
     creatorDirectiveMigrations,
     activityMigrations,
     selfDecisionMigrations,
-    predictionMigrations,
     observedEventMigrations,
     trainOfThoughtMigrations,
     promptSurfaceHistoryMigrations,
+    // New migration GROUPS must be appended at the end: composeMigrations derives
+    // each migration's id from its group's position, so inserting a group mid-list
+    // shifts the ids of every later group and forces already-applied migrations to
+    // re-run on existing databases.
+    predictionMigrations,
   );
 }
 
