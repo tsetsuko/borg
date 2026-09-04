@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { LLMCompleteResult } from "../../llm/index.js";
 import { FakeLLMClient } from "../../llm/test-support/fake-client.js";
+import { predictionMemoryDisclosureLabel } from "../../memory/common/disclosure-serializers.js";
 import { PredictionRepository, predictionMigrations } from "../../memory/predictions/index.js";
 import { openDatabase } from "../../storage/sqlite/index.js";
 import { ManualClock } from "../../util/clock.js";
@@ -73,7 +74,14 @@ describe("PredictionExtractor", () => {
     const result = await extractor.extract({
       userMessage: "actually let's leave migrations, I'll look at snapshots",
       recentHistory: [],
-      openExpectations: [{ prediction_id: open.id, content: open.content, about: null }],
+      openExpectations: [
+        {
+          prediction_id: open.id,
+          content: open.content,
+          about: null,
+          disclosureLabel: predictionMemoryDisclosureLabel(),
+        },
+      ],
       sessionId,
       turnId: "turn-2",
     });
@@ -90,6 +98,58 @@ describe("PredictionExtractor", () => {
     expect(reconciliations).toHaveLength(1);
     expect(reconciliations[0]!.error_magnitude).toBe(0.6);
     expect(reconciliations[0]!.prediction_id).toBe(open.id);
+  });
+
+  it("labels every open expectation it shows the model as self-private", async () => {
+    const repository = openRepository();
+    const sessionId = createSessionId();
+    const open = repository.recordExpectation({
+      sessionId,
+      turnId: "turn-1",
+      content: "Jacek will ask about migrations next.",
+      aboutEntityId: null,
+    });
+
+    const llmClient = new FakeLLMClient({
+      responses: [toolResponse({ reconciliations: [], new_expectations: [] })],
+    });
+
+    const extractor = new PredictionExtractor({
+      llmClient,
+      model: "test-model",
+      predictionRepository: repository,
+      turnId: "turn-2",
+      sessionId,
+    });
+
+    await extractor.extract({
+      userMessage: "morning",
+      recentHistory: [],
+      openExpectations: [
+        {
+          prediction_id: open.id,
+          content: open.content,
+          about: null,
+          disclosureLabel: predictionMemoryDisclosureLabel(),
+        },
+      ],
+      sessionId,
+      turnId: "turn-2",
+    });
+
+    const payload = JSON.parse(String(llmClient.requests[0]!.messages[0]!.content)) as {
+      open_expectations: { content: string; disclosure: string; disclosure_label: unknown }[];
+    };
+
+    // The row reaches the model with its label attached, not stripped of it.
+    expect(payload.open_expectations).toHaveLength(1);
+    expect(payload.open_expectations[0]!.content).toBe(open.content);
+    expect(payload.open_expectations[0]!.disclosure).toContain("self_private");
+    expect(payload.open_expectations[0]!.disclosure_label).toMatchObject({
+      disclosure_class: "self_private",
+      origin_audience_entity_ids: [],
+      private_to_entity_ids: [],
+    });
   });
 
   it("drops a reconciliation for a prediction id that was not surfaced as open", async () => {

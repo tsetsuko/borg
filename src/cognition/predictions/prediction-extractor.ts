@@ -8,6 +8,8 @@ import {
   type LLMMessage,
   type LLMToolDefinition,
 } from "../../llm/index.js";
+import type { MemoryDisclosureLabel } from "../../memory/common/disclosure-label.js";
+import { memoryDisclosurePayloadFields } from "../../memory/common/disclosure-serializers.js";
 import type { PredictionRepository } from "../../memory/predictions/index.js";
 import {
   entityIdHelpers,
@@ -67,6 +69,12 @@ export type OpenExpectationForPrompt = {
   prediction_id: PredictionEventId;
   content: string;
   about: string | null;
+  /**
+   * How the expectation may be disclosed. Carried alongside the content so the
+   * extraction model never reads a private-bearing row without its label; it does
+   * not narrow which expectations are recalled.
+   */
+  disclosureLabel: MemoryDisclosureLabel;
 };
 
 export type PredictionExtractorOptions = {
@@ -114,6 +122,7 @@ function buildMessages(input: ExtractPredictionsInput): LLMMessage[] {
           prediction_id: expectation.prediction_id,
           content: expectation.content,
           about: expectation.about,
+          ...memoryDisclosurePayloadFields(expectation.disclosureLabel),
         })),
       }),
     },

@@ -1,3 +1,4 @@
+import { predictionMemoryDisclosureLabel } from "../../memory/common/disclosure-serializers.js";
 import type { EpisodicRepository } from "../../memory/episodic/index.js";
 import type { LLMClient } from "../../llm/index.js";
 import type { PredictionRepository } from "../../memory/predictions/index.js";
@@ -66,6 +67,7 @@ export class PredictionTurnService {
         prediction_id: expectation.prediction_id,
         content: expectation.content,
         about: expectation.about,
+        disclosureLabel: predictionMemoryDisclosureLabel(),
       }));
 
     const extractor = new PredictionExtractor({

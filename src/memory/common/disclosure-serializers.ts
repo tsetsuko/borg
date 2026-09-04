@@ -58,6 +58,25 @@ export function goalMemoryDisclosureLabel(
     : relationshipPrivateMemoryDisclosureLabel(entityIds);
 }
 
+/**
+ * An expectation (and its later reconciliation) is the entity's own first-person
+ * appraisal of what comes next. Nobody told it to the entity, so unlike episodic
+ * or social rows there is no speaker whose privacy it inherits: it is self-private
+ * with no origin audience.
+ *
+ * `about_entity_id` deliberately does NOT become an origin id. It names who the
+ * expectation is ABOUT, not who was in the room when it formed; treating it as
+ * provenance would both claim that entity witnessed the appraisal and, through
+ * `privateToEntityIds`, mark the entity's own thought as private to somebody else.
+ * The row's `origin_audience` column is free text rather than an entity id and is
+ * never written today; when it starts carrying ids, they belong here.
+ *
+ * Presentation only. Prediction recall (`listOpen`) stays global to the being.
+ */
+export function predictionMemoryDisclosureLabel(): MemoryDisclosureLabel {
+  return selfPrivateMemoryDisclosureLabel();
+}
+
 export function openQuestionMemoryDisclosureLabel(
   question: Pick<OpenQuestion, "audience_entity_id"> & {
     disclosure_label?: MemoryDisclosureLabel | null;
