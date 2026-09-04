@@ -61,6 +61,18 @@ agency:
   contingency_confidence: 0.8
 
 differentiation:
-  # consumer: M4
+  # consumer: TASK-032 (czytelnik retencji imitacji; blokowany przez TASK-028)
   # architecture:431-441 -- observe -> imitate -> observe outcome -> retain/modify/reject.
+  #
+  # NIC TEGO JESZCZE NIE CZYTA i jest to zapisane swiadomie (TASK-031).
+  # Konsumentem bylo "M4", ale M4 zbudowalo tylko GORNA polowe: zaufanie per domena
+  # (od kogo sie uczyc) i prowenienecje nabycia PRZEKONAN. Retencja liczy sie z wyniku
+  # WLASNEGO eksperymentu nad przejetym ZACHOWANIEM, a tego nie ma: umiejetnosci
+  # w src/memory/procedural/ maja posteriory Beta, ale zero prowenienecji (TASK-028)
+  # i zero kroku retain/reject.
+  #
+  # KSZTALT JEST TYMCZASOWY. Jedna liczba nad krzywa nie nazywa zadnej wielkosci --
+  # ta sama wada, ktora M1 naprawilo rozbijajac agency na floor + confidence (:56-59).
+  # Docelowy parametr bedzie para liczb i zostanie napisany przy realnym czytelniku,
+  # nie na zapas.
   imitation_retention_threshold: 0.6

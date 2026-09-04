@@ -105,6 +105,21 @@ describe("temperament.yaml", () => {
     expect(findOrphanParameters([], { "invented.parameter": "M5" }, ["M0"])).toEqual([]);
   });
 
+  it("stays quiet about a parameter whose consumer is a task that has not landed", () => {
+    // TASK-031: the consumer vocabulary carries backlog tasks as well as milestones,
+    // for a reader no milestone scoped. An unlanded task is skipped exactly like an
+    // unlanded milestone -- same code path, no per-key exception.
+    expect(findOrphanParameters([], { "invented.parameter": "TASK-999" }, ["M0"])).toEqual([]);
+  });
+
+  it("reports a parameter whose consumer task has landed and which nothing reads", () => {
+    // And the task form is shown to fail, not assumed to guard: once the task is
+    // listed as landed, an unread key is an orphan on the same terms as a milestone.
+    expect(
+      findOrphanParameters([], { "invented.parameter": "TASK-999" }, ["M0", "TASK-999"]),
+    ).toEqual(["invented.parameter (consumer TASK-999 has landed)"]);
+  });
+
   it("does not accept a bare-leaf substring as a read", () => {
     // "figures, dates, names" in borg's epistemic_posture must NOT count as a read
     // of attachment.figure.
