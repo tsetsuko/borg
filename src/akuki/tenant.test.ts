@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { buildAkukiClients } from "./tenant.js";
 
 const embeddingEnv = {
+  ANTHROPIC_API_KEY: "direct-secret",
   BORG_EMBEDDING_BASE_URL: "http://127.0.0.1:11434/v1",
   BORG_EMBEDDING_MODEL: "bge-m3",
   BORG_EMBEDDING_DIMS: "1024",

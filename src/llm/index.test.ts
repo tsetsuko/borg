@@ -2061,16 +2061,19 @@ describe("llm", () => {
     });
   });
 
-  it("routes requests through ANTHROPIC_BASE_URL when set", async () => {
+  it("uses ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL in auto auth mode", async () => {
     const requestedUrls: string[] = [];
-    const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+    const authorizationHeaders: string[] = [];
+    const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const url = input instanceof Request ? input.url : String(input);
       requestedUrls.push(url);
+      authorizationHeaders.push(new Headers(init?.headers).get("authorization") ?? "");
       return jsonResponse(createMessageBody());
     });
     vi.stubGlobal("fetch", fetchMock);
 
     const client = new AnthropicLLMClient({
+      authMode: "auto",
       env: {
         ANTHROPIC_AUTH_TOKEN: "oauth-token",
         ANTHROPIC_BASE_URL: "https://aiproxy.example.com",
@@ -2089,6 +2092,7 @@ describe("llm", () => {
     for (const url of requestedUrls) {
       expect(url.startsWith("https://aiproxy.example.com")).toBe(true);
     }
+    expect(authorizationHeaders).toEqual(requestedUrls.map(() => "Bearer oauth-token"));
   });
 
   it("builds an OAuth client from the shared credentials file", async () => {

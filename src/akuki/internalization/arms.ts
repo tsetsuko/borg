@@ -25,7 +25,7 @@
 // flaw: it is why the test MUST report "not internalised" at t0. A green result
 // on day one means the measurement is broken, not that he grew up in an afternoon.
 
-import { cpSync, mkdirSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Scaffolding } from "../seed/scaffolding.js";
 
@@ -95,7 +95,14 @@ export function prepareArmDirectory(arm: ArmSpec, liveDataDir: string): void {
   }
 
   // Empty memory, but the SAME config -- embedding model and vector width must
-  // match or LanceDB rejects the store on open.
+  // match or LanceDB rejects the store on open. When the tenant is configured by
+  // file, carry that file across so an empty arm pins the same dims. When it is
+  // configured by env (Borg.open writes no config.json, and env overrides file
+  // anyway), there is nothing to copy: every arm in one reading opens under the
+  // same env, so the fresh store adopts identical dims without it.
   mkdirSync(arm.dataDir, { recursive: true });
-  cpSync(join(liveDataDir, "config.json"), join(arm.dataDir, "config.json"));
+  const configPath = join(liveDataDir, "config.json");
+  if (existsSync(configPath)) {
+    cpSync(configPath, join(arm.dataDir, "config.json"));
+  }
 }
