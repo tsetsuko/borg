@@ -17,8 +17,14 @@ import {
   validateAkukiSmokeEmbeddings,
 } from "./smoke-config.js";
 
-export const AKUKI_DEFAULT_ENDPOINT_MODEL = "generative-apis/qwen3-235b-a22b-instruct-2507";
-export const AKUKI_DEFAULT_BASE_URL = "https://inference.kratos.p4.int/v1";
+// There is deliberately no default endpoint model and no default base URL.
+// Both used to point at Kratos; that route was abandoned on 2026-09-02 and Akuki
+// runs on Anthropic models only. A default would silently aim the volume roles at
+// an endpoint nobody chose, which is the worst kind of configuration bug: it looks
+// configured. A non-Anthropic role now requires AKUKI_ENDPOINT_MODEL and
+// AKUKI_LLM_BASE_URL to be set explicitly, and a missing one raises a ConfigError
+// from OpenAICompatibleLLMClient at the first non-claude call rather than falling
+// back anywhere.
 
 // The volume roles. `cognition` is deliberately absent: it is Akuki's actual
 // thinking and is set separately, so that pointing the cheap roles at an endpoint
@@ -71,16 +77,14 @@ export function buildAkukiClients(options: AkukiClientOptions = {}): AkukiClient
 
   const anthropicOnly = isAkukiAnthropicOnly(env);
 
-  const baseUrl = env.AKUKI_LLM_BASE_URL ?? AKUKI_DEFAULT_BASE_URL;
+  const baseUrl = env.AKUKI_LLM_BASE_URL ?? "";
   const endpointApiKey = env.AKUKI_LLM_API_KEY ?? "";
   const anthropicApiKey = env.AKUKI_ANTHROPIC_API_KEY ?? "";
 
-  // In normal operation the historical Kratos default remains intact. The smoke
-  // mode never fills a missing role with that default: only an explicitly set
-  // AKUKI_ENDPOINT_MODEL may populate the volume roles before validation.
-  const endpointModel = anthropicOnly
-    ? env.AKUKI_ENDPOINT_MODEL?.trim()
-    : (env.AKUKI_ENDPOINT_MODEL ?? AKUKI_DEFAULT_ENDPOINT_MODEL);
+  // Only an explicitly set AKUKI_ENDPOINT_MODEL may populate the volume roles,
+  // in every mode. Leaving them unset is what makes the Anthropic-only validation
+  // below able to complain about a genuinely missing role.
+  const endpointModel = env.AKUKI_ENDPOINT_MODEL?.trim();
   if (endpointModel) {
     applyAkukiModelSlots(env, endpointModel);
   }
