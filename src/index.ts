@@ -652,3 +652,12 @@ export {
   type StoredAttachmentRecord,
   type TurnInputAttachment,
 } from "./attachments/index.js";
+
+// Akuki-specific wiring, exported for the connector package that lives outside
+// this repository. Upstream borg has no reason to expose these; this fork does,
+// because the BotArena transport is platform code and belongs in its own package
+// (the same split sol-connector makes), while the seed, the model clients and the
+// prediction parameters are entity code and belong here.
+export { applyAkukiSeed } from "./akuki/seed/apply.js";
+export { applyAkukiPredictionEnv } from "./akuki/prediction-config.js";
+export { buildAkukiClients } from "./akuki/tenant.js";

@@ -32,8 +32,6 @@
     "assess": "tsx assessor/cli.ts",
     "chat": "tsx scripts/chat.ts",
     "daemon": "tsx scripts/daemon.ts",
-    "akuki:arena": "tsx scripts/akuki-arena.ts",
-    "akuki:arena:dry-run": "tsx scripts/akuki-arena.ts --dry-run",
     "debug": "tsx scripts/debug.ts",
     "dev": "tsx watch src/cli/index.ts",
     "dev:server": "npm --prefix demo/server run dev",
