@@ -1,7 +1,14 @@
 import { pathToFileURL } from "node:url";
 
 import { serve } from "@hono/node-server";
-import { Borg, DemoMessageConnector, loadConfig, type MessageConnector } from "borg";
+import {
+  Borg,
+  DemoMessageConnector,
+  loadConfig,
+  type EmbeddingClient,
+  type LLMClient,
+  type MessageConnector,
+} from "borg";
 
 import {
   createDemoServerApp,
@@ -19,6 +26,20 @@ import { createResetBorgController, type BorgHandle } from "./reset.js";
 // the plugin does -- it never references any specific platform.
 type ExternalConnectorPlugin = {
   outboundConnectors: MessageConnector[];
+  /**
+   * Called before loadConfig, so a plugin may put values in the environment that
+   * the configuration then reads. Kept generic on purpose: the server does not know
+   * or care which variables, only that a plugin may need to derive some from its own
+   * source of truth rather than have them duplicated in a deployment's env file.
+   */
+  prepareEnv?(): void;
+  /**
+   * Model clients for Borg.open. A plugin whose entity must run on specific
+   * providers supplies them here instead of the server hard-coding any; absent, the
+   * server opens borg with its own defaults exactly as before.
+   */
+  llmClient?: LLMClient;
+  embeddingClient?: EmbeddingClient;
   start(ctx: {
     getBorg: () => Borg;
     log?: (level: string, message: string) => void;
@@ -64,13 +85,18 @@ function readCorsOrigins(): string[] {
     .filter((origin) => origin.length > 0);
 }
 
+// Loaded before loadConfig, not after: prepareEnv exists so a plugin can set
+// configuration-bearing environment variables, and loadConfig reads the environment
+// once. Loading the plugin later would make that hook silently useless.
+const connectorPlugin = await loadExternalConnectorPlugin();
+connectorPlugin?.prepareEnv?.();
+
 const configuredDataDir = process.env.BORG_DATA_DIR ?? ".borg-data/demo";
 const demoConfig = loadConfig({ dataDir: configuredDataDir });
 const dataDir = demoConfig.dataDir;
 const demoCreatorEntityName = process.env.DEMO_CREATOR_ENTITY_NAME ?? undefined;
 const port = readPort();
 const live = createLiveBridge();
-const connectorPlugin = await loadExternalConnectorPlugin();
 
 async function openDemoBorg(): Promise<Borg> {
   const borg = await Borg.open({
@@ -81,6 +107,12 @@ async function openDemoBorg(): Promise<Borg> {
       new DemoMessageConnector(),
       ...(connectorPlugin?.outboundConnectors ?? []),
     ],
+    ...(connectorPlugin?.llmClient === undefined
+      ? {}
+      : { llmClient: connectorPlugin.llmClient }),
+    ...(connectorPlugin?.embeddingClient === undefined
+      ? {}
+      : { embeddingClient: connectorPlugin.embeddingClient }),
   });
   ensureDemoDefaultSession(borg, { demoCreatorEntityName });
   return borg;
