@@ -12,6 +12,8 @@ import {
 
 import {
   createDemoServerApp,
+  DEMO_DEFAULT_AUDIENCE_LABEL,
+  DEMO_DEFAULT_CREATOR_ENTITY_NAME,
   ensureDemoDefaultSession,
   runtimeConfigFromConfig,
   serializeStreamEntries,
@@ -69,7 +71,11 @@ async function loadExternalConnectorPlugin(): Promise<ExternalConnectorPlugin | 
  * to it. Set DEMO_HOST=127.0.0.1 and reach it through a tunnel or a private network.
  */
 function readHost(): string | undefined {
-  const raw = process.env.DEMO_HOST?.trim();
+  return readOptionalEnv("DEMO_HOST");
+}
+
+function readOptionalEnv(name: string): string | undefined {
+  const raw = process.env[name]?.trim();
   return raw === undefined || raw === "" ? undefined : raw;
 }
 
@@ -107,6 +113,13 @@ const configuredDataDir = process.env.BORG_DATA_DIR ?? ".borg-data/demo";
 const demoConfig = loadConfig({ dataDir: configuredDataDir });
 const dataDir = demoConfig.dataDir;
 const demoCreatorEntityName = process.env.DEMO_CREATOR_ENTITY_NAME ?? undefined;
+/**
+ * Who the default session is with. Unset keeps the built-in demo fixture, which is a
+ * person's name -- so a deployment that leaves it unset has its entity meeting, and
+ * remembering, that fixture under a name nobody chose. Nothing in the UI names the
+ * audience, so the only way to see the value is this line and the session row.
+ */
+const demoAudienceLabel = readOptionalEnv("DEMO_AUDIENCE_LABEL");
 const port = readPort();
 const live = createLiveBridge();
 
@@ -126,7 +139,7 @@ async function openDemoBorg(): Promise<Borg> {
       ? {}
       : { embeddingClient: connectorPlugin.embeddingClient }),
   });
-  ensureDemoDefaultSession(borg, { demoCreatorEntityName });
+  ensureDemoDefaultSession(borg, { demoCreatorEntityName, demoAudienceLabel });
   return borg;
 }
 
@@ -164,6 +177,7 @@ const { app, injectWebSocket } = createDemoServerApp({
   corsOrigins: readCorsOrigins(),
   resetBorg,
   demoCreatorEntityName,
+  demoAudienceLabel,
   runtimeConfig: runtimeConfigFromConfig(demoConfig),
 });
 const host = readHost();
@@ -180,6 +194,10 @@ injectWebSocket(server);
 console.log(
   `Borg demo server listening on http://${host ?? "localhost"}:${port}` +
     (host === undefined ? " (every interface)" : ""),
+);
+console.log(
+  `default session audience: ${demoAudienceLabel ?? `${DEMO_DEFAULT_AUDIENCE_LABEL} (built-in default)`}; ` +
+    `creator: ${demoCreatorEntityName ?? `${DEMO_DEFAULT_CREATOR_ENTITY_NAME} (built-in default)`}`,
 );
 
 let shuttingDown = false;

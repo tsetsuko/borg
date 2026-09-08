@@ -790,7 +790,7 @@ export function ensureDemoCreator(borg: Borg, name = DEMO_DEFAULT_CREATOR_ENTITY
 
 export function ensureDemoDefaultSession(
   borg: Borg,
-  options: { demoCreatorEntityName?: string } = {},
+  options: { demoCreatorEntityName?: string; demoAudienceLabel?: string } = {},
 ) {
   ensureDemoCreator(borg, options.demoCreatorEntityName ?? DEMO_DEFAULT_CREATOR_ENTITY_NAME);
 
@@ -799,7 +799,25 @@ export function ensureDemoDefaultSession(
   // -- no other participant in the room) sets its audience once; re-passing the demo
   // default here would re-stamp that on every boot, and every record written in the
   // session inherits its audience as origin provenance.
-  return ensureDemoSession(borg, { sessionId: DEFAULT_SESSION_ID });
+  if (options.demoAudienceLabel === undefined) {
+    return ensureDemoSession(borg, { sessionId: DEFAULT_SESSION_ID });
+  }
+
+  // A deployment that names its audience is the other case: the configured label is who
+  // this session is with, so it is stamped on every boot rather than adopted once. The
+  // entity is resolved from that label and stamped with it, because carrying the label
+  // alone would leave a session naming one person and pointing at another -- /api/turn
+  // prefers the stored id over the label (resolveTurnAudienceEntityId), so a stale
+  // binding would quietly outlive the rename. config_default_user provenance never
+  // overwrites a stronger one, so a name the audience declared themselves survives this.
+  return ensureDemoSession(borg, {
+    sessionId: DEFAULT_SESSION_ID,
+    audienceLabel: options.demoAudienceLabel,
+    audienceEntityId: borg.entities.resolve(options.demoAudienceLabel, {
+      kind: "person",
+      provenance: "config_default_user",
+    }),
+  });
 }
 
 export function ensureDemoOperatorSession(borg: Borg) {
@@ -3005,6 +3023,7 @@ export type DemoServerAppInput = {
   resetBorg?: () => Promise<void>;
   requestGate?: BorgRequestGate;
   demoCreatorEntityName?: string;
+  demoAudienceLabel?: string;
   runtimeConfig?: DemoRuntimeConfig;
 };
 
@@ -3093,12 +3112,14 @@ export function createDemoServerApp(args: DemoServerAppInput) {
     resetBorg: args.resetBorg,
     requestGate: args.requestGate ?? new BorgRequestGate(),
     demoCreatorEntityName: args.demoCreatorEntityName ?? DEMO_DEFAULT_CREATOR_ENTITY_NAME,
+    demoAudienceLabel: args.demoAudienceLabel,
     runtimeConfig: args.runtimeConfig,
   };
   const app = new Hono();
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
   ensureDemoDefaultSession(input.borg, {
     demoCreatorEntityName: input.demoCreatorEntityName,
+    demoAudienceLabel: input.demoAudienceLabel,
   });
   input.live.setStreamEntrySerializer((entries) => serializeStreamEntries(input.borg, entries));
   input.live.observeStreamAppend((entries) => {
@@ -4395,6 +4416,7 @@ export function createDemoServerApp(args: DemoServerAppInput) {
       await input.resetBorg();
       ensureDemoDefaultSession(input.borg, {
         demoCreatorEntityName: input.demoCreatorEntityName,
+        demoAudienceLabel: input.demoAudienceLabel,
       });
       return c.json({ ok: true });
     } catch (error) {

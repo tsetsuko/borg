@@ -47,6 +47,7 @@ import type { StreamWriter } from "../../../../src/stream/index.js";
 import {
   broadcastMaintenanceTick,
   createDemoServerApp,
+  DEMO_DEFAULT_AUDIENCE_LABEL,
   ensureDemoDefaultSession,
   runtimeConfigFromConfig,
   wireMaintenanceSchedulerLiveObserver,
@@ -1016,6 +1017,37 @@ describe("demo server", () => {
     const session = borg.sessions.get(DEFAULT_SESSION_ID);
     expect(session?.audience_label).toBe("self");
     expect(session?.audience_entity_id).toBe(selfEntityId);
+  });
+
+  it("stamps a configured default-session audience onto the entity that name already names", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-demo-server-configured-audience-"));
+    tempDirs.push(tempDir);
+    const { borg, live } = await openHarness({ tempDir });
+    closers.push(() => borg.close());
+    // The first boot stamps the built-in fixture, which is what a deployment that never
+    // configured an audience ends up remembering its operator as.
+    createDemoServerApp({ borgHandle: { current: borg }, live });
+    expect(borg.sessions.get(DEFAULT_SESSION_ID)?.audience_label).toBe(
+      DEMO_DEFAULT_AUDIENCE_LABEL,
+    );
+
+    const declared = borg.entities.resolve("Zosia", {
+      kind: "person",
+      provenance: "user_declared",
+    });
+
+    ensureDemoDefaultSession(borg, { demoAudienceLabel: "Zosia" });
+
+    const session = borg.sessions.get(DEFAULT_SESSION_ID);
+    expect(session?.audience_label).toBe("Zosia");
+    // The binding moves with the label. Left behind, it would keep pointing at the
+    // fixture while the session read as if it were with someone else.
+    expect(session?.audience_entity_id).toBe(declared);
+    expect(
+      borg.entities.list({ kind: "person" }).filter((entity) => entity.canonical_name === "Zosia"),
+    ).toHaveLength(1);
+    // A name its bearer declared outranks one that came from configuration.
+    expect(borg.entities.get(declared)?.name_provenance).toBe("user_declared");
   });
 
   it("serves the in-flight turn snapshot while a turn is running", async () => {
@@ -4970,6 +5002,8 @@ describe("demo server", () => {
     vi.doMock("@hono/node-server", () => ({ serve: serveMock }));
     vi.doMock("../app.js", () => ({
       createDemoServerApp: createDemoServerAppMock,
+      DEMO_DEFAULT_AUDIENCE_LABEL: "mock-audience",
+      DEMO_DEFAULT_CREATOR_ENTITY_NAME: "mock-creator",
       ensureDemoDefaultSession: vi.fn(),
       runtimeConfigFromConfig: vi.fn(() => ({
         model: "entry-cognition",
