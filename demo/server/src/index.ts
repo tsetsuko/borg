@@ -61,6 +61,18 @@ async function loadExternalConnectorPlugin(): Promise<ExternalConnectorPlugin | 
   return mod.createDemoPlugin();
 }
 
+/**
+ * Interface to accept connections on. @hono/node-server without a hostname accepts
+ * on EVERY interface, which is fine on a laptop and is not fine on a host with a
+ * public address: the only barrier left is whatever the cloud firewall happens to
+ * allow, and this server exposes an entity's whole memory plus the ability to talk
+ * to it. Set DEMO_HOST=127.0.0.1 and reach it through a tunnel or a private network.
+ */
+function readHost(): string | undefined {
+  const raw = process.env.DEMO_HOST?.trim();
+  return raw === undefined || raw === "" ? undefined : raw;
+}
+
 function readPort(): number {
   const raw = process.env.PORT ?? "7740";
   const port = Number.parseInt(raw, 10);
@@ -154,14 +166,21 @@ const { app, injectWebSocket } = createDemoServerApp({
   demoCreatorEntityName,
   runtimeConfig: runtimeConfigFromConfig(demoConfig),
 });
+const host = readHost();
 const server = serve({
   fetch: app.fetch,
   port,
+  // Omitted when unset, so the previous every-interface behaviour is unchanged for
+  // anyone who does not ask for a different one.
+  ...(host === undefined ? {} : { hostname: host }),
 });
 
 injectWebSocket(server);
 
-console.log(`Borg demo server listening on http://localhost:${port}`);
+console.log(
+  `Borg demo server listening on http://${host ?? "localhost"}:${port}` +
+    (host === undefined ? " (every interface)" : ""),
+);
 
 let shuttingDown = false;
 const shutdown = async (signal: NodeJS.Signals) => {

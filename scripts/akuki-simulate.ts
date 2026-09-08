@@ -16,8 +16,13 @@ import { PersonaSession } from "../simulator/persona.js";
 import { tomPersona } from "../simulator/personas/tom.js";
 import { runSimulation } from "../simulator/runner.js";
 import { captureAkukiSnapshot } from "../src/akuki/snapshot-capture.js";
+import { requireAkukiDataDir } from "../src/akuki/smoke-config.js";
 
-const liveDir = process.env.AKUKI_DATA_DIR ?? "/home/zosia/projects/ai/akuki/data/akuki";
+// No default path. Akuki's live tenant moved to the VPS on 2026-09-08, so a default
+// pointing at a local directory would be a lie -- and worse, a script that finds
+// nothing there could create a tenant and start a second Akuki alongside the real
+// one. Two writers split the memory.
+const liveDir = requireAkukiDataDir(process.env);
 const expRoot = process.env.AKUKI_EXPERIMENT_DIR ?? "/home/zosia/projects/ai/akuki/data/experiments";
 const turns = Number(process.env.AKUKI_SIM_TURNS ?? 6);
 
