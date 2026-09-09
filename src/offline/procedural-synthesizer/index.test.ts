@@ -14,6 +14,7 @@ import { createSkillsListTool } from "../../tools/index.js";
 import { ManualClock } from "../../util/clock.js";
 import {
   DEFAULT_SESSION_ID,
+  createEntityId,
   createSkillId,
   createStreamEntryId,
   type EntityId,
@@ -68,6 +69,8 @@ function createSkillCandidateResponse(input: {
   approach?: string;
   abstraction_fit?: "too_narrow" | "usable" | "too_broad";
   rejection_reason?: "unusable_abstraction" | "centered_proper_noun" | null;
+  acquisition_mode?: "told_by" | "observed_from" | "inferred" | "tested_independently" | null;
+  acquired_from_entity_id?: string | null;
   inputTokens?: number;
   outputTokens?: number;
 }) {
@@ -86,6 +89,8 @@ function createSkillCandidateResponse(input: {
             input.approach ?? "Compare the failing state against the last known-good state.",
           abstraction_fit: input.abstraction_fit ?? "usable",
           rejection_reason: input.rejection_reason ?? null,
+          acquisition_mode: input.acquisition_mode ?? null,
+          acquired_from_entity_id: input.acquired_from_entity_id ?? null,
         },
       },
     ],
@@ -171,6 +176,7 @@ async function addSuccessEvidence(
     grounded?: boolean;
     skillActuallyApplied?: boolean;
     audienceEntityId?: EntityId | null;
+    participantEntityIds?: readonly EntityId[];
     selectedSkillId?: SkillId | null;
     additionalResolvedEpisodeIds?: readonly EpisodeId[];
   } = {},
@@ -183,6 +189,7 @@ async function addSuccessEvidence(
         narrative: "The deploy failed until the rollback state was compared to the clean release.",
         tags: ["deploy"],
         source_stream_ids: sourceStreamIds,
+        participants: [...(input.participantEntityIds ?? [])],
         audience_entity_id: input.audienceEntityId,
         shared: input.audienceEntityId === undefined || input.audienceEntityId === null,
       },
@@ -414,6 +421,60 @@ describe("ProceduralSynthesizerProcess", () => {
         applies_when: "deployment rollback comparison",
       }),
     ]);
+  });
+
+  it("stores an imitated skill's source and drops an entity id nobody was", async () => {
+    const lunaria = createEntityId();
+    const llm = new FakeLLMClient({
+      responses: [
+        createSkillCandidateResponse({
+          applies_when: "a quiet exchange stalls",
+          approach: "Say the awkward thing rather than nothing.",
+          acquisition_mode: "observed_from",
+          acquired_from_entity_id: lunaria,
+        }),
+        createSkillCandidateResponse({
+          applies_when: "a claim contradicts what I remember",
+          approach: "Ask for the detail that would settle it.",
+          acquisition_mode: "observed_from",
+          acquired_from_entity_id: createEntityId(),
+        }),
+      ],
+    });
+    harness = await createOfflineTestHarness({
+      configOverrides: proceduralConfig({ minSupport: 2 }),
+      llmClient: llm,
+    });
+    harness.entityRepository.add({ id: lunaria, canonicalName: "Lunaria", kind: "person" });
+
+    for (const problemText of ["Atlas deploy failed after rollback.", "Someone said the log was empty."]) {
+      await addSuccessEvidence(harness, { problemText, participantEntityIds: [lunaria] });
+      await addSuccessEvidence(harness, { problemText, participantEntityIds: [lunaria] });
+    }
+
+    const process = createProcess(harness);
+    const plan = await process.plan(harness.createContext());
+    await process.apply(harness.createContext(), plan);
+
+    const byAppliesWhen = new Map(
+      harness.skillRepository.list().map((skill) => [skill.applies_when, skill]),
+    );
+
+    // Still borrowed, and that is the point: the attempts synthesis credited are the
+    // ones the skill was BUILT from, so retention does not read them (TASK-032). It
+    // becomes his own only after it works for him as a skill he already knew.
+    expect(byAppliesWhen.get("a quiet exchange stalls")).toMatchObject({
+      acquisition_mode: "observed_from",
+      acquired_from_entity_id: lunaria,
+      founding_successes: 2,
+    });
+    // The mode is kept because the model did report imitation; only the source is
+    // dropped, because that id took part in nothing. An invented id must never
+    // become provenance that later joins to somebody's trust.
+    expect(byAppliesWhen.get("a claim contradicts what I remember")).toMatchObject({
+      acquisition_mode: "observed_from",
+      acquired_from_entity_id: null,
+    });
   });
 
   it("batches disclosure hydration once for a procedural evidence collection", async () => {

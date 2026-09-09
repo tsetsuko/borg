@@ -89,4 +89,52 @@ export const proceduralMigrations = [
       }
     },
   },
+  {
+    id: 3,
+    name: "skills_acquisition_mode",
+    up: (db) => {
+      // TASK-028: the same acquisition axis semantic_nodes carries since M4, now
+      // on behaviours. A skill watched in a stronger peer and a skill the entity
+      // found on its own are not the same standing, and without this column the
+      // difference is unrecoverable: every skill looks self-found once it is in
+      // the table.
+      if (!tableHasColumn(db, "skills", "acquisition_mode")) {
+        db.exec(`
+          ALTER TABLE skills
+            ADD COLUMN acquisition_mode TEXT NULL CHECK (
+              acquisition_mode IS NULL OR acquisition_mode IN (
+                'told_by', 'observed_from', 'inferred', 'tested_independently'
+              )
+            );
+        `);
+      }
+
+      if (!tableHasColumn(db, "skills", "acquired_from_entity_id")) {
+        db.exec("ALTER TABLE skills ADD COLUMN acquired_from_entity_id TEXT NULL");
+      }
+
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_skills_acquisition_mode
+          ON skills (acquisition_mode)
+          WHERE acquisition_mode IS NOT NULL;
+      `);
+    },
+  },
+  {
+    id: 4,
+    name: "skills_founding_evidence",
+    up: (db) => {
+      // TASK-032: the attempts a skill was BUILT from, kept apart from the attempts
+      // made since. Synthesis credits its founding evidence to the posterior, which
+      // is right for choosing a skill -- it is real evidence -- but wrong for
+      // retention: a borrowed behaviour would be adopted as the entity's own on the
+      // strength of the very attempts that suggested writing it down, before it was
+      // ever tried AS a known skill.
+      for (const column of ["founding_successes", "founding_failures"]) {
+        if (!tableHasColumn(db, "skills", column)) {
+          db.exec(`ALTER TABLE skills ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`);
+        }
+      }
+    },
+  },
 ] as const satisfies readonly Migration[];

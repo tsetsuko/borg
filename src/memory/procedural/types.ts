@@ -1,5 +1,9 @@
 import { z } from "zod";
 
+import {
+  acquiredFromEntityIdSchema,
+  acquisitionModeSchema,
+} from "../common/acquisition-mode.js";
 import { memoryDisclosureLabelSchema } from "../common/disclosure-label.js";
 import { type SkillId, skillIdHelpers } from "../../util/ids.js";
 import {
@@ -32,7 +36,10 @@ export const skillSchema = z.object({
   id: skillIdSchema,
   applies_when: z.string().min(1),
   approach: z.string().min(1),
-  status: z.enum(["active", "superseded"]).default("active"),
+  // "rejected" is retention's reject branch (TASK-032): a borrowed behaviour whose
+  // own results say it does not work for this entity. Distinct from "superseded",
+  // which means a split replaced it and names the replacements.
+  status: z.enum(["active", "superseded", "rejected"]).default("active"),
   alpha: z.number().positive(),
   beta: z.number().positive(),
   attempts: z.number().int().nonnegative(),
@@ -48,6 +55,15 @@ export const skillSchema = z.object({
   requires_manual_review: z.boolean().default(false),
   source_episode_ids: z.array(episodeIdSchema),
   disclosure_label: memoryDisclosureLabelSchema.optional(),
+  // TASK-028: how this behaviour was acquired, and from whom when the mode names
+  // someone. Null means the skill predates the column or the synthesizer could
+  // not tell -- never "self-found", which is the whole point of the distinction.
+  // Attempts this skill was built from, as opposed to attempts made since it
+  // existed. Retention (TASK-032) reads only the latter.
+  founding_successes: z.number().int().nonnegative().default(0),
+  founding_failures: z.number().int().nonnegative().default(0),
+  acquisition_mode: acquisitionModeSchema.nullable().default(null),
+  acquired_from_entity_id: acquiredFromEntityIdSchema.nullable().default(null),
   last_used: z.number().finite().nullable(),
   last_successful: z.number().finite().nullable(),
   created_at: z.number().finite(),

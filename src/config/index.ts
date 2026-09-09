@@ -398,6 +398,13 @@ const configBaseSchema = z.object({
   procedural: z
     .object({
       skillSelectionMinSimilarity: z.number().min(0).max(1).default(0.5),
+      // Retention of an imitated behaviour, read as
+      // P(true success rate > floor) > confidence over the skill's own posterior.
+      // Two numbers because one number over a curve names no quantity. Defaults
+      // are inert for a generic being: nothing is retained or rejected until a
+      // skill carries an acquisition mode saying it was picked up from someone.
+      imitationRetentionFloor: z.number().min(0).max(1).default(0.6),
+      imitationRetentionConfidence: z.number().min(0).max(1).default(0.8),
     })
     .prefault({}),
   retrieval: z
@@ -1281,6 +1288,16 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["procedural", "skillSelectionMinSimilarity"],
     readOptionalEnvUnitInterval(env, "BORG_PROCEDURAL_SKILL_SELECTION_MIN_SIMILARITY"),
+  );
+  setConfigOverride(
+    overrides,
+    ["procedural", "imitationRetentionFloor"],
+    readOptionalEnvUnitInterval(env, "BORG_IMITATION_RETENTION_FLOOR"),
+  );
+  setConfigOverride(
+    overrides,
+    ["procedural", "imitationRetentionConfidence"],
+    readOptionalEnvUnitInterval(env, "BORG_IMITATION_RETENTION_CONFIDENCE"),
   );
   setConfigOverride(
     overrides,

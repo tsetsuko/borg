@@ -1,4 +1,4 @@
-import { sampleBeta } from "./bayes.js";
+import { contextualPosterior as computeContextualPosterior, sampleBeta } from "./bayes.js";
 import { proceduralContextSchema, type ProceduralContext } from "./context.js";
 import type {
   SkillRecord,
@@ -28,21 +28,6 @@ export type SkillSelectorOptions = {
   sampler?: (alpha: number, beta: number, rng: () => number) => number;
   minSimilarity?: number;
 };
-
-function computeContextualPosterior(
-  skill: SkillRecord,
-  contextStats: NonNullable<SkillSelectionCandidate["contextStats"]>,
-): { alpha: number; beta: number } {
-  const priorAlpha = Math.max(1, skill.alpha - skill.successes);
-  const priorBeta = Math.max(1, skill.beta - skill.failures);
-  const globalOtherSuccesses = Math.max(0, skill.successes - contextStats.successes);
-  const globalOtherFailures = Math.max(0, skill.failures - contextStats.failures);
-
-  return {
-    alpha: priorAlpha + contextStats.successes + 0.25 * globalOtherSuccesses,
-    beta: priorBeta + contextStats.failures + 0.25 * globalOtherFailures,
-  };
-}
 
 export class SkillSelector {
   private readonly rng: () => number;

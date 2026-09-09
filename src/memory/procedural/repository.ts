@@ -30,8 +30,14 @@ import {
   unknownMemoryDisclosureLabel,
   type MemoryDisclosureLabel,
 } from "../common/disclosure-label.js";
+import type { AcquisitionMode } from "../common/acquisition-mode.js";
+import {
+  isImitatedSkill,
+  readImitationRetention,
+  type ImitationRetentionParams,
+} from "./imitation-retention.js";
 
-import { computeBetaStats, type BetaStats } from "./bayes.js";
+import { computeBetaStats, contextualPosterior, type BetaStats } from "./bayes.js";
 import {
   proceduralContextMetadataSchema,
   proceduralContextKeySchema,
@@ -57,7 +63,7 @@ type SkillSqlRow = {
   id: string;
   applies_when: string;
   approach: string;
-  status: "active" | "superseded";
+  status: "active" | "superseded" | "rejected";
   alpha: number;
   beta: number;
   attempts: number;
@@ -73,6 +79,10 @@ type SkillSqlRow = {
   requires_manual_review: number;
   source_episode_ids: string;
   disclosure_label: string;
+  founding_successes: number;
+  founding_failures: number;
+  acquisition_mode: string | null;
+  acquired_from_entity_id: string | null;
   last_used: number | null;
   last_successful: number | null;
   created_at: number;
@@ -100,6 +110,48 @@ const PROCEDURAL_EVIDENCE_JSON_ARRAY_CODEC = {
   errorMessage: (label: string) => `Failed to parse procedural evidence ${label}`,
 } satisfies JsonArrayCodecOptions;
 
+/**
+ * One context's counters for one skill. Module-level because two repositories read
+ * it: the context-stats repository as its own accessor, and the skill repository
+ * when retention has to weigh the situation an attempt actually happened in.
+ */
+function readContextStats(
+  db: SqliteDatabase,
+  skillId: SkillId,
+  contextKey: string,
+): SkillContextStatsRecord | null {
+  const row = db
+    .prepare(
+      `
+        SELECT *
+        FROM skill_context_stats
+        WHERE skill_id = ? AND context_key = ?
+      `,
+    )
+    .get(skillId, assertContextKey(contextKey)) as Record<string, unknown> | undefined;
+
+  return row === undefined ? null : skillContextStatsFromRow(row);
+}
+
+/**
+ * The skill as it stands on attempts made SINCE it existed: the founding counts are
+ * taken back out of both the posterior and the tallies. Never below the prior, so a
+ * skill can only ever be judged on evidence it actually earned.
+ */
+function withoutFoundingEvidence(skill: SkillRecord): {
+  alpha: number;
+  beta: number;
+  successes: number;
+  failures: number;
+} {
+  return {
+    alpha: Math.max(1, skill.alpha - skill.founding_successes),
+    beta: Math.max(1, skill.beta - skill.founding_failures),
+    successes: Math.max(0, skill.successes - skill.founding_successes),
+    failures: Math.max(0, skill.failures - skill.founding_failures),
+  };
+}
+
 function rowFromSkill(skill: SkillRecord): SkillSqlRow {
   return {
     id: skill.id,
@@ -121,6 +173,10 @@ function rowFromSkill(skill: SkillRecord): SkillSqlRow {
     requires_manual_review: skill.requires_manual_review ? 1 : 0,
     source_episode_ids: serializeJsonValue(skill.source_episode_ids),
     disclosure_label: serializeJsonValue(skill.disclosure_label ?? unknownMemoryDisclosureLabel()),
+    founding_successes: skill.founding_successes,
+    founding_failures: skill.founding_failures,
+    acquisition_mode: skill.acquisition_mode,
+    acquired_from_entity_id: skill.acquired_from_entity_id,
     last_used: skill.last_used,
     last_successful: skill.last_successful,
     created_at: skill.created_at,
@@ -177,6 +233,16 @@ function skillFromRow(row: Record<string, unknown>): SkillRecord {
       SKILL_JSON_ARRAY_CODEC,
     ).map((value) => parseEpisodeId(value)),
     disclosure_label: parseMemoryDisclosureLabel(row.disclosure_label),
+    founding_successes: Number(row.founding_successes ?? 0),
+    founding_failures: Number(row.founding_failures ?? 0),
+    acquisition_mode:
+      row.acquisition_mode === null || row.acquisition_mode === undefined
+        ? null
+        : String(row.acquisition_mode),
+    acquired_from_entity_id:
+      row.acquired_from_entity_id === null || row.acquired_from_entity_id === undefined
+        ? null
+        : String(row.acquired_from_entity_id),
     last_used: row.last_used === null || row.last_used === undefined ? null : Number(row.last_used),
     last_successful:
       row.last_successful === null || row.last_successful === undefined
@@ -454,6 +520,11 @@ export type SkillRepositoryOptions = {
   db: SqliteDatabase;
   embeddingClient: EmbeddingClient;
   clock?: Clock;
+  /**
+   * Retention of imitated behaviour (TASK-032). Absent means the mechanism is off,
+   * which is the right default for a being with no acquisition provenance to read.
+   */
+  imitationRetention?: ImitationRetentionParams;
 };
 
 export type SkillSplitPartInput = {
@@ -499,8 +570,10 @@ export class SkillRepository {
             id, applies_when, approach, status, alpha, beta, attempts, successes, failures,
             alternatives, superseded_by, superseded_at, splitting_at, last_split_attempt_at,
             split_failure_count, last_split_error, requires_manual_review, source_episode_ids,
-            disclosure_label, last_used, last_successful, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            disclosure_label, founding_successes, founding_failures,
+            acquisition_mode, acquired_from_entity_id,
+            last_used, last_successful, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT (id) DO UPDATE SET
             applies_when = excluded.applies_when,
             approach = excluded.approach,
@@ -520,6 +593,10 @@ export class SkillRepository {
             requires_manual_review = excluded.requires_manual_review,
             source_episode_ids = excluded.source_episode_ids,
             disclosure_label = excluded.disclosure_label,
+            founding_successes = excluded.founding_successes,
+            founding_failures = excluded.founding_failures,
+            acquisition_mode = excluded.acquisition_mode,
+            acquired_from_entity_id = excluded.acquired_from_entity_id,
             last_used = excluded.last_used,
             last_successful = excluded.last_successful,
             updated_at = excluded.updated_at
@@ -545,6 +622,10 @@ export class SkillRepository {
         row.requires_manual_review,
         row.source_episode_ids,
         row.disclosure_label,
+        row.founding_successes,
+        row.founding_failures,
+        row.acquisition_mode,
+        row.acquired_from_entity_id,
         row.last_used,
         row.last_successful,
         row.created_at,
@@ -559,6 +640,8 @@ export class SkillRepository {
     alternatives?: readonly SkillId[];
     sourceEpisodes: readonly EpisodeId[];
     disclosureLabel?: MemoryDisclosureLabel;
+    acquisitionMode?: AcquisitionMode | null;
+    acquiredFromEntityId?: EntityId | null;
     priorAlpha?: number;
     priorBeta?: number;
     createdAt?: number;
@@ -581,6 +664,10 @@ export class SkillRepository {
       last_split_attempt_at: null,
       source_episode_ids: input.sourceEpisodes,
       disclosure_label: input.disclosureLabel ?? unknownMemoryDisclosureLabel(),
+      founding_successes: 0,
+      founding_failures: 0,
+      acquisition_mode: input.acquisitionMode ?? null,
+      acquired_from_entity_id: input.acquiredFromEntityId ?? null,
       last_used: null,
       last_successful: null,
       created_at: nowMs,
@@ -1211,6 +1298,16 @@ export class SkillRepository {
     success: boolean,
     episodeIds?: EpisodeId | readonly EpisodeId[],
     proceduralContext?: ProceduralContext | null,
+    options: {
+      /**
+       * True when this outcome is one of the attempts the skill was BUILT from,
+       * replayed by synthesis. It still counts for selection -- it is real evidence
+       * about the approach -- but retention must not read it, or a borrowed
+       * behaviour becomes the entity's own on the strength of the attempts that
+       * merely suggested writing it down.
+       */
+      foundingEvidence?: boolean;
+    } = {},
   ): SkillRecord {
     const nowMs = this.clock.now();
     const parsedContext =
@@ -1230,6 +1327,8 @@ export class SkillRepository {
           attempts = attempts + 1,
           successes = successes + ?,
           failures = failures + ?,
+          founding_successes = founding_successes + ?,
+          founding_failures = founding_failures + ?,
           last_used = ?,
           last_successful = CASE WHEN ? THEN ? ELSE last_successful END,
           updated_at = ?
@@ -1265,6 +1364,8 @@ export class SkillRepository {
         incrementBeta,
         incrementSuccesses,
         incrementFailures,
+        options.foundingEvidence === true ? incrementSuccesses : 0,
+        options.foundingEvidence === true ? incrementFailures : 0,
         nowMs,
         success ? 1 : 0,
         nowMs,
@@ -1307,7 +1408,63 @@ export class SkillRepository {
       });
     }
 
-    return next;
+    return this.applyImitationRetention(next, parsedContext?.context_key ?? null, nowMs);
+  }
+
+  /**
+   * The retain/modify/reject step, applied where an outcome lands so that the live
+   * reflector and the offline synthesizer cannot diverge -- one owner, not a guard
+   * copied into each caller.
+   *
+   * RETAIN rewrites provenance: a behaviour that has proven itself in this entity's
+   * own hands stops being "Lunaria's way of doing it" and becomes tested. The source
+   * entity is kept, because where it came from remains true; what changes is whose
+   * the behaviour now is.
+   *
+   * REJECT deactivates. It is one-way by construction -- an inactive skill is never
+   * sampled, so no further evidence about it can arrive -- and that is the point of
+   * rejecting rather than merely down-weighting. The row and its counts stay.
+   */
+  private applyImitationRetention(
+    skill: SkillRecord,
+    contextKey: string | null,
+    nowMs: number,
+  ): SkillRecord {
+    const params = this.options.imitationRetention;
+
+    if (params === undefined || !isImitatedSkill(skill)) {
+      return skill;
+    }
+
+    // The posterior for the situation the attempt actually happened in when there
+    // is one: "when I do X in situation S" is what was just measured.
+    const contextStats =
+      contextKey === null ? null : readContextStats(this.db, skill.id, contextKey);
+    // Founding evidence is removed first, so what the posterior answers is "how has
+    // this gone since I knew it as a skill", not "why did I write it down".
+    const earned = withoutFoundingEvidence(skill);
+    const posterior =
+      contextStats === null
+        ? { alpha: earned.alpha, beta: earned.beta }
+        : contextualPosterior(earned, contextStats);
+    const reading = readImitationRetention(posterior, params);
+
+    if (reading.verdict === "keep_trying") {
+      return skill;
+    }
+
+    const updated =
+      reading.verdict === "retain"
+        ? skillSchema.parse({
+            ...skill,
+            acquisition_mode: "tested_independently",
+            updated_at: nowMs,
+          })
+        : skillSchema.parse({ ...skill, status: "rejected", updated_at: nowMs });
+
+    this.upsertSqlRow(updated);
+
+    return updated;
   }
 
   getStats(id: SkillId): BetaStats {
@@ -1371,17 +1528,7 @@ export class ProceduralContextStatsRepository {
   }
 
   getContextStats(skillId: SkillId, contextKey: string): SkillContextStatsRecord | null {
-    const row = this.db
-      .prepare(
-        `
-          SELECT *
-          FROM skill_context_stats
-          WHERE skill_id = ? AND context_key = ?
-        `,
-      )
-      .get(skillId, assertContextKey(contextKey)) as Record<string, unknown> | undefined;
-
-    return row === undefined ? null : skillContextStatsFromRow(row);
+    return readContextStats(this.db, skillId, contextKey);
   }
 
   batchGetContextStats(

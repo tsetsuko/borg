@@ -61,18 +61,21 @@ agency:
   contingency_confidence: 0.8
 
 differentiation:
-  # consumer: TASK-032 (czytelnik retencji imitacji; blokowany przez TASK-028)
+  # consumer: TASK-032 (czytelnik retencji imitacji)
   # architecture:431-441 -- observe -> imitate -> observe outcome -> retain/modify/reject.
   #
-  # NIC TEGO JESZCZE NIE CZYTA i jest to zapisane swiadomie (TASK-031).
-  # Konsumentem bylo "M4", ale M4 zbudowalo tylko GORNA polowe: zaufanie per domena
-  # (od kogo sie uczyc) i prowenienecje nabycia PRZEKONAN. Retencja liczy sie z wyniku
-  # WLASNEGO eksperymentu nad przejetym ZACHOWANIEM, a tego nie ma: umiejetnosci
-  # w src/memory/procedural/ maja posteriory Beta, ale zero prowenienecji (TASK-028)
-  # i zero kroku retain/reject.
+  # DWIE LICZBY, nie jedna, dokladnie jak agency (:56-59). Posterior Beta jest
+  # krzywa, wiec "skutecznosc ponad 0.6" nie nazywa zadnej wielkosci. Policzalne
+  # jest dolne ograniczenie PLUS masa:
+  #   P(prawdziwa skutecznosc > imitation_retention_floor) > imitation_retention_confidence
+  # czyli: co najmniej 80% krzywej przekonania lezy powyzej 60% skutecznosci.
   #
-  # KSZTALT JEST TYMCZASOWY. Jedna liczba nad krzywa nie nazywa zadnej wielkosci --
-  # ta sama wada, ktora M1 naprawilo rozbijajac agency na floor + confidence (:56-59).
-  # Docelowy parametr bedzie para liczb i zostanie napisany przy realnym czytelniku,
-  # nie na zapas.
-  imitation_retention_threshold: 0.6
+  # WIELKOSCIA PRZEKRACZAJACA PROG jest wynik WLASNEGO eksperymentu Akukiego nad
+  # przejetym zachowaniem, nigdy zaufanie do zrodla. Zaufanie to krok wczesniejszy
+  # (architecture:775-779) i M4 juz je dostarczylo.
+  #
+  # SAME LICZBY SA WYBOREM TWORCZYM. Badanie mowi, ze retencja wynika z obserwacji
+  # wyniku wlasnego eksperymentu, i nie mowi NIC o zadnym progu ani jego wartosci.
+  # Nie wolno tym liczbom pozyczac powagi od literatury.
+  imitation_retention_floor: 0.6
+  imitation_retention_confidence: 0.8

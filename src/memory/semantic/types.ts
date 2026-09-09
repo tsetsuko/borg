@@ -1,5 +1,10 @@
 import { z } from "zod";
 
+import {
+  ACQUISITION_MODES,
+  acquiredFromEntityIdSchema,
+  acquisitionModeSchema,
+} from "../common/acquisition-mode.js";
 import { episodeIdSchema, streamEntryIdSchema } from "../episodic/types.js";
 import {
   entityIdHelpers,
@@ -27,17 +32,10 @@ export const SEMANTIC_RELATIONS = [
   "related_to",
   "instance_of",
 ] as const;
-// M4: how a belief was ACQUIRED, which is a different axis from where it came
-// from in the pipeline (provenance_kind). "Sol does it this way, I tried it, it
-// suits me" only means something if hearsay is distinguishable from what the
-// entity tested for itself -- without that, anything picked up from a stronger
-// peer silently becomes the entity's own, which is mimicry.
-export const SEMANTIC_ACQUISITION_MODES = [
-  "told_by",
-  "observed_from",
-  "inferred",
-  "tested_independently",
-] as const;
+// M4: how a belief was ACQUIRED. The vocabulary lives in memory/common because
+// skills carry the same axis (TASK-028); this alias keeps the semantic-band name
+// that the extractor and repository already use.
+export const SEMANTIC_ACQUISITION_MODES = ACQUISITION_MODES;
 export const INVALIDATION_PROCESSES = [
   "extractor",
   "overseer",
@@ -71,13 +69,8 @@ export const semanticNodeKindSchema = z.string().regex(/^[a-z][a-z0-9_]*$/, {
 export const semanticNodeStatusSchema = z.enum(SEMANTIC_NODE_STATUSES);
 export const semanticRelationSchema = z.enum(SEMANTIC_RELATIONS);
 export const invalidationProcessSchema = z.enum(INVALIDATION_PROCESSES);
-export const semanticAcquisitionModeSchema = z.enum(SEMANTIC_ACQUISITION_MODES);
-export const semanticAcquiredFromEntityIdSchema = z
-  .string()
-  .refine((value) => entityIdHelpers.is(value), {
-    message: "Invalid entity id",
-  })
-  .transform((value) => value as EntityId);
+export const semanticAcquisitionModeSchema = acquisitionModeSchema;
+export const semanticAcquiredFromEntityIdSchema = acquiredFromEntityIdSchema;
 export const semanticNodeCorrectionRefSchema = z.union([
   semanticNodeIdSchema,
   semanticEdgeIdSchema,

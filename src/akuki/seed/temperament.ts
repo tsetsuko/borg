@@ -146,7 +146,12 @@ export const temperamentSchema = z
     agency: z
       .object({ contingency_floor: probability, contingency_confidence: probability })
       .strict(),
-    differentiation: z.object({ imitation_retention_threshold: probability }).strict(),
+    differentiation: z
+      .object({
+        imitation_retention_floor: probability,
+        imitation_retention_confidence: probability,
+      })
+      .strict(),
   })
   .strict();
 
@@ -189,7 +194,8 @@ export const TEMPERAMENT_CONSUMERS: Readonly<Record<string, ParameterConsumer>> 
   "memory.surprise_weight": "M2",
   "agency.contingency_floor": "M5",
   "agency.contingency_confidence": "M5",
-  "differentiation.imitation_retention_threshold": "TASK-032",
+  "differentiation.imitation_retention_floor": "TASK-032",
+  "differentiation.imitation_retention_confidence": "TASK-032",
 };
 
 /**
@@ -200,6 +206,13 @@ export const TEMPERAMENT_CONSUMERS: Readonly<Record<string, ParameterConsumer>> 
  * lands, which is what makes the guard fire for it.
  */
 export const LANDED_MILESTONES: readonly Milestone[] = ["M0", "M1", "M2", "M3", "M4"];
+
+/**
+ * Task-shaped consumers whose reader has landed. Same purpose as the list above and
+ * kept separate only because these are not milestones: the guard checks membership
+ * in either list before it demands a reader.
+ */
+export const LANDED_TASKS: readonly TaskId[] = ["TASK-032"];
 
 /**
  * Parameters whose consumer has landed and which nothing reads.
@@ -219,7 +232,7 @@ export const LANDED_MILESTONES: readonly Milestone[] = ["M0", "M1", "M2", "M3", 
 export function findOrphanParameters(
   sources: readonly string[],
   consumers: Readonly<Record<string, ParameterConsumer>> = TEMPERAMENT_CONSUMERS,
-  landed: readonly ParameterConsumer[] = LANDED_MILESTONES,
+  landed: readonly ParameterConsumer[] = [...LANDED_MILESTONES, ...LANDED_TASKS],
 ): readonly string[] {
   const orphans: string[] = [];
 

@@ -811,6 +811,9 @@ export async function createOfflineTestHarness(
     db,
     embeddingClient,
     clock,
+    // Same pair the seed carries, so a harness test exercises the retention
+    // mechanism rather than a version of the band that quietly has none.
+    imitationRetention: { floor: 0.6, confidence: 0.8 },
   });
   const actionRepository = new ActionRepository({
     table: actionRecordsTable,
@@ -1118,6 +1121,10 @@ export function createSkillFixture(overrides: Partial<SkillRecord> = {}): SkillR
     applies_when: overrides.applies_when ?? "Debugging a flaky deployment",
     approach: overrides.approach ?? "Compare the failing state with the last known-good state.",
     status: overrides.status ?? "active",
+    founding_successes: overrides.founding_successes ?? 0,
+    founding_failures: overrides.founding_failures ?? 0,
+    acquisition_mode: overrides.acquisition_mode ?? null,
+    acquired_from_entity_id: overrides.acquired_from_entity_id ?? null,
     alpha: overrides.alpha ?? 1,
     beta: overrides.beta ?? 1,
     attempts: overrides.attempts ?? 0,

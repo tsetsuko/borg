@@ -485,6 +485,10 @@ export async function buildBorgRepositories(
     db: sqlite,
     embeddingClient,
     clock,
+    imitationRetention: {
+      floor: config.procedural.imitationRetentionFloor,
+      confidence: config.procedural.imitationRetentionConfidence,
+    },
   });
   const actionRepository = new ActionRepository({
     table: options.actionRecordsTable,

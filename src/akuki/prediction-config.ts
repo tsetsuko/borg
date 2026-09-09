@@ -6,7 +6,8 @@
 // is where those temperament keys earn their reader: curiosity.gain,
 // curiosity.target_error_band, memory.surprise_weight, attachment.memory_weight
 // (M2) and inhibition.base_threshold, inhibition.uncertainty_weight (M3) are read
-// here and pushed into the env Borg.open resolves, so the orphan guard
+// here, together with differentiation.imitation_retention_floor/confidence
+// (TASK-032), and pushed into the env Borg.open resolves, so the orphan guard
 // (temperament.test.ts) sees a live consumer for each.
 
 import { loadTemperament, type Temperament } from "./seed/temperament.js";
@@ -27,4 +28,10 @@ export function applyAkukiPredictionEnv(
   env.BORG_PREDICTION_ATTACHMENT_FIGURE_NAME ??= temperament.attachment.figure;
   env.BORG_INHIBITION_BASE_THRESHOLD ??= String(temperament.inhibition.base_threshold);
   env.BORG_INHIBITION_UNCERTAINTY_WEIGHT ??= String(temperament.inhibition.uncertainty_weight);
+  env.BORG_IMITATION_RETENTION_FLOOR ??= String(
+    temperament.differentiation.imitation_retention_floor,
+  );
+  env.BORG_IMITATION_RETENTION_CONFIDENCE ??= String(
+    temperament.differentiation.imitation_retention_confidence,
+  );
 }

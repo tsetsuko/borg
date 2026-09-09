@@ -72,6 +72,175 @@ describe("SkillRepository", () => {
     expect(harness.skillRepository.get(skill.id)).toBeNull();
   });
 
+  it("round-trips how a skill was acquired and from whom", async () => {
+    harness = await createOfflineTestHarness();
+    const episode = createEpisodeFixture();
+    await harness.episodicRepository.createEpisode(episode);
+    const lunaria = harness.entityRepository.add({ canonicalName: "Lunaria", kind: "person" });
+
+    const imitated = await harness.skillRepository.add({
+      applies_when: "A quiet exchange stalls",
+      approach: "Say the awkward thing rather than nothing.",
+      sourceEpisodes: [episode.id],
+      acquisitionMode: "observed_from",
+      acquiredFromEntityId: lunaria.id,
+    });
+    const selfFound = await harness.skillRepository.add({
+      applies_when: "A claim contradicts what I remember",
+      approach: "Ask for the detail that would settle it.",
+      sourceEpisodes: [episode.id],
+    });
+
+    expect(harness.skillRepository.get(imitated.id)).toMatchObject({
+      acquisition_mode: "observed_from",
+      acquired_from_entity_id: lunaria.id,
+    });
+    // Null, not "tested_independently": an unrecorded origin is unknown, and
+    // reading it as self-discovery is the mimicry blindness TASK-028 closes.
+    expect(harness.skillRepository.get(selfFound.id)).toMatchObject({
+      acquisition_mode: null,
+      acquired_from_entity_id: null,
+    });
+  });
+
+  it("makes a borrowed behaviour his own once his own results clear the bar", async () => {
+    harness = await createOfflineTestHarness();
+    const episode = createEpisodeFixture();
+    await harness.episodicRepository.createEpisode(episode);
+    const lunaria = harness.entityRepository.add({ canonicalName: "Lunaria", kind: "person" });
+    const skill = await harness.skillRepository.add({
+      applies_when: "A quiet exchange stalls",
+      approach: "Say the awkward thing rather than nothing.",
+      sourceEpisodes: [episode.id],
+      acquisitionMode: "observed_from",
+      acquiredFromEntityId: lunaria.id,
+    });
+
+    let current = harness.skillRepository.get(skill.id);
+    for (let attempt = 0; attempt < 10 && current?.acquisition_mode === "observed_from"; attempt += 1) {
+      current = harness.skillRepository.recordOutcome(skill.id, true);
+    }
+
+    // Read back from storage, not from the return value: the test that matters is
+    // whether it is true in the database when nobody is looking.
+    expect(harness.skillRepository.get(skill.id)).toMatchObject({
+      acquisition_mode: "tested_independently",
+      // Where it came from stays true; what changes is whose the behaviour is now.
+      acquired_from_entity_id: lunaria.id,
+      status: "active",
+    });
+  });
+
+  it("drops a borrowed behaviour that keeps failing, and stops sampling it", async () => {
+    harness = await createOfflineTestHarness();
+    const episode = createEpisodeFixture();
+    await harness.episodicRepository.createEpisode(episode);
+    const lunaria = harness.entityRepository.add({ canonicalName: "Lunaria", kind: "person" });
+    const skill = await harness.skillRepository.add({
+      applies_when: "A quiet exchange stalls",
+      approach: "Say the awkward thing rather than nothing.",
+      sourceEpisodes: [episode.id],
+      acquisitionMode: "observed_from",
+      acquiredFromEntityId: lunaria.id,
+    });
+
+    let current = harness.skillRepository.get(skill.id);
+    for (let attempt = 0; attempt < 10 && current?.status === "active"; attempt += 1) {
+      current = harness.skillRepository.recordOutcome(skill.id, false);
+    }
+
+    expect(harness.skillRepository.get(skill.id)?.status).toBe("rejected");
+    // list() is a listing, not a selection: it still shows the row, which is right --
+    // the history stays. What must stop is being chosen for use again.
+    await expect(
+      harness.skillRepository.searchByContext("A quiet exchange stalls", 5),
+    ).resolves.toEqual([]);
+  });
+
+  it("leaves a self-found skill alone however well or badly it goes", async () => {
+    // Retention is about imitation. A skill with no recorded source has nothing to
+    // differentiate itself from, and must not be quietly promoted or dropped.
+    harness = await createOfflineTestHarness();
+    const skill = await harness.skillRepository.add({
+      applies_when: "A claim contradicts what I remember",
+      approach: "Ask for the detail that would settle it.",
+      sourceEpisodes: [],
+    });
+
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      harness.skillRepository.recordOutcome(skill.id, attempt % 4 !== 0);
+    }
+
+    expect(harness.skillRepository.get(skill.id)).toMatchObject({
+      acquisition_mode: null,
+      status: "active",
+    });
+  });
+
+  it("does not adopt a borrowed behaviour on the attempts it was written down from", async () => {
+    harness = await createOfflineTestHarness();
+    const lunaria = harness.entityRepository.add({ canonicalName: "Lunaria", kind: "person" });
+    const skill = await harness.skillRepository.add({
+      applies_when: "A quiet exchange stalls",
+      approach: "Say the awkward thing rather than nothing.",
+      sourceEpisodes: [],
+      acquisitionMode: "observed_from",
+      acquiredFromEntityId: lunaria.id,
+    });
+
+    // Twenty founding successes: far past the bar, and none of them earned as a
+    // skill he already knew. Retention must stay silent.
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      harness.skillRepository.recordOutcome(skill.id, true, undefined, null, {
+        foundingEvidence: true,
+      });
+    }
+
+    expect(harness.skillRepository.get(skill.id)).toMatchObject({
+      acquisition_mode: "observed_from",
+      founding_successes: 20,
+    });
+
+    // The same successes, now earned after the skill existed, do promote it.
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      harness.skillRepository.recordOutcome(skill.id, true);
+    }
+
+    expect(harness.skillRepository.get(skill.id)?.acquisition_mode).toBe("tested_independently");
+  });
+
+  it("rejects an acquisition mode outside the four-value vocabulary", async () => {
+    harness = await createOfflineTestHarness();
+
+    expect(() =>
+      harness!.db
+        .prepare(
+          `INSERT INTO skills (
+             id, applies_when, approach, status, alpha, beta, attempts, successes, failures,
+             alternatives, superseded_by, superseded_at, splitting_at, split_failure_count,
+             requires_manual_review, source_episode_ids, disclosure_label, acquisition_mode,
+             created_at, updated_at
+           ) VALUES (?, ?, ?, 'active', 1, 1, 0, 0, 0, '[]', '[]', NULL, NULL, 0, 0, '[]', '{}', ?, 1, 1)`,
+        )
+        .run(createSkillId(), "anything", "anything", "copied_vibes"),
+    ).toThrow(/CHECK constraint failed/);
+
+    // Same statement, a value from the vocabulary: proves the rejection above is
+    // the CHECK constraint and not a malformed insert.
+    expect(() =>
+      harness!.db
+        .prepare(
+          `INSERT INTO skills (
+             id, applies_when, approach, status, alpha, beta, attempts, successes, failures,
+             alternatives, superseded_by, superseded_at, splitting_at, split_failure_count,
+             requires_manual_review, source_episode_ids, disclosure_label, acquisition_mode,
+             created_at, updated_at
+           ) VALUES (?, ?, ?, 'active', 1, 1, 0, 0, 0, '[]', '[]', NULL, NULL, 0, 0, '[]', '{}', ?, 1, 1)`,
+        )
+        .run(createSkillId(), "anything", "anything", "observed_from"),
+    ).not.toThrow();
+  });
+
   it("selects stronger skills more often and breaks ties toward fewer attempts", async () => {
     harness = await createOfflineTestHarness();
     const episode = createEpisodeFixture();

@@ -247,3 +247,29 @@ export function computeBetaStats(alpha: number, beta: number): BetaStats {
     ci_95: [betaInverseCdf(0.025, alpha, beta), betaInverseCdf(0.975, alpha, beta)],
   };
 }
+
+/**
+ * The posterior for "when I do X in situation S", as opposed to "when I do X".
+ *
+ * The skill's global counts are split back into the prior it started from plus the
+ * evidence from this context, and evidence from OTHER contexts is folded back in at
+ * a quarter weight: a behaviour that works elsewhere is weak evidence here, not no
+ * evidence and not equal evidence.
+ *
+ * Lives here rather than beside its first caller because two mechanisms now read
+ * it -- skill selection and imitation retention -- and a copy in each would drift.
+ */
+export function contextualPosterior(
+  skill: { alpha: number; beta: number; successes: number; failures: number },
+  contextStats: { successes: number; failures: number },
+): { alpha: number; beta: number } {
+  const priorAlpha = Math.max(1, skill.alpha - skill.successes);
+  const priorBeta = Math.max(1, skill.beta - skill.failures);
+  const globalOtherSuccesses = Math.max(0, skill.successes - contextStats.successes);
+  const globalOtherFailures = Math.max(0, skill.failures - contextStats.failures);
+
+  return {
+    alpha: priorAlpha + contextStats.successes + 0.25 * globalOtherSuccesses,
+    beta: priorBeta + contextStats.failures + 0.25 * globalOtherFailures,
+  };
+}

@@ -9,6 +9,11 @@ import {
 } from "../../llm/index.js";
 import { episodeIdSchema, type Episode } from "../../memory/episodic/index.js";
 import {
+  acquiredFromEntityIdSchema as entityIdSchema,
+  acquisitionModeImpliesSource,
+  acquisitionModeSchema,
+} from "../../memory/common/acquisition-mode.js";
+import {
   memoryDisclosureLabelFromEpisodeAccess,
   memoryDisclosureLabelSchema,
   unknownMemoryDisclosureLabel,
@@ -35,7 +40,7 @@ import {
 } from "../../retrieval/index.js";
 import { SystemClock, type Clock } from "../../util/clock.js";
 import { BudgetExceededError, StorageError } from "../../util/errors.js";
-import { type EpisodeId } from "../../util/ids.js";
+import { entityIdHelpers, type EntityId, type EpisodeId } from "../../util/ids.js";
 
 import type { ReverserRegistry } from "../audit-log.js";
 import { getBudgetErrorTokens, withBudget } from "../budget.js";
@@ -64,6 +69,10 @@ const skillCandidateSchema = z.object({
   approach: z.string().min(1),
   abstraction_fit: z.enum(["too_narrow", "usable", "too_broad"]),
   rejection_reason: proceduralSynthesizerRejectionReasonSchema.nullable().default(null),
+  // TASK-028: the same acquisition axis semantic beliefs carry since M4. Null
+  // when the evidence does not say -- an unclear origin is not self-discovery.
+  acquisition_mode: acquisitionModeSchema.nullable().default(null),
+  acquired_from_entity_id: z.string().min(1).nullable().default(null),
 });
 
 const skillSplitPartSchema = z.object({
@@ -101,6 +110,9 @@ const proceduralSynthesizerPlanItemSchema = z.object({
   source_episode_ids: z.array(episodeIdSchema),
   source_disclosure_label: memoryDisclosureLabelSchema,
   candidate: skillCandidateSchema,
+  identity_anchors: z
+    .array(z.object({ id: entityIdSchema, canonical_name: z.string().min(1) }))
+    .default([]),
   dedup_decision: proceduralSynthesizerDedupDecisionSchema,
   rejection_reason: proceduralSynthesizerRejectionReasonSchema.nullable(),
 });
@@ -161,6 +173,13 @@ type EvidenceCluster = {
   sourceEpisodeIds: EpisodeId[];
   sourceEpisodes: Episode[];
   sourceDisclosureLabel: MemoryDisclosureLabel;
+  /** Entities taking part in the source episodes, so an imitated skill can name whom it came from. */
+  identityAnchors: SkillIdentityAnchor[];
+};
+
+type SkillIdentityAnchor = {
+  id: EntityId;
+  canonical_name: string;
 };
 
 type LabeledProceduralEvidenceRow = {
@@ -281,6 +300,7 @@ async function collectEvidenceClusters(
     );
 
     clusters.push({
+      identityAnchors: identityAnchorsForEpisodes(ctx, sourceEpisodes),
       key: `procedural:${seed.id}`,
       evidence: clusterEvidence,
       evidenceRows: labeledEvidenceRows,
@@ -299,6 +319,52 @@ async function collectEvidenceClusters(
   );
 }
 
+/**
+ * Entities that took part in the episodes a skill was synthesized from. Episode
+ * participants are stored as free strings (names alongside ids), so only the ones
+ * that are real entity ids and resolve in the repository become anchors.
+ */
+function identityAnchorsForEpisodes(
+  ctx: OfflineContext,
+  episodes: readonly Episode[],
+): SkillIdentityAnchor[] {
+  const ids = new Set<string>(episodes.flatMap((episode) => episode.participants));
+
+  return [...ids].flatMap((participant) => {
+    if (!entityIdHelpers.is(participant)) {
+      return [];
+    }
+
+    const entity = ctx.entityRepository.get(participant as EntityId);
+
+    return entity === null || entity === undefined
+      ? []
+      : [{ id: entity.id, canonical_name: entity.canonical_name }];
+  });
+}
+
+/**
+ * The emitted source id counts only when the mode names someone AND the id is one
+ * of the anchors that were offered. Anything else is dropped rather than stored,
+ * so a hallucinated id never becomes provenance.
+ */
+function resolveAcquiredFromEntityId(
+  candidate: z.infer<typeof skillCandidateSchema>,
+  identityAnchors: readonly SkillIdentityAnchor[],
+): EntityId | null {
+  if (candidate.acquisition_mode === null || candidate.acquired_from_entity_id === null) {
+    return null;
+  }
+
+  if (!acquisitionModeImpliesSource(candidate.acquisition_mode)) {
+    return null;
+  }
+
+  return (
+    identityAnchors.find((anchor) => anchor.id === candidate.acquired_from_entity_id)?.id ?? null
+  );
+}
+
 function buildPrompt(cluster: EvidenceCluster): string {
   return [
     "I synthesize one reusable procedural skill from repeated successful problem-solving attempts.",
@@ -307,7 +373,12 @@ function buildPrompt(cluster: EvidenceCluster): string {
     "I mark abstraction_fit as too_narrow when the skill is tied to a specific named project, person, or incident.",
     "I mark abstraction_fit as too_broad when it is generic advice rather than a reusable procedure.",
     "I set rejection_reason to centered_proper_noun when an otherwise usable candidate remains centered on a project/person/product name instead of a reusable class; I set unusable_abstraction when abstraction_fit is not usable; otherwise null.",
+    "I set acquisition_mode to how I came by this way of acting: observed_from when I watched someone else do it, told_by when someone told me to, inferred when I reasoned it out, tested_independently when I tried it on my own initiative. I use null when the evidence does not say; an unclear origin is not self-discovery.",
+    "When acquisition_mode is observed_from or told_by and that person is in identity_anchors_by_entity_id, I copy their entity id into acquired_from_entity_id. I use null otherwise, and never invent an entity id.",
     `Cluster: ${cluster.key}`,
+    "<identity_anchors_by_entity_id>",
+    ...cluster.identityAnchors.map((anchor) => JSON.stringify(anchor)),
+    "</identity_anchors_by_entity_id>",
     "Evidence:",
     ...cluster.evidenceRows.map((row) =>
       JSON.stringify({
@@ -625,6 +696,9 @@ function recordClusterOutcomes(
       evidence.classification === "success",
       uniqueEpisodeIds([...evidence.resolved_episode_ids, ...item.source_episode_ids]),
       evidence.procedural_context ?? evidence.pending_attempt_snapshot.procedural_context ?? null,
+      // These are the attempts the skill was built from. They count for choosing it
+      // and not for retention (TASK-032).
+      { foundingEvidence: true },
     );
   }
 
@@ -843,6 +917,7 @@ export class ProceduralSynthesizerProcess implements OfflineProcess<ProceduralSy
               source_episode_ids: cluster.sourceEpisodeIds,
               source_disclosure_label: cluster.sourceDisclosureLabel,
               candidate,
+              identity_anchors: cluster.identityAnchors,
               dedup_decision: {
                 skill_id: similarSkill?.skill.id ?? null,
                 similarity: similarSkill?.similarity ?? null,
@@ -1074,6 +1149,11 @@ export class ProceduralSynthesizerProcess implements OfflineProcess<ProceduralSy
             approach: item.candidate.approach.trim(),
             sourceEpisodes: item.source_episode_ids,
             disclosureLabel: item.source_disclosure_label,
+            acquisitionMode: item.candidate.acquisition_mode,
+            acquiredFromEntityId: resolveAcquiredFromEntityId(
+              item.candidate,
+              item.identity_anchors,
+            ),
             priorAlpha: 2,
             priorBeta: 1,
           });
