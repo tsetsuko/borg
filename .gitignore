@@ -28,3 +28,11 @@ tmp
 # out to `pnpm exec`; pnpm writes them on the way to its build-approval gate.
 pnpm-lock.yaml
 pnpm-workspace.yaml
+
+# npm lockfiles for the two demo subprojects, written during test runs. The root
+# package-lock.json above is the only tracked lockfile; committing a second set
+# would pin demo dependencies nobody reviews and let them drift from the root.
+# Which test writes them was not pinned down -- they appeared during a full
+# `vitest run` on 2026-09-09.
+demo/server/package-lock.json
+demo/web/package-lock.json
