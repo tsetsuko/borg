@@ -12,8 +12,17 @@ export type AkukiTokenUsageByModel = AkukiTokenUsageTotals & {
   model: string;
 };
 
+// The budget is borg's call-site label ("reflection", "offline-reflector",
+// "prediction-extractor", ...). Totals per model answer "which model costs";
+// totals per budget answer "which mechanism costs", which is the question
+// TASK-013 actually asks -- one model serves many call sites.
+export type AkukiTokenUsageByBudget = AkukiTokenUsageTotals & {
+  budget: string;
+};
+
 export type AkukiTokenUsageReport = AkukiTokenUsageTotals & {
   byModel: readonly AkukiTokenUsageByModel[];
+  byBudget: readonly AkukiTokenUsageByBudget[];
 };
 
 const EMPTY_TOTALS: AkukiTokenUsageTotals = {
@@ -37,17 +46,22 @@ export function aggregateAkukiTokenUsage(
 ): AkukiTokenUsageReport {
   const totals = { ...EMPTY_TOTALS };
   const byModel = new Map<string, AkukiTokenUsageByModel>();
+  const byBudget = new Map<string, AkukiTokenUsageByBudget>();
 
   for (const event of events) {
     addEvent(totals, event);
     const modelTotals = byModel.get(event.model) ?? { model: event.model, ...EMPTY_TOTALS };
     addEvent(modelTotals, event);
     byModel.set(event.model, modelTotals);
+    const budgetTotals = byBudget.get(event.budget) ?? { budget: event.budget, ...EMPTY_TOTALS };
+    addEvent(budgetTotals, event);
+    byBudget.set(event.budget, budgetTotals);
   }
 
   return {
     ...totals,
     byModel: [...byModel.values()].sort((left, right) => left.model.localeCompare(right.model)),
+    byBudget: [...byBudget.values()].sort((left, right) => left.budget.localeCompare(right.budget)),
   };
 }
 

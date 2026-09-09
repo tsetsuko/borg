@@ -35,7 +35,47 @@ describe("Akuki token usage", () => {
           cacheCreationInputTokens: 3,
         },
       ],
+      byBudget: [
+        {
+          budget: "test",
+          calls: 2,
+          inputTokens: 30,
+          outputTokens: 12,
+          cacheReadInputTokens: 18,
+          cacheCreationInputTokens: 3,
+        },
+      ],
     });
+  });
+
+  it("separates call sites that share one model", () => {
+    // The question TASK-013 asks is which mechanism spends, not which model: the
+    // reflector and a live turn can run on the same model and cost very differently.
+    const report = aggregateAkukiTokenUsage([
+      usage({ budget: "reflection", input_tokens: 100 }),
+      usage({ budget: "offline-reflector", input_tokens: 900, cache_read_input_tokens: 50 }),
+      usage({ budget: "reflection", input_tokens: 40 }),
+    ]);
+
+    expect(report.byModel).toHaveLength(1);
+    expect(report.byBudget).toEqual([
+      {
+        budget: "offline-reflector",
+        calls: 1,
+        inputTokens: 900,
+        outputTokens: 4,
+        cacheReadInputTokens: 50,
+        cacheCreationInputTokens: 0,
+      },
+      {
+        budget: "reflection",
+        calls: 2,
+        inputTokens: 140,
+        outputTokens: 8,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      },
+    ]);
   });
 
   it("keeps different models separate while producing grand totals", () => {
