@@ -144,4 +144,43 @@ describe("PredictionRepository", () => {
     expect(since.map((row) => row.prediction_id)).toEqual([ids[1], ids[2]]);
     expect(since[0]!.created_ts).toBeLessThan(since[1]!.created_ts);
   });
+
+  it("keeps the forming turn ordinal on the expectation and off the reconciliation", () => {
+    const repository = openRepository(new ManualClock(5_000));
+    const sessionId = createSessionId();
+
+    const stamped = repository.recordExpectation({
+      sessionId,
+      turnId: "turn-11",
+      content: "Lunaria will bring a real fault, not a description of one.",
+      formedTurnCounter: 11,
+    });
+
+    expect(stamped.formed_turn_counter).toBe(11);
+    expect(repository.listOpen({ limit: 10 })[0]!.formed_turn_counter).toBe(11);
+
+    // A reconciliation always happens in the current turn, so it carries no ordinal
+    // of its own; the age that matters is the expectation's.
+    const reconciliation = repository.reconcile({
+      predictionId: stamped.id,
+      sessionId,
+      turnId: "turn-13",
+      content: "She brought one.",
+      errorMagnitude: 0.2,
+    });
+
+    expect(reconciliation.formed_turn_counter).toBeNull();
+  });
+
+  it("records an expectation with no turn ordinal when the caller tracks none", () => {
+    const repository = openRepository(new ManualClock(5_000));
+
+    const unstamped = repository.recordExpectation({
+      sessionId: createSessionId(),
+      turnId: "turn-1",
+      content: "Someone will answer.",
+    });
+
+    expect(unstamped.formed_turn_counter).toBeNull();
+  });
 });

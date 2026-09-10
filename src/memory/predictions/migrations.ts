@@ -42,4 +42,20 @@ export const predictionMigrations = [
       `);
     },
   },
+  {
+    id: 2,
+    name: "prediction_events_formed_turn_counter",
+    up: (db) => {
+      db.exec(`
+        -- The global turn ordinal the expectation formed in. Provenance, like
+        -- turn_id and session_id beside it -- never a recall gate. It exists so the
+        -- reconciliation prompt can be told how many turns old an open expectation
+        -- is: without that, "resolve only what this turn bears on" has nothing to
+        -- lean on, and a backlog of stale expectations gets cleared in one lump
+        -- against whatever turn happens to be current. Nullable, because rows
+        -- written before this migration have no ordinal to backfill from.
+        ALTER TABLE prediction_events ADD COLUMN formed_turn_counter INTEGER NULL;
+      `);
+    },
+  },
 ] as const satisfies readonly Migration[];

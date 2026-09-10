@@ -61,6 +61,10 @@ export const predictionEventSchema = z
     about_entity_id: predictionEntityIdSchema.nullable(),
     origin_audience: z.string().min(1).nullable(),
     error_magnitude: z.number().min(0).max(1).nullable(),
+    // Global turn ordinal the row was written in, when the caller knew it. Lets a
+    // consumer say how many turns ago an expectation formed; null on rows written
+    // before the column existed, and on reconciliations, which are always current.
+    formed_turn_counter: z.number().int().nonnegative().nullable(),
     episode_ids: z.array(predictionEpisodeIdSchema),
     source_stream_ids: z.array(predictionStreamEntryIdSchema),
     created_at: z.number().int().finite(),

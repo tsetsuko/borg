@@ -75,6 +75,14 @@ export type OpenExpectationForPrompt = {
    * not narrow which expectations are recalled.
    */
   disclosureLabel: MemoryDisclosureLabel;
+  /**
+   * How old the expectation is, in turns and in minutes, or null when the age
+   * cannot be established (a row written before the turn ordinal was recorded).
+   * The prompt needs it to leave a stale expectation open instead of settling it
+   * against whatever turn is current.
+   */
+  formedTurnsAgo: number | null;
+  formedMinutesAgo: number | null;
 };
 
 export type PredictionExtractorOptions = {
@@ -95,6 +103,8 @@ export type ExtractPredictionsInput = {
   turnId: string;
   /** Stream entries of this turn, stored on new expectations for episode linkage. */
   sourceStreamEntryIds?: readonly StreamEntryId[];
+  /** Global turn ordinal of this turn; stamped on the expectations it records. */
+  currentTurnCounter?: number | null;
 };
 
 export type PredictionExtractionResult = {
@@ -122,6 +132,8 @@ function buildMessages(input: ExtractPredictionsInput): LLMMessage[] {
           prediction_id: expectation.prediction_id,
           content: expectation.content,
           about: expectation.about,
+          formed_turns_ago: expectation.formedTurnsAgo,
+          formed_minutes_ago: expectation.formedMinutesAgo,
           ...memoryDisclosurePayloadFields(expectation.disclosureLabel),
         })),
       }),
@@ -245,6 +257,7 @@ export class PredictionExtractor {
           about: expectation.about ?? null,
           aboutEntityId: asEntityId(expectation.about_entity_id),
           sourceStreamIds: input.sourceStreamEntryIds ?? [],
+          formedTurnCounter: input.currentTurnCounter ?? null,
         });
         createdExpectationIds.push(row.id);
       } catch (error) {

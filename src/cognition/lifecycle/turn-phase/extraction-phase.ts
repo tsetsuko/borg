@@ -321,6 +321,8 @@ export async function runExtractionPhase(input: {
             sourceStreamEntryIds:
               input.sourceUserEntryIds ??
               (input.persistedUserEntryId === undefined ? [] : [input.persistedUserEntryId]),
+            currentTurnCounter:
+              input.turnInput.globalTurnCounter ?? input.workingMemory.turn_counter,
           })
         : Promise.resolve(EMPTY_PREDICTION_RESULT),
       // Post-turn trust appraisal: did this partner turn out to be responsive,

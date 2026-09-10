@@ -80,6 +80,8 @@ describe("PredictionExtractor", () => {
           content: open.content,
           about: null,
           disclosureLabel: predictionMemoryDisclosureLabel(),
+          formedTurnsAgo: 1,
+          formedMinutesAgo: 2,
         },
       ],
       sessionId,
@@ -131,6 +133,8 @@ describe("PredictionExtractor", () => {
           content: open.content,
           about: null,
           disclosureLabel: predictionMemoryDisclosureLabel(),
+          formedTurnsAgo: 1,
+          formedMinutesAgo: 2,
         },
       ],
       sessionId,
@@ -205,5 +209,87 @@ describe("PredictionExtractor", () => {
 
     expect(result.reconciledPredictionIds).toEqual([]);
     expect(result.createdExpectationIds).toEqual([]);
+  });
+
+  it("shows the model how old each open expectation is, in turns and in minutes", async () => {
+    const repository = openRepository();
+    const sessionId = createSessionId();
+    const open = repository.recordExpectation({
+      sessionId,
+      turnId: "turn-1",
+      content: "Jacek will bring the snapshot ordering back.",
+      formedTurnCounter: 4,
+    });
+
+    const llmClient = new FakeLLMClient({
+      responses: [toolResponse({ reconciliations: [], new_expectations: [] })],
+    });
+
+    const extractor = new PredictionExtractor({
+      llmClient,
+      model: "test-model",
+      predictionRepository: repository,
+      turnId: "turn-9",
+      sessionId,
+    });
+
+    await extractor.extract({
+      userMessage: "morning",
+      recentHistory: [],
+      openExpectations: [
+        {
+          prediction_id: open.id,
+          content: open.content,
+          about: null,
+          disclosureLabel: predictionMemoryDisclosureLabel(),
+          formedTurnsAgo: 5,
+          formedMinutesAgo: 12,
+        },
+      ],
+      sessionId,
+      turnId: "turn-9",
+    });
+
+    const payload = JSON.parse(String(llmClient.requests[0]!.messages[0]!.content)) as {
+      open_expectations: { formed_turns_ago: number | null; formed_minutes_ago: number | null }[];
+    };
+
+    // Without the age, "resolve only what this turn bears on" has nothing to lean on.
+    expect(payload.open_expectations[0]!.formed_turns_ago).toBe(5);
+    expect(payload.open_expectations[0]!.formed_minutes_ago).toBe(12);
+  });
+
+  it("stamps a new expectation with the turn ordinal it formed in", async () => {
+    const repository = openRepository();
+    const sessionId = createSessionId();
+
+    const llmClient = new FakeLLMClient({
+      responses: [
+        toolResponse({
+          reconciliations: [],
+          new_expectations: [{ content: "Lunaria will answer with a fault to fix." }],
+        }),
+      ],
+    });
+
+    const extractor = new PredictionExtractor({
+      llmClient,
+      model: "test-model",
+      predictionRepository: repository,
+      turnId: "turn-7",
+      sessionId,
+    });
+
+    const result = await extractor.extract({
+      userMessage: "anything broken today?",
+      recentHistory: [],
+      openExpectations: [],
+      sessionId,
+      turnId: "turn-7",
+      currentTurnCounter: 7,
+    });
+
+    const stored = repository.getExpectation(result.createdExpectationIds[0]!);
+    expect(stored?.formed_turn_counter).toBe(7);
   });
 });

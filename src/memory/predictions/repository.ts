@@ -28,6 +28,8 @@ export type RecordExpectationInput = {
   originAudience?: string | null;
   /** Stream entries of the forming turn; reconciliation boosts their episode(s). */
   sourceStreamIds?: readonly StreamEntryId[];
+  /** Global turn ordinal this expectation formed in, when the caller knows it. */
+  formedTurnCounter?: number | null;
   now?: number;
 };
 
@@ -67,6 +69,10 @@ function mapRow(row: Record<string, unknown>): PredictionEvent {
       row.error_magnitude === null || row.error_magnitude === undefined
         ? null
         : Number(row.error_magnitude),
+    formed_turn_counter:
+      row.formed_turn_counter === null || row.formed_turn_counter === undefined
+        ? null
+        : Number(row.formed_turn_counter),
     episode_ids: JSON.parse(String(row.episode_ids ?? "[]")) as unknown,
     source_stream_ids: JSON.parse(String(row.source_stream_ids ?? "[]")) as unknown,
     created_at: Number(row.created_at),
@@ -106,6 +112,7 @@ export class PredictionRepository {
     errorMagnitude: number | null;
     episodeIds: readonly EpisodeId[];
     sourceStreamIds: readonly StreamEntryId[];
+    formedTurnCounter: number | null;
     now: number;
   }): { inserted: boolean } {
     const result = this.db
@@ -114,8 +121,8 @@ export class PredictionRepository {
           INSERT INTO prediction_events (
             id, prediction_id, kind, created_ts, session_id, turn_id, content,
             about, about_entity_id, origin_audience, error_magnitude, episode_ids,
-            source_stream_ids, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            source_stream_ids, formed_turn_counter, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(prediction_id, kind) DO NOTHING
         `,
       )
@@ -133,6 +140,7 @@ export class PredictionRepository {
         row.errorMagnitude,
         JSON.stringify([...row.episodeIds]),
         JSON.stringify([...row.sourceStreamIds]),
+        row.formedTurnCounter,
         row.now,
       );
 
@@ -172,6 +180,7 @@ export class PredictionRepository {
       errorMagnitude: null,
       episodeIds: [],
       sourceStreamIds: input.sourceStreamIds ?? [],
+      formedTurnCounter: input.formedTurnCounter ?? null,
       now,
     });
 
@@ -223,6 +232,7 @@ export class PredictionRepository {
       errorMagnitude,
       episodeIds: input.episodeIds ?? [],
       sourceStreamIds: [],
+      formedTurnCounter: null,
       now,
     });
 

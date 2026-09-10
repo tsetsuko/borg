@@ -44,6 +44,8 @@ export type ExtractPredictionsTurnInput = {
   sessionId: SessionId;
   /** Stream entries of this turn; stored on new expectations for later episode linkage. */
   sourceStreamEntryIds: readonly StreamEntryId[];
+  /** Global turn ordinal of this turn; null when the caller does not track one. */
+  currentTurnCounter?: number | null;
 };
 
 const EMPTY_RESULT: PredictionExtractionResult = {
@@ -61,6 +63,12 @@ export class PredictionTurnService {
       return EMPTY_RESULT;
     }
 
+    // Age of each open expectation, so the reflection can leave a stale one open
+    // rather than settling it against whatever turn happens to be current. Turns
+    // are the conversational unit the instruction speaks in; minutes ride along
+    // because a turn ordinal is missing on rows written before it was recorded.
+    const now = this.options.clock.now();
+    const currentTurnCounter = input.currentTurnCounter ?? null;
     const openExpectations = this.options.predictionRepository
       .listOpen({ limit: OPEN_EXPECTATION_SURFACE_CAP })
       .map((expectation) => ({
@@ -68,6 +76,11 @@ export class PredictionTurnService {
         content: expectation.content,
         about: expectation.about,
         disclosureLabel: predictionMemoryDisclosureLabel(),
+        formedTurnsAgo:
+          currentTurnCounter === null || expectation.formed_turn_counter === null
+            ? null
+            : Math.max(0, currentTurnCounter - expectation.formed_turn_counter),
+        formedMinutesAgo: Math.max(0, Math.round((now - expectation.created_ts) / 60_000)),
       }));
 
     const extractor = new PredictionExtractor({
@@ -86,6 +99,7 @@ export class PredictionTurnService {
       sessionId: input.sessionId,
       turnId: input.turnId,
       sourceStreamEntryIds: input.sourceStreamEntryIds,
+      currentTurnCounter,
     });
 
     if (result.reconciledPredictionIds.length > 0) {
