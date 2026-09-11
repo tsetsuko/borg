@@ -1026,6 +1026,108 @@ describe("commitment repository", () => {
     }
   });
 
+  it("adopts an unclaimed entity of the same name on first contact through a channel", () => {
+    const db = openDatabase(":memory:", {
+      migrations: commitmentMigrations,
+    });
+    const entities = new EntityRepository({
+      db,
+      clock: new FixedClock(1_000),
+    });
+
+    try {
+      const declared = entities.resolve("Zosia", {
+        kind: "person",
+        provenance: "user_declared",
+      });
+      const throughTransport = entities.resolveExternal({
+        source: "botarena",
+        externalId: "principal-1",
+        canonicalName: "Zosia",
+        kind: "person",
+        provenance: "transport_sender",
+      });
+
+      expect(throughTransport).toBe(declared);
+      expect(entities.findByExternalId("botarena", "principal-1")).toBe(declared);
+      expect(entities.list({ kind: "person" })).toHaveLength(1);
+      // The declared name is the stronger claim and survives the transport's.
+      expect(entities.get(declared)).toMatchObject({
+        canonical_name: "Zosia",
+        name_provenance: "user_declared",
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("leaves a claimed entity alone when a second principal shares its name", () => {
+    const db = openDatabase(":memory:", {
+      migrations: commitmentMigrations,
+    });
+    const entities = new EntityRepository({
+      db,
+      clock: new FixedClock(1_000),
+    });
+
+    try {
+      const declared = entities.resolve("Zosia", {
+        kind: "person",
+        provenance: "user_declared",
+      });
+      const first = entities.resolveExternal({
+        source: "botarena",
+        externalId: "principal-1",
+        canonicalName: "Zosia",
+        kind: "person",
+        provenance: "transport_sender",
+      });
+      const second = entities.resolveExternal({
+        source: "botarena",
+        externalId: "principal-2",
+        canonicalName: "Zosia",
+        kind: "person",
+        provenance: "transport_sender",
+      });
+
+      expect(first).toBe(declared);
+      expect(second).not.toBe(declared);
+      expect(entities.list({ kind: "person" })).toHaveLength(2);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("does not adopt an entity of a different kind that happens to share the name", () => {
+    const db = openDatabase(":memory:", {
+      migrations: commitmentMigrations,
+    });
+    const entities = new EntityRepository({
+      db,
+      clock: new FixedClock(1_000),
+    });
+
+    try {
+      const group = entities.resolve("Arena", {
+        kind: "group",
+        provenance: "transport_audience_label",
+      });
+      const person = entities.resolveExternal({
+        source: "botarena",
+        externalId: "principal-1",
+        canonicalName: "Arena",
+        kind: "person",
+        provenance: "transport_sender",
+      });
+
+      expect(person).not.toBe(group);
+      expect(entities.get(group)).toMatchObject({ kind: "group" });
+      expect(entities.get(person)).toMatchObject({ kind: "person" });
+    } finally {
+      db.close();
+    }
+  });
+
   it("materializes expiration and records an identity event", () => {
     const db = openDatabase(":memory:", {
       migrations: composeMigrations(commitmentMigrations, identityMigrations),

@@ -455,6 +455,46 @@ export class EntityRepository {
     return entity.id;
   }
 
+  /**
+   * Has any external channel already claimed this entity? A claimed entity belongs
+   * to one principal, so a second principal arriving under the same display name
+   * must not be folded into it.
+   */
+  private hasExternalMapping(entityId: EntityId): boolean {
+    const row = this.db
+      .prepare(`SELECT 1 AS claimed FROM entity_external_ids WHERE entity_id = ? LIMIT 1`)
+      .get(entityId) as { claimed: number } | undefined;
+
+    return row !== undefined;
+  }
+
+  /**
+   * Settle the record of an entity adopted by an external channel: the channel's
+   * kind wins, and the name keeps whichever provenance is the stronger claim, so
+   * a name the user declared is not downgraded to a transport's display name.
+   */
+  private stampAdopted(entityId: EntityId, kind: EntityKind, provenance: NameProvenance): EntityId {
+    const current = this.get(entityId);
+
+    if (current === null) {
+      throw new CommitmentError(`Adoptable entity ${entityId} disappeared`, {
+        code: "ENTITY_EXTERNAL_ID_DANGLING",
+      });
+    }
+
+    const next = entityRecordSchema.parse({
+      ...current,
+      kind,
+      name_provenance: strongerNameProvenance(current.name_provenance, provenance),
+    });
+
+    this.db
+      .prepare(`UPDATE entities SET kind = ?, name_provenance = ? WHERE id = ?`)
+      .run(next.kind, next.name_provenance, next.id);
+
+    return next.id;
+  }
+
   findByExternalId(source: string, externalId: string): EntityId | null {
     const normalizedSource = source.trim();
     const normalizedExternalId = externalId.trim();
@@ -558,12 +598,28 @@ export class EntityRepository {
         return next.id;
       }
 
-      const entity = this.add({
-        canonicalName,
-        kind,
-        provenance,
-        createdAt: nowMs,
-      });
+      // First contact through this channel. Before minting a new entity, adopt one
+      // that is already known under this name and that no other channel has claimed
+      // -- otherwise a person the being already knows (declared in a seed, or named
+      // in conversation) is forked into a second identity the moment they first
+      // speak through a transport, splitting their history, trust and attachment.
+      // The unclaimed condition is what keeps this from collapsing two different
+      // principals who merely share a display name: once a principal holds an
+      // entity, a same-named stranger gets their own.
+      const adoptable =
+        this.findAllByName(canonicalName, { kind }).find(
+          (candidate) => !this.hasExternalMapping(candidate),
+        ) ?? null;
+
+      const entityId =
+        adoptable === null
+          ? this.add({
+              canonicalName,
+              kind,
+              provenance,
+              createdAt: nowMs,
+            }).id
+          : this.stampAdopted(adoptable, kind, provenance);
 
       this.db
         .prepare(
@@ -573,9 +629,9 @@ export class EntityRepository {
             ) VALUES (?, ?, ?, ?, ?)
           `,
         )
-        .run(source, externalId, entity.id, nowMs, nowMs);
+        .run(source, externalId, entityId, nowMs, nowMs);
 
-      return entity.id;
+      return entityId;
     });
 
     return resolve.immediate();
@@ -583,8 +639,7 @@ export class EntityRepository {
 
   get(id: EntityId): EntityRecord | null {
     const row = this.db.prepare("SELECT * FROM entities WHERE id = ?").get(id) as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
 
     return row === undefined ? null : mapEntityRow(row);
   }
@@ -1338,8 +1393,7 @@ export class CommitmentRepository {
 
   get(id: CommitmentId): CommitmentRecord | null {
     const row = this.db.prepare("SELECT * FROM commitments WHERE id = ?").get(id) as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
 
     return row === undefined ? null : mapCommitmentRow(row);
   }
