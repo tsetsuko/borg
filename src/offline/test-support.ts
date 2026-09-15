@@ -671,6 +671,7 @@ export async function createOfflineTestHarness(
     clock,
     defaultHalfLifeHours: config.affective.moodHalfLifeHours,
     incomingWeight: config.affective.incomingMoodWeight,
+    restingValence: config.affective.restingValence,
   });
   const activityRepository = new ActivityRepository({
     db,

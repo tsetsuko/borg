@@ -42,7 +42,24 @@ function decayFactor(nowMs: number, updatedAt: number, halfLifeHours: number): n
   return halfLifeDecay(elapsed, halfLifeHours * HOUR_MS);
 }
 
-function mapMoodStateRow(row: Record<string, unknown>, nowMs: number): MoodState {
+/**
+ * Decay a stored reading toward `resting` rather than toward zero.
+ *
+ * With `resting` at 0 this is the original behaviour -- the value is multiplied by
+ * the half-life factor and fades to neutral. A non-zero resting point makes the
+ * same curve settle somewhere else: the distance from the resting point decays,
+ * not the value itself. Akuki uses it for valence, where the resting point is the
+ * mood he returns to when nothing is happening.
+ */
+function decayToward(stored: number, resting: number, factor: number): number {
+  return resting + (stored - resting) * factor;
+}
+
+function mapMoodStateRow(
+  row: Record<string, unknown>,
+  nowMs: number,
+  restingValence: number,
+): MoodState {
   const base = moodStateSchema.parse({
     session_id: row.session_id,
     valence: Number(row.valence),
@@ -55,7 +72,9 @@ function mapMoodStateRow(row: Record<string, unknown>, nowMs: number): MoodState
 
   return {
     ...base,
-    valence: clamp(base.valence * factor, -1, 1),
+    valence: clamp(decayToward(base.valence, restingValence, factor), -1, 1),
+    // Arousal keeps decaying to zero: "how stirred up" has a natural floor of
+    // "not stirred up at all", while valence does not have a natural zero.
     arousal: clamp(base.arousal * factor, 0, 1),
   };
 }
@@ -93,17 +112,25 @@ export type MoodRepositoryOptions = {
   clock?: Clock;
   defaultHalfLifeHours?: number;
   incomingWeight?: number;
+  /**
+   * Valence the mood returns to when nothing is happening, -1..1. Zero (the
+   * default, and Borg's behaviour before this option existed) means moods fade to
+   * neutral.
+   */
+  restingValence?: number;
 };
 
 export class MoodRepository {
   private readonly clock: Clock;
   private readonly defaultHalfLifeHours: number;
   private readonly incomingWeight: number;
+  private readonly restingValence: number;
 
   constructor(private readonly options: MoodRepositoryOptions) {
     this.clock = options.clock ?? new SystemClock();
     this.defaultHalfLifeHours = options.defaultHalfLifeHours ?? 24;
     this.incomingWeight = clamp(options.incomingWeight ?? 0.3, 0, 1);
+    this.restingValence = clamp(options.restingValence ?? 0, -1, 1);
   }
 
   private get db(): SqliteDatabase {
@@ -128,7 +155,10 @@ export class MoodRepository {
     if (row === undefined) {
       return moodStateSchema.parse({
         session_id: sessionId,
-        valence: 0,
+        // No row yet: the resting point IS the starting mood, otherwise the very
+        // first turn would read neutral and only later drift to where the entity
+        // rests.
+        valence: this.restingValence,
         arousal: 0,
         updated_at: this.clock.now(),
         half_life_hours: this.defaultHalfLifeHours,
@@ -136,7 +166,7 @@ export class MoodRepository {
       });
     }
 
-    return mapMoodStateRow(row, this.clock.now());
+    return mapMoodStateRow(row, this.clock.now(), this.restingValence);
   }
 
   listStates(): MoodState[] {
@@ -144,7 +174,11 @@ export class MoodRepository {
     return this.listStoredStates().map((state) => ({
       ...state,
       valence: clamp(
-        state.valence * decayFactor(nowMs, state.updated_at, state.half_life_hours),
+        decayToward(
+          state.valence,
+          this.restingValence,
+          decayFactor(nowMs, state.updated_at, state.half_life_hours),
+        ),
         -1,
         1,
       ),

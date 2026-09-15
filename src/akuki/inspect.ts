@@ -11,7 +11,7 @@ import {
   computePartnerPredictability,
 } from "../cognition/inhibition/index.js";
 import type { SessionId } from "../util/ids.js";
-import { applyAkukiPredictionEnv } from "./prediction-config.js";
+import { applyAkukiTemperamentEnv } from "./prediction-config.js";
 import { buildAkukiClients } from "./tenant.js";
 
 export type AkukiInspectOptions = {
@@ -131,7 +131,7 @@ export async function runAkukiInspect(options: AkukiInspectOptions): Promise<Aku
   const sessionId = (options.sessionId ?? "default") as SessionId;
   const audience = options.audience ?? "Zosia";
 
-  applyAkukiPredictionEnv(env);
+  applyAkukiTemperamentEnv(env);
   const clients = buildAkukiClients({ env });
   const deps = await openBorgDependencies({
     dataDir: options.dataDir,

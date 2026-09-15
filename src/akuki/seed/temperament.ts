@@ -152,6 +152,8 @@ export const temperamentSchema = z
         imitation_retention_confidence: probability,
       })
       .strict(),
+    empathy: z.object({ contagion_weight: probability }).strict(),
+    optimism: z.object({ resting_valence: z.number().min(-1).max(1) }).strict(),
   })
   .strict();
 
@@ -196,6 +198,8 @@ export const TEMPERAMENT_CONSUMERS: Readonly<Record<string, ParameterConsumer>> 
   "agency.contingency_confidence": "M5",
   "differentiation.imitation_retention_floor": "TASK-032",
   "differentiation.imitation_retention_confidence": "TASK-032",
+  "empathy.contagion_weight": "TASK-041",
+  "optimism.resting_valence": "TASK-041",
 };
 
 /**
@@ -212,7 +216,7 @@ export const LANDED_MILESTONES: readonly Milestone[] = ["M0", "M1", "M2", "M3", 
  * kept separate only because these are not milestones: the guard checks membership
  * in either list before it demands a reader.
  */
-export const LANDED_TASKS: readonly TaskId[] = ["TASK-032"];
+export const LANDED_TASKS: readonly TaskId[] = ["TASK-032", "TASK-041"];
 
 /**
  * Parameters whose consumer has landed and which nothing reads.

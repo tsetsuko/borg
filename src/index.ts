@@ -659,5 +659,5 @@ export {
 // (the same split sol-connector makes), while the seed, the model clients and the
 // prediction parameters are entity code and belong here.
 export { applyAkukiSeed } from "./akuki/seed/apply.js";
-export { applyAkukiPredictionEnv } from "./akuki/prediction-config.js";
+export { applyAkukiTemperamentEnv } from "./akuki/prediction-config.js";
 export { buildAkukiClients } from "./akuki/tenant.js";

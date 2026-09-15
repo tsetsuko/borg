@@ -1,5 +1,5 @@
-// Akuki: bridge temperament.yaml into Borg's core prediction (M2) and inhibition
-// (M3) config.
+// Akuki: bridge temperament.yaml into Borg's core prediction (M2), inhibition
+// (M3) and affect config.
 //
 // The M2/M3 mechanisms live in core Borg and read plain numbers from
 // config.prediction / config.inhibition. Their VALUES are Akuki's temperament. This
@@ -13,10 +13,11 @@
 import { loadTemperament, type Temperament } from "./seed/temperament.js";
 
 /**
- * Populate BORG_PREDICTION_* from temperament, unless already set. Uses `??=` so an
+ * Populate BORG_PREDICTION_*, BORG_INHIBITION_*, BORG_IMITATION_* and the two
+ * BORG_AFFECTIVE_* keys from temperament, unless already set. Uses `??=` so an
  * explicit environment override (tests, ops) still wins over the seed default.
  */
-export function applyAkukiPredictionEnv(
+export function applyAkukiTemperamentEnv(
   env: NodeJS.ProcessEnv,
   temperament: Temperament = loadTemperament(),
 ): void {
@@ -34,4 +35,9 @@ export function applyAkukiPredictionEnv(
   env.BORG_IMITATION_RETENTION_CONFIDENCE ??= String(
     temperament.differentiation.imitation_retention_confidence,
   );
+  // Affect (TASK-041). Both keys have readers that predate them: the incoming-mood
+  // blend weight and the valence the mood decays back to. Temperament owns their
+  // values; the mechanism is Borg's.
+  env.BORG_AFFECTIVE_INCOMING_MOOD_WEIGHT ??= String(temperament.empathy.contagion_weight);
+  env.BORG_AFFECTIVE_RESTING_VALENCE ??= String(temperament.optimism.resting_valence);
 }

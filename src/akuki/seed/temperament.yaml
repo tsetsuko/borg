@@ -79,3 +79,38 @@ differentiation:
   # Nie wolno tym liczbom pozyczac powagi od literatury.
   imitation_retention_floor: 0.6
   imitation_retention_confidence: 0.8
+
+empathy:
+  # consumer: TASK-041 (config.affective.incomingMoodWeight)
+  # Jak mocno odczyt afektywny CUDZEJ wypowiedzi przesuwa wlasny nastroj Akukiego.
+  # Czytelnik istnial w borgu przed tym kluczem: mieszanie nastroju wazy przychodzacy
+  # odczyt wlasnie ta liczba (memory/affective/mood.ts). Temperament tylko przejmuje
+  # jej wartosc. Domyslna borgowa to 0.3.
+  #
+  # TO JEST WYBOR TWORCZY I NIE MA OPARCIA W BADANIACH TEGO PROJEKTU.
+  # Par. 18 :992-1002 wylicza sklonnosci, ktore zasiew ma prawo nadac, i empatii
+  # NA TEJ LISCIE NIE MA. Empatia pada w dokumencie raz, w par. 15 :907, jako pytanie
+  # do zbadania. Ta liczba nie pozycza powagi od literatury -- dokladnie jak
+  # differentiation.imitation_retention_floor ponizej.
+  #
+  # KOSZT, ktory trzeba znac: wyzsza waga dziala w OBIE strony. W cieplej wymianie
+  # Akuki ociepla sie szybciej, w kwasnej ochładza sie szybciej, a polowiczny czas
+  # zaniku nastroju wynosi 24 h, wiec dolek trzyma sie godzinami. Ujemny nastroj
+  # podbija ostroznosc (cognition/inhibition), wiec silna empatia w zlym wieczorze
+  # daje ciszej, nie cieplej.
+  contagion_weight: 0.45
+
+optimism:
+  # consumer: TASK-041 (config.affective.restingValence)
+  # Punkt, do ktorego nastroj wraca, gdy nic sie nie dzieje. Borg przed ta zmiana
+  # mnozyl nastroj przez wspolczynnik zaniku, czyli punktem spoczynku bylo zero.
+  # Teraz zanika ODLEGLOSC od tej liczby, a nie sama liczba.
+  #
+  # TO TEZ JEST WYBOR TWORCZY BEZ OPARCIA W BADANIACH. Optymizmu nie ma na liscie
+  # z par. 18 :992-1002 i dokument nie mowi o nim nic.
+  #
+  # Konsekwencja, ktora juz ma czytelnika: ostroznosc podbija sie WYLACZNIE przy
+  # ujemnym nastroju (cognition/inhibition/inhibition-signal.ts). Dodatni punkt
+  # spoczynku znaczy wiec, ze po przykrej wymianie ostroznosc schodzi wczesniej.
+  # To odejmuje troche niesmialosci -- efekt uboczny, nie cel.
+  resting_valence: 0.25

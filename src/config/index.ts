@@ -75,6 +75,10 @@ const affectiveConfigSchema = z
         // when configured; heuristics are the offline/test fallback path.
         llmEnabled: z.boolean().default(true),
         incomingMoodWeight: z.number().min(0).max(1).default(0.3),
+        // Valence the mood decays back to when nothing is happening. Zero keeps
+        // Borg's original behaviour (moods fade to neutral); a positive value
+        // makes the entity settle mildly cheerful instead.
+        restingValence: z.number().min(-1).max(1).default(0),
         moodHistoryRetentionDays: z.number().positive().default(90),
         moodHalfLifeHours: z.number().positive().default(24),
       })
@@ -345,7 +349,7 @@ const anthropicConfigSchema = z
   .prefault({});
 
 // M2 prediction->surprise loop. Defaults mirror Akuki's temperament.yaml; the
-// Akuki layer overrides them from temperament at open (see applyAkukiPredictionEnv),
+// Akuki layer overrides them from temperament at open (see applyAkukiTemperamentEnv),
 // which is also where those temperament keys earn their reader.
 const predictionConfigSchema = z
   .object({
@@ -1128,6 +1132,11 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["affective", "incomingMoodWeight"],
     readOptionalEnvUnitInterval(env, "BORG_AFFECTIVE_INCOMING_MOOD_WEIGHT"),
+  );
+  setConfigOverride(
+    overrides,
+    ["affective", "restingValence"],
+    readOptionalEnvFloat(env, "BORG_AFFECTIVE_RESTING_VALENCE"),
   );
   setConfigOverride(
     overrides,

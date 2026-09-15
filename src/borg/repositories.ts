@@ -251,6 +251,7 @@ export async function buildBorgRepositories(
     clock,
     defaultHalfLifeHours: config.affective.moodHalfLifeHours,
     incomingWeight: config.affective.incomingMoodWeight,
+    restingValence: config.affective.restingValence,
   });
   const enqueueReview = (input: Parameters<ReviewQueueRepository["enqueue"]>[0]) => {
     return reviewQueueRepository?.enqueue(input);
