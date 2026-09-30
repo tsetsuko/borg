@@ -51,7 +51,7 @@ export type DirectedOutboundDeliveryOutcome =
     }
   | {
       state: "not_emitted";
-      emissionKind: Exclude<TurnEmission["kind"], "message" | "suppressed">;
+      emissionKind: Exclude<TurnEmission["kind"], "message" | "suppressed" | "assessed">;
       markerEntryId?: StreamEntryId;
     }
   | {
@@ -140,6 +140,12 @@ function directedOutboundDeliveryOutcome(input: {
         ? {}
         : { structuralNoOutputFlags: [...input.emission.structural_no_output_flags] }),
     };
+  }
+
+  if (input.emission.kind === "assessed") {
+    // Assess-only is a user-origin transport mode; a directed outbound turn
+    // cannot produce it, so reaching here is a wiring error, not an outcome.
+    throw new Error("A directed outbound turn cannot end assessed");
   }
 
   return {

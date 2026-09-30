@@ -24,6 +24,7 @@ import type {
 import type { EntityId, SessionId, StreamEntryId } from "../../../util/ids.js";
 import type { CognitiveMode } from "../../types.js";
 import type { DiscourseStopProvenance, WorkingMemory } from "../../../memory/working/index.js";
+import type { AffectiveSignal } from "../../../memory/affective/index.js";
 import type { ActivityEventStatus } from "../../../memory/activity/index.js";
 import { CognitionError } from "../../../util/errors.js";
 import type { SharedStateEntry } from "../../../memory/shared-state/index.js";
@@ -1334,6 +1335,92 @@ async function suppressFromActionPhase(input: {
     toolCalls: [...input.actionResult.tool_calls],
     terminalOutcome: "suppressed_action",
   });
+}
+
+/**
+ * End an assess-only turn right after the extract phase. By this point the
+ * message is in the stream, perception has run, and M2 and M4 have written
+ * their appraisal. What remains is what the full turn writes only after the
+ * reply and that belongs to receiving the message rather than answering it:
+ * the mood and the social contact, the working memory, and any corrective
+ * commitment the extract phase found.
+ *
+ * Deliberately absent: the closure-loop classifier, the generation gate,
+ * recall, deliberation, the reflector, and any stream marker. The suppress
+ * exits above are not reused because both set a discourse stop state and
+ * append an `agent_suppressed` marker, which recency renders as a turn the
+ * entity chose to withhold. An assessed message was heard, not declined.
+ *
+ * Episodic memory needs no call here: the next turn's pre-turn catch-up
+ * ingests the stored message.
+ */
+export async function finalizeAssessedTurn(input: {
+  options: TurnPhaseCoordinatorOptions;
+  streamWriter: StreamWriter;
+  appendHookFailureEvent: AppendHookFailureEvent;
+  turnId: string;
+  sessionId: SessionId;
+  turnInput: TurnPhaseInput;
+  isUserTurn: boolean;
+  perception: PerceptionResult;
+  workingMood: AffectiveSignal;
+  workingMemory: WorkingMemory;
+  socialInteractionEntityId: EntityId | null;
+  correctiveCommitment: CorrectiveCommitment;
+  correctiveCommitmentSupersession: CorrectiveCommitmentSupersession;
+  correctiveCommitmentRetirement: CorrectiveCommitmentRetirement;
+}): Promise<TurnPhaseResult> {
+  const { moodSnapshot } = await input.options.turnReflectionCoordinator.recordReception({
+    sessionId: input.sessionId,
+    userMessage: input.turnInput.userMessage,
+    perception: input.perception,
+    workingMood: input.workingMood,
+    isUserTurn: input.isUserTurn,
+    socialInteractionEntityId: input.socialInteractionEntityId,
+    onHookFailure: (hook, error) => input.appendHookFailureEvent(input.streamWriter, hook, error),
+  });
+
+  input.options.workingMemoryStore.save({
+    ...input.workingMemory,
+    mood: moodSnapshot,
+    updated_at: input.options.clock.now(),
+  });
+  await persistCorrectiveCommitment({
+    service: input.options.correctivePreferenceTurnService,
+    streamWriter: input.streamWriter,
+    turnId: input.turnId,
+    sessionId: input.sessionId,
+    commitment: input.correctiveCommitment,
+    supersession: input.correctiveCommitmentSupersession,
+    retirement: input.correctiveCommitmentRetirement,
+    appendHookFailureEvent: input.appendHookFailureEvent,
+  });
+  archiveInactiveParticipantActions({
+    options: input.options,
+    turnId: input.turnId,
+    sessionId: input.sessionId,
+    turnCounter: actionLifecycleTurnCounter(input.turnInput, input.workingMemory),
+  });
+
+  return {
+    turn_id: input.turnId,
+    mode: input.perception.mode,
+    path: "assessed",
+    response: "",
+    emitted: false,
+    emission: { kind: "assessed" },
+    thoughts: [],
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      stop_reason: null,
+    },
+    retrievedEpisodeIds: [],
+    referencedEpisodeIds: [],
+    intents: [],
+    toolCalls: [],
+    terminalOutcome: "assessed",
+  };
 }
 
 function suppressedTurnPhaseResult(input: {

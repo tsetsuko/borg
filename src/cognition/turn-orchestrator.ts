@@ -100,7 +100,7 @@ import { isAutonomousLikeTurnOrigin, type CognitiveMode, type IntentRecord } fro
 export type TurnResult = {
   turn_id: string;
   mode: CognitiveMode;
-  path: "system_1" | "system_2" | "suppressed";
+  path: "system_1" | "system_2" | "suppressed" | "assessed";
   response: string;
   emitted: boolean;
   emission: TurnEmission;

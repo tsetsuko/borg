@@ -216,6 +216,12 @@ export type TurnEmission =
       structural_no_output_flags?: FinalizerNoOutputStructuralFlag[];
       decision_rationale?: string;
       finalizer_invalid_tool?: FinalizerInvalidToolDiagnostic;
+    }
+  | {
+      // The message was taken in (perceived and appraised) but the turn stopped
+      // before deliberation, at the transport's request. Not a decision to stay
+      // silent, so it carries no reason and leaves no marker in the stream.
+      kind: "assessed";
     };
 
 export type AgentSuppressedStreamContent = {

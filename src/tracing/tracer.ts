@@ -194,6 +194,7 @@ export type TurnTerminalOutcome =
   | "suppressed_closure"
   | "suppressed_generation_gate"
   | "suppressed_action"
+  | "assessed"
   | "aborted"
   | "error";
 

@@ -96,7 +96,7 @@ export type TurnPhaseInput = {
 export type TurnPhaseResult = {
   turn_id: string;
   mode: CognitiveMode;
-  path: "system_1" | "system_2" | "suppressed";
+  path: "system_1" | "system_2" | "suppressed" | "assessed";
   response: string;
   emitted: boolean;
   emission: TurnEmission;

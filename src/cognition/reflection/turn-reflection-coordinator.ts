@@ -96,59 +96,7 @@ export class TurnReflectionCoordinator {
       };
     }
 
-    let moodSnapshot = input.workingMood;
-
-    // Only user turns write mood, and only undegraded ones: a gap in
-    // `mood_history` is therefore either an autonomous turn or a dead
-    // classifier, never a turn that felt nothing.
-    //
-    // `reason` is the trigger text rendered by `borg_affective_trajectory`, and
-    // a head slice of `userMessage` is a poor source for it on transports that
-    // wrap the message: 120 characters of `<inbound_batch ...><inbound_message
-    // index="1" stream_entry_id="..." times` is the whole budget on the demo
-    // connector, so every rendered trigger on that surface names a stream id
-    // and stops before the message begins. The field meant to say why the mood
-    // moved says only which envelope carried it. Widening the slice is not the
-    // fix -- the envelope grows too; the trigger wants the message body the
-    // classifier actually scored.
-    if (input.isUserTurn && input.perception.affectiveSignalDegraded !== true) {
-      try {
-        const nextMood = this.options.moodRepository.update(input.sessionId, {
-          valence: input.perception.affectiveSignal.valence,
-          arousal: input.perception.affectiveSignal.arousal,
-          reason: input.userMessage.slice(0, 120),
-          provenance: {
-            kind: "system",
-          },
-        });
-        moodSnapshot = {
-          valence: nextMood.valence,
-          arousal: nextMood.arousal,
-          dominant_emotion: input.perception.affectiveSignal.dominant_emotion,
-        };
-      } catch (error) {
-        await input.onHookFailure("mood_update", error);
-      }
-    }
-
-    let interactionRecord: ReturnType<SocialRepository["recordInteractionWithId"]> | null = null;
-    if (input.socialInteractionEntityId !== null) {
-      try {
-        // The lifecycle passes the current speaker for group channels, so
-        // participant sentiment does not collapse onto the abstract group.
-        interactionRecord = this.options.socialRepository.recordInteractionWithId(
-          input.socialInteractionEntityId,
-          {
-            now: this.options.clock.now(),
-            provenance: {
-              kind: "system",
-            },
-          },
-        );
-      } catch (error) {
-        await input.onHookFailure("social_update", error);
-      }
-    }
+    const { moodSnapshot, interactionRecord } = await this.recordReception(input);
 
     const reflector = this.options.createReflector(input.llmClient);
     const activeOpenQuestions = this.options.openQuestionsRepository.list({
@@ -255,5 +203,84 @@ export class TurnReflectionCoordinator {
     });
 
     return reflection;
+  }
+
+  /**
+   * The part of reflection that belongs to receiving a message rather than to
+   * answering it: the mood the message moved, and one recorded contact with
+   * whoever said it. The full turn runs it before the reflector; the assess-only
+   * exit runs it alone, so a message that was heard but not answered still
+   * counts toward familiarity (which M3 reads) and still shows in mood history.
+   */
+  async recordReception(
+    input: Pick<
+      RunTurnReflectionInput,
+      | "sessionId"
+      | "userMessage"
+      | "perception"
+      | "workingMood"
+      | "isUserTurn"
+      | "socialInteractionEntityId"
+      | "onHookFailure"
+    >,
+  ): Promise<{
+    moodSnapshot: AffectiveSignal;
+    interactionRecord: ReturnType<SocialRepository["recordInteractionWithId"]> | null;
+  }> {
+    let moodSnapshot = input.workingMood;
+
+    // Only user turns write mood, and only undegraded ones: a gap in
+    // `mood_history` is therefore either an autonomous turn or a dead
+    // classifier, never a turn that felt nothing.
+    //
+    // `reason` is the trigger text rendered by `borg_affective_trajectory`, and
+    // a head slice of `userMessage` is a poor source for it on transports that
+    // wrap the message: 120 characters of `<inbound_batch ...><inbound_message
+    // index="1" stream_entry_id="..." times` is the whole budget on the demo
+    // connector, so every rendered trigger on that surface names a stream id
+    // and stops before the message begins. The field meant to say why the mood
+    // moved says only which envelope carried it. Widening the slice is not the
+    // fix -- the envelope grows too; the trigger wants the message body the
+    // classifier actually scored.
+    if (input.isUserTurn && input.perception.affectiveSignalDegraded !== true) {
+      try {
+        const nextMood = this.options.moodRepository.update(input.sessionId, {
+          valence: input.perception.affectiveSignal.valence,
+          arousal: input.perception.affectiveSignal.arousal,
+          reason: input.userMessage.slice(0, 120),
+          provenance: {
+            kind: "system",
+          },
+        });
+        moodSnapshot = {
+          valence: nextMood.valence,
+          arousal: nextMood.arousal,
+          dominant_emotion: input.perception.affectiveSignal.dominant_emotion,
+        };
+      } catch (error) {
+        await input.onHookFailure("mood_update", error);
+      }
+    }
+
+    let interactionRecord: ReturnType<SocialRepository["recordInteractionWithId"]> | null = null;
+    if (input.socialInteractionEntityId !== null) {
+      try {
+        // The lifecycle passes the current speaker for group channels, so
+        // participant sentiment does not collapse onto the abstract group.
+        interactionRecord = this.options.socialRepository.recordInteractionWithId(
+          input.socialInteractionEntityId,
+          {
+            now: this.options.clock.now(),
+            provenance: {
+              kind: "system",
+            },
+          },
+        );
+      } catch (error) {
+        await input.onHookFailure("social_update", error);
+      }
+    }
+
+    return { moodSnapshot, interactionRecord };
   }
 }

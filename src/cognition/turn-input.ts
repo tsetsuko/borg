@@ -57,6 +57,18 @@ export type SingleMessageTurnInput = TurnInputBase & {
   userMessage: string;
   attachments?: readonly TurnInputAttachment[];
   inboundBatch?: never;
+  /**
+   * Take the message in without answering it. The turn runs through perception
+   * and the extract phase -- so the message is stored, perceived, and appraised
+   * by M2 and M4 -- then records the mood and the social contact the reflector
+   * would have recorded, and stops. No recall, no deliberation, no reply, no
+   * reflector, and no marker in the stream: an assessed message was heard, not
+   * declined, and the history must not claim a choice that was never made.
+   *
+   * For a transport draining a queue: every message but the newest is assessed,
+   * the newest gets a full turn. User origin only.
+   */
+  assessOnly?: boolean;
 };
 
 export type TurnInput = SingleMessageTurnInput;

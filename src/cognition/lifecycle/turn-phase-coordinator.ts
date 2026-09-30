@@ -61,6 +61,7 @@ import { runExtractionPhase } from "./turn-phase/extraction-phase.js";
 import { runRetrievalPhase } from "./turn-phase/retrieval-phase.js";
 import { runDeliberationPhase } from "./turn-phase/deliberation-phase.js";
 import {
+  finalizeAssessedTurn,
   runPostGenerationPhase,
   suppressFromClosureLoopPhase,
   suppressFromGenerationGatePhase,
@@ -806,6 +807,14 @@ export class TurnPhaseCoordinator {
       rawTurnInput,
       isUserTurn,
     });
+    const assessOnly = "assessOnly" in rawTurnInput && rawTurnInput.assessOnly === true;
+    // Assessing is taking a message in; only a message someone sent can be taken
+    // in, and a batch is already the other answer to the same queue.
+    if (assessOnly && (!isUserTurn || batchEntryIds !== null)) {
+      throw new CognitionError("Assess-only turns require a single user message", {
+        code: "ASSESS_ONLY_REQUIRES_SINGLE_USER_MESSAGE",
+      });
+    }
     const sessionRecord = this.options.sessionsRepository?.get(sessionId) ?? null;
     const effectiveAudience =
       batchEntryIds !== null &&
@@ -1354,6 +1363,25 @@ export class TurnPhaseCoordinator {
     lifecycleTracker.trackCreatedActionIds(extraction.createdActionIds);
     lifecycleTracker.trackCreatedGoalIds(extraction.persistedPromotions.goalIds);
     lifecycleTracker.trackCreatedExecutiveStepIds(extraction.persistedPromotions.executiveStepIds);
+
+    if (assessOnly) {
+      return finalizeAssessedTurn({
+        options: this.options,
+        streamWriter,
+        appendHookFailureEvent: appendHookFailure,
+        turnId,
+        sessionId,
+        turnInput,
+        isUserTurn,
+        perception,
+        workingMood,
+        workingMemory,
+        socialInteractionEntityId,
+        correctiveCommitment,
+        correctiveCommitmentSupersession,
+        correctiveCommitmentRetirement,
+      });
+    }
 
     const closureLoopAssessment = await traceTurnPhase({
       tracer: this.options.tracer,
