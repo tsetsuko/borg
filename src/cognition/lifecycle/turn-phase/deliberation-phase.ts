@@ -75,6 +75,12 @@ export async function runDeliberationPhase(input: {
   streamWriter: StreamWriter;
   isSelfAudience?: boolean;
   audienceEntityId: EntityId | null;
+  /**
+   * Who this turn's social exchange is credited to: the speaker in a group, the
+   * audience one-to-one. M3 reads familiarity from the same entity, because that is
+   * where the interaction count and the reconciled predictions accumulate.
+   */
+  socialInteractionEntityId: EntityId | null;
   participationPolicy: SessionParticipationPolicy;
   creatorIdentity: CreatorIdentityContext | null;
   creatorContext: TrustedCreatorContext | null;
@@ -139,7 +145,14 @@ export async function runDeliberationPhase(input: {
               familiarityScale: inhibitionConfig.familiarityScale,
               recentErrorWindow: inhibitionConfig.recentErrorWindow,
             },
-            partnerEntityId: input.audienceEntityId,
+            // A group entity has no profile and no predictions of its own, so it is
+            // never the partner. With no single speaker, everyone present counts.
+            partnerEntityIds:
+              input.socialInteractionEntityId !== null
+                ? [input.socialInteractionEntityId]
+                : input.activeParticipants
+                    .filter((participant) => participant.role !== "audience")
+                    .map((participant) => participant.entityId),
             participantEntityIds: input.activeParticipants.map(
               (participant) => participant.entityId,
             ),

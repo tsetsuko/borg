@@ -18,8 +18,11 @@ export type SpeechInhibitionParams = {
 
 export type BuildSpeechInhibitionSectionInput = {
   params: SpeechInhibitionParams;
-  /** The partner this turn is with, or null in a group with no single addressee. */
-  partnerEntityId: EntityId | null;
+  /**
+   * The people this turn is with: the speaker alone when one is known, otherwise
+   * every person present. Empty means nobody is known, which reads as a stranger.
+   */
+  partnerEntityIds: readonly EntityId[];
   /** Entities present this turn, for detecting the attachment figure in a group. */
   participantEntityIds?: readonly EntityId[];
   /** Resolved attachment figure entity id, or null when it names no known entity. */
@@ -48,28 +51,35 @@ function inhibitionBand(value: number): string {
  * silence does not, so staying mute is never the free-optimal move.
  */
 export function buildSpeechInhibitionSection(input: BuildSpeechInhibitionSectionInput): string {
-  let partnerPredictability = 0;
+  // With several people and no single speaker, the least predictable one sets the
+  // hesitation: one stranger in the thread is enough to make the entity careful.
+  // CREATIVE CHOICE, not research-backed -- the literature behind M3 speaks of an
+  // unfamiliar person, not of a group. Taking the minimum (rather than a mean) keeps
+  // the number traceable to one named partner. Decided by the author 2026-10-01.
+  const partnerPredictability =
+    input.partnerEntityIds.length === 0
+      ? 0
+      : Math.min(
+          ...input.partnerEntityIds.map((entityId) => {
+            const profile = input.socialRepository.getProfile(entityId);
+            const recentErrorMagnitudes = input.predictionRepository
+              .listReconciliationsForEntity({
+                aboutEntityId: entityId,
+                limit: input.params.recentErrorWindow,
+              })
+              .flatMap((row) => (row.error_magnitude === null ? [] : [row.error_magnitude]));
 
-  if (input.partnerEntityId !== null) {
-    const profile = input.socialRepository.getProfile(input.partnerEntityId);
-    const interactionCount = profile?.interaction_count ?? 0;
-    const recentErrorMagnitudes = input.predictionRepository
-      .listReconciliationsForEntity({
-        aboutEntityId: input.partnerEntityId,
-        limit: input.params.recentErrorWindow,
-      })
-      .flatMap((row) => (row.error_magnitude === null ? [] : [row.error_magnitude]));
-
-    partnerPredictability = computePartnerPredictability({
-      interactionCount,
-      recentErrorMagnitudes,
-      familiarityScale: input.params.familiarityScale,
-    });
-  }
+            return computePartnerPredictability({
+              interactionCount: profile?.interaction_count ?? 0,
+              recentErrorMagnitudes,
+              familiarityScale: input.params.familiarityScale,
+            });
+          }),
+        );
 
   const attachmentFigurePresent =
     input.attachmentFigureEntityId !== null &&
-    (input.partnerEntityId === input.attachmentFigureEntityId ||
+    (input.partnerEntityIds.includes(input.attachmentFigureEntityId) ||
       (input.participantEntityIds ?? []).includes(input.attachmentFigureEntityId));
 
   const cautionBump = computeCautionBump({

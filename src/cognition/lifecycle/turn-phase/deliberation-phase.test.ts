@@ -111,6 +111,7 @@ function makeInput(origin: "user" | "autonomous", setStopState: ReturnType<typeo
     streamWriter: {},
     isSelfAudience: origin === "autonomous",
     audienceEntityId: null,
+    socialInteractionEntityId: null,
     participationPolicy: "active",
     creatorIdentity: null,
     creatorContext: null,
@@ -213,4 +214,85 @@ describe("runDeliberationPhase", () => {
     });
     expect(input.options.entityRepository.get).toHaveBeenCalledTimes(2);
   });
+
+  describe("M3 partner on a group channel", () => {
+    const group = createEntityId();
+    const speaker = createEntityId();
+    const stranger = createEntityId();
+    const valueOf = (section: string): number => Number(/\((0\.\d+)/.exec(section)![1]);
+
+    // Two exchanges with the speaker, each with a reconciled expectation about them.
+    // The group itself has neither: borg credits the exchange to the speaker.
+    function withInhibitionWiring(input: ReturnType<typeof makeInput>) {
+      const options = input.options as unknown as Record<string, unknown>;
+      options.config = {
+        ...(options.config as object),
+        inhibition: {
+          baseThreshold: 0.75,
+          uncertaintyWeight: 0.5,
+          presenceRelief: 0.1,
+          cautionWeight: 0.3,
+          familiarityScale: 5,
+          recentErrorWindow: 10,
+        },
+        prediction: { attachmentFigureName: null },
+      };
+      options.socialRepository = {
+        getProfile: (id: unknown) => (id === speaker ? { interaction_count: 2 } : null),
+      };
+      options.predictionRepository = {
+        listReconciliationsForEntity: ({ aboutEntityId }: { aboutEntityId: unknown }) =>
+          aboutEntityId === speaker ? [{ error_magnitude: 0.1 }, { error_magnitude: 0.2 }] : [],
+      };
+      input.isSelfAudience = false;
+      input.audienceEntityId = group as never;
+      deliberatorRun.mockResolvedValue({
+        response: "",
+        emissionRecommendation: "emit",
+        thoughtStreamEntryIds: [],
+      });
+      return input;
+    }
+
+    function inhibitionSection(): string {
+      return deliberatorRun.mock.calls[0]?.[0].speechInhibitionPromptSection as string;
+    }
+
+    it("reads familiarity from the speaker, not from the thread group", async () => {
+      const input = withInhibitionWiring(makeInput("user", vi.fn()));
+      input.socialInteractionEntityId = speaker as never;
+
+      await runDeliberationPhase(input);
+
+      // Predictability > 0 shows as hesitation below the 0.75 base threshold.
+      expect(valueOf(inhibitionSection())).toBeLessThan(0.75);
+    });
+
+    it("with no single speaker, the least predictable person present sets the hesitation", async () => {
+      const input = withInhibitionWiring(makeInput("user", vi.fn()));
+      input.socialInteractionEntityId = null;
+      input.activeParticipants = [
+        { entityId: speaker, displayName: "Sol", role: "participant" },
+        { entityId: stranger, displayName: "Nowy", role: "participant" },
+      ] as never;
+
+      await runDeliberationPhase(input);
+
+      expect(inhibitionSection()).toContain("(0.75");
+    });
+
+    it("with no single speaker, never counts the group entity as a person present", async () => {
+      const input = withInhibitionWiring(makeInput("user", vi.fn()));
+      input.socialInteractionEntityId = null;
+      input.activeParticipants = [
+        { entityId: speaker, displayName: "Sol", role: "participant" },
+        { entityId: group, displayName: "wątek", role: "audience" },
+      ] as never;
+
+      await runDeliberationPhase(input);
+
+      expect(valueOf(inhibitionSection())).toBeLessThan(0.75);
+    });
+  });
 });
+

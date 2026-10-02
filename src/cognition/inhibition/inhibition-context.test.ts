@@ -37,7 +37,7 @@ describe("buildSpeechInhibitionSection", () => {
     const partner = createEntityId();
     const section = buildSpeechInhibitionSection({
       params: PARAMS,
-      partnerEntityId: partner,
+      partnerEntityIds: [partner],
       attachmentFigureEntityId: null,
       currentValence: 0,
       predictionRepository: predictionRepo(new Map()),
@@ -54,7 +54,7 @@ describe("buildSpeechInhibitionSection", () => {
     const partner = createEntityId();
     const section = buildSpeechInhibitionSection({
       params: PARAMS,
-      partnerEntityId: partner,
+      partnerEntityIds: [partner],
       attachmentFigureEntityId: null,
       currentValence: 0,
       predictionRepository: predictionRepo(new Map([[partner, [0.05, 0.1]]])),
@@ -71,7 +71,7 @@ describe("buildSpeechInhibitionSection", () => {
     const figure = createEntityId();
     const common = {
       params: PARAMS,
-      partnerEntityId: partner,
+      partnerEntityIds: [partner],
       currentValence: 0,
       predictionRepository: predictionRepo(new Map([[partner, [0.4]]])),
       socialRepository: socialRepo(new Map([[partner, 10]])),
@@ -88,15 +88,40 @@ describe("buildSpeechInhibitionSection", () => {
     expect(valueOf(present)).toBeLessThan(valueOf(away));
   });
 
-  it("stays at the base threshold when there is no single partner (group)", () => {
+  it("stays at the base threshold when nobody is known to be present", () => {
     const section = buildSpeechInhibitionSection({
       params: PARAMS,
-      partnerEntityId: null,
+      partnerEntityIds: [],
       attachmentFigureEntityId: null,
       currentValence: 0,
       predictionRepository: predictionRepo(new Map()),
       socialRepository: socialRepo(new Map()),
     });
     expect(section).toContain("(0.75");
+  });
+
+  it("takes the least predictable person when several are present and none is the speaker", () => {
+    const familiar = createEntityId();
+    const stranger = createEntityId();
+    const predictionRepository = predictionRepo(new Map([[familiar, [0.05, 0.1]]]));
+    const socialRepository = socialRepo(new Map([[familiar, 30]]));
+    const common = {
+      params: PARAMS,
+      attachmentFigureEntityId: null,
+      currentValence: 0,
+      predictionRepository,
+      socialRepository,
+    };
+    const valueOf = (text: string): number => Number(/\((0\.\d+)/.exec(text)![1]);
+
+    const familiarOnly = buildSpeechInhibitionSection({ ...common, partnerEntityIds: [familiar] });
+    const withStranger = buildSpeechInhibitionSection({
+      ...common,
+      partnerEntityIds: [familiar, stranger],
+    });
+
+    expect(valueOf(familiarOnly)).toBeLessThan(0.4);
+    // One stranger in the thread pulls hesitation back to the base threshold.
+    expect(withStranger).toContain("(0.75");
   });
 });
