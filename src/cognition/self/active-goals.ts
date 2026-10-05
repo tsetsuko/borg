@@ -1,28 +1,12 @@
 import type { GoalRecord, GoalTreeNode, GoalsRepository } from "../../memory/self/index.js";
+import { flattenGoalTree } from "../../memory/self/goal-tree.js";
 
-type GoalTreeNodeLike = GoalRecord & {
-  children?: readonly GoalTreeNodeLike[];
-};
+export { flattenGoalTree } from "../../memory/self/goal-tree.js";
 
-export function flattenGoalTree(goals: ReadonlyArray<GoalTreeNodeLike>): GoalRecord[] {
-  const flattened: GoalRecord[] = [];
-  const stack = [...goals];
-
-  while (stack.length > 0) {
-    const next = stack.shift();
-
-    if (next === undefined) {
-      continue;
-    }
-
-    flattened.push(next);
-
-    if (Array.isArray(next.children)) {
-      stack.push(...next.children);
-    }
-  }
-
-  return flattened;
+export function listUnfinishedGoalsForCognition(
+  goalsRepository: Pick<GoalsRepository, "list">,
+): GoalRecord[] {
+  return flattenGoalTree(goalsRepository.list({ statuses: ["active", "blocked"] }));
 }
 
 export function listActiveGoalsForCognition(

@@ -141,10 +141,34 @@ export const EVIDENCE_LEDGER_SECTION_DEFINITIONS = [
 
 export type EvidenceLedgerSectionId = (typeof EVIDENCE_LEDGER_SECTION_DEFINITIONS)[number]["id"];
 
+// Every framing figure is a count of some subset of the rows a section was assembled from, and a
+// subset figure printed alone has no denominator a reader can recover: a section that assembles ten
+// rows of three kinds and counts one of those kinds prints a number that is correct about the kind
+// and reads as a count of the section. So the population is part of the type rather than a
+// convention -- `rows_assembled` is required, every other key is a named subset of it, and no key
+// but that one ever counts the section.
+export type EvidenceLedgerSectionFramingCounts = Record<string, number> & {
+  rows_assembled: number;
+};
+
 export type EvidenceLedgerSectionFraming = {
   text: string;
-  counts?: Record<string, number>;
+  counts?: EvidenceLedgerSectionFramingCounts;
 };
+
+// Shared by the two sections that render a self-decision label (13 and 14), so the wording
+// cannot drift apart and leave one of them reading as if it carried no caveat.
+//
+// The label is written by summarizeAutonomousDecision() in src/autonomy/scheduler.ts, which
+// reads turnResult.response and turnResult.emission and nothing else -- notably not
+// turnResult.toolCalls. So the vocabulary is closed over emission kinds, and a turn that made
+// an outbound tool call is described by the same label as one that made none. Observed live on
+// 2026-08-28: autonomous turn 32a3cb12 (wake fired 00:08:22Z) called tool.outbound.post at
+// 00:13:57Z, the delivery came back transport_failed at 00:15:28Z and filed action record
+// act_mj8aryyayv8v95r3, and the turn's self-decision row at 00:15:58Z reads "Continued private
+// train of thought." Both are true of the same turn; only one of them mentions the reach.
+export const SELF_DECISION_LABEL_SCOPE_FRAMING =
+  "A self-decision label reports that turn's emission alone, whether it spoke, stayed silent, or continued privately, and reads nothing the turn did through a tool. An autonomous turn that reached outward and had the reach fail in transport therefore still labels as private thought, and the reach and its outcome are recorded only as an action record.";
 
 export type EvidenceLedgerSection = {
   id: EvidenceLedgerSectionId;

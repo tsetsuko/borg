@@ -1,3 +1,5 @@
+import { refreshSerializedEmbeddings } from "../embeddings/serialized.js";
+import { parseSemanticNodeId } from "../util/ids.js";
 // Wires Borg's offline maintenance processes into the maintenance orchestrator.
 
 import type { Config } from "../config/index.js";
@@ -5,6 +7,7 @@ import type { TurnTracer } from "../tracing/tracer.js";
 import type { EmbeddingClient } from "../embeddings/index.js";
 import type { LLMClient } from "../llm/index.js";
 import type { MoodRepository } from "../memory/affective/index.js";
+import type { SourceStreamAudienceDisclosureResolver } from "../memory/common/index.js";
 import type {
   ActivityRepository,
   LivedExperienceDaySummaryRepository,
@@ -77,6 +80,7 @@ export type BuildOfflineSetupOptions = {
   embeddingClient: EmbeddingClient;
   lazyLlmClient: LLMClient;
   entryIndex: StreamEntryIndexRepository;
+  sourceStreamAudienceDisclosureResolver: SourceStreamAudienceDisclosureResolver;
   episodicRepository: EpisodicRepository;
   semanticNodeRepository: SemanticNodeRepository;
   semanticEdgeRepository: SemanticEdgeRepository;
@@ -109,8 +113,13 @@ export type BuildOfflineSetupOptions = {
 };
 
 export function buildOfflineSetup(options: BuildOfflineSetupOptions): BorgOfflineSetup {
+  const prepareSerializedEmbeddings = (payload: unknown) =>
+    refreshSerializedEmbeddings(payload, options.embeddingClient, (id) =>
+      options.semanticNodeRepository.get(parseSemanticNodeId(id)),
+    );
   const reverserRegistry = new ReverserRegistry();
   const auditLog = new AuditLog({
+    prepareSerializedEmbeddings,
     db: options.sqlite,
     clock: options.clock,
     registry: reverserRegistry,
@@ -209,10 +218,12 @@ export function buildOfflineSetup(options: BuildOfflineSetupOptions): BorgOfflin
     ),
   );
   const maintenanceOrchestrator = new MaintenanceOrchestrator({
+    prepareSerializedEmbeddings,
     baseContext: {
       config: options.config,
       clock: options.clock,
       entryIndex: options.entryIndex,
+      sourceStreamAudienceDisclosureResolver: options.sourceStreamAudienceDisclosureResolver,
       embeddingClient: options.embeddingClient,
       tracer: options.tracer,
       llm: {

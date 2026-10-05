@@ -7,6 +7,8 @@ import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import {
   BorgError,
+  goalBlockInputSchema,
+  operatorAttentionRecordSchema,
   COMMITMENT_KINDS,
   DEFAULT_SESSION_ID,
   OFFLINE_PROCESS_NAMES,
@@ -20,6 +22,7 @@ import {
   type AttachmentId,
   type AutonomyWakeRecord,
   type Borg,
+  type BorgCommitmentWithDisclosure,
   type CommitmentEnforcementClass,
   type CommitmentRecord,
   type Config,
@@ -484,10 +487,11 @@ const goalPatchBodySchema = z.discriminatedUnion("action", [
       note: optionalTextFieldSchema,
     })
     .strict(),
-  z
-    .object({
+  goalBlockInputSchema
+    .omit({ reason: true })
+    .extend({
       action: z.literal("block"),
-      note: optionalTextFieldSchema,
+      note: z.string().trim().min(1),
     })
     .strict(),
   z
@@ -1788,9 +1792,7 @@ function persistedEntryExcerpt(
   return conciseText(stringContent(entry.display_content) ?? stringContent(entry.content));
 }
 
-function isAutonomousActionEntry(
-  entry: SerializedStreamEntry,
-): entry is AutonomousActionEntry {
+function isAutonomousActionEntry(entry: SerializedStreamEntry): entry is AutonomousActionEntry {
   return (
     entry.kind === "internal_event" &&
     isRecord(entry.content) &&
@@ -1832,7 +1834,9 @@ function activityRecentEntries(borg: Borg): SerializedStreamEntry[] {
   const seen = new Set<string>();
 
   for (const session of sessions) {
-    for (const entry of borg.stream.tail(ACTIVITY_SESSION_TAIL_LIMIT, { session: session.session_id })) {
+    for (const entry of borg.stream.tail(ACTIVITY_SESSION_TAIL_LIMIT, {
+      session: session.session_id,
+    })) {
       if (seen.has(entry.id)) {
         continue;
       }
@@ -1877,7 +1881,9 @@ function autonomousTriggersByTerminalEntryId(
         continue;
       }
 
-      const trigger = autonomousActionTrigger(entry) ?? (pendingWake === null ? null : autonomousWakeSourceName(pendingWake));
+      const trigger =
+        autonomousActionTrigger(entry) ??
+        (pendingWake === null ? null : autonomousWakeSourceName(pendingWake));
       if (typeof entry.content.turn_result_id === "string" && trigger !== null) {
         byTerminalEntryId.set(entry.content.turn_result_id, trigger);
       } else if (pendingWake !== null && pendingTerminal !== null && trigger !== null) {
@@ -1933,7 +1939,6 @@ function activityTurnRows(entries: readonly SerializedStreamEntry[]): ActivityTu
       bucket.push(entry);
       bySessionTurnId.set(key, bucket);
     }
-
   }
 
   const rows: ActivityTurnRow[] = [];
@@ -2023,12 +2028,16 @@ function journalRowsForDay(
   return journalEntries.filter((entry) => localDayString(entry.created_at) === day);
 }
 
-function activityDigest(rows: readonly ActivityRow[], journalEntries: readonly JournalEntryForActivity[]) {
+function activityDigest(
+  rows: readonly ActivityRow[],
+  journalEntries: readonly JournalEntryForActivity[],
+) {
   return {
     turns: rows.filter((row) => row.kind === "turn").length,
     autonomous_wakes: rows.filter((row) => row.origin === "autonomous").length,
     emissions: rows.filter((row) => row.kind === "turn" && row.outcome === "emitted").length,
-    silences: rows.filter((row) => row.kind === "turn" && row.outcome === "deliberate-silence").length,
+    silences: rows.filter((row) => row.kind === "turn" && row.outcome === "deliberate-silence")
+      .length,
     observations: rows.filter((row) => row.kind === "turn" && row.outcome === "observed").length,
     suppressions: rows.filter(
       (row) =>
@@ -2084,9 +2093,16 @@ function mapAutonomyWake(borg: Borg, wake: AutonomyWakeRecord) {
     trigger_name: wake.trigger_name,
     condition_name: wake.condition_name,
     session_id: wake.session_id,
-    session_label: wake.session_id === null ? null : borg.sessions.get(wake.session_id)?.label ?? null,
+    session_label:
+      wake.session_id === null ? null : (borg.sessions.get(wake.session_id)?.label ?? null),
     wake_source_type: wake.wake_source_type,
     source_category: wake.source_category,
+    selected_goal_id: wake.selected_goal_id,
+    outcome: wake.outcome,
+    outcome_detail: wake.outcome_detail,
+    headway_bases: wake.headway_bases,
+    finalizer_rounds: wake.finalizer_rounds,
+    stall_retries: wake.stall_retries,
   };
 }
 
@@ -2147,7 +2163,7 @@ function commitmentState(record: CommitmentRecord): "active" | "revoked" | "expi
   return "active";
 }
 
-function mapCommitment(borg: Borg, record: CommitmentRecord) {
+function mapCommitment(borg: Borg, record: BorgCommitmentWithDisclosure) {
   return {
     id: record.id,
     text: record.directive,
@@ -2172,6 +2188,8 @@ function mapCommitment(borg: Borg, record: CommitmentRecord) {
     superseded_by_id: record.superseded_by,
     canonicalized_by_artifact_entry_id: record.canonicalized_by_artifact_entry_id ?? null,
     last_reinforced_at: record.last_reinforced_at,
+    disclosure: record.disclosure,
+    disclosure_label: record.disclosure_label,
   };
 }
 
@@ -2560,6 +2578,7 @@ function processDescription(name: OfflineProcessName): string {
     "creator-directive-reconciler": "reconcile redundant or conflicting creator directives",
     ruminator: "open-question rumination",
     "self-narrator": "autobiography and growth markers",
+    "lived-experience-day-summarizer": "summarize the day's lived experience",
     "procedural-synthesizer": "skill abstractions",
     "belief-reviser": "invalidate, weaken, contradict",
     "commitment-reconciler": "reconcile redundant or conflicting commitments",
@@ -3210,6 +3229,11 @@ export function createDemoServerApp(args: DemoServerAppInput) {
   });
 
   app.get("/api/sessions", (c) => c.json({ sessions: input.borg.sessions.list({ limit: 1000 }) }));
+
+  app.post("/api/operator-attention", async (c) => {
+    const record = parseRequest(operatorAttentionRecordSchema, await parseJsonBody(c));
+    return c.json(input.borg.operatorAttention.record(record));
+  });
 
   app.get("/api/entities/creator", (c) => c.json(input.borg.entities.getCreator()));
 
@@ -4093,16 +4117,9 @@ export function createDemoServerApp(args: DemoServerAppInput) {
       }
 
       if (body.action === "block") {
+        const { action: _action, note, ...block } = body;
         return c.json(
-          requireIdentityApplied(
-            input.borg.self.goals.updateStatus(
-              params.id,
-              "blocked",
-              { kind: "manual" },
-              { throughReview: true, reason: body.note ?? null },
-            ),
-            "Blocking goal",
-          ),
+          input.borg.self.goals.block(params.id, { ...block, reason: note }, { kind: "manual" }),
         );
       }
 

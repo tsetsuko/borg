@@ -18,12 +18,14 @@ export {
 export { identityMigrations } from "./migrations.js";
 export {
   IdentityService,
+  type IdentityOpenQuestionDuplicateMergeResult,
   type IdentityServiceOptions,
   type IdentityUpdateOptions,
   type IdentityUpdateResult,
 } from "./service.js";
 export { IdentityEventRepository, type IdentityEventRepositoryOptions } from "./repository.js";
 export {
+  IDENTITY_EVENT_COGNITION_CHANGE_EXCERPT_MAX_CHARS,
   IDENTITY_RECORD_TYPES,
   identityEventSchema,
   identityRecordTypeSchema,

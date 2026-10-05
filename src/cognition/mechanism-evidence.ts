@@ -1,3 +1,4 @@
+import type { OperatorAttentionIndex } from "../memory/operator-attention/types.js";
 import type {
   AgentSuppressedStreamContent,
   FinalizerInvalidToolDiagnostic,
@@ -14,6 +15,7 @@ import type {
 } from "../memory/working/index.js";
 import type {
   AutonomySchedulerBudgetDescription,
+  AutonomySchedulerDescription,
   AutonomySchedulerFleetBrakeDescription,
 } from "../autonomy/index.js";
 import {
@@ -27,6 +29,7 @@ import {
   type StreamReader,
 } from "../stream/index.js";
 import type { SessionId, StreamEntryId } from "../util/ids.js";
+import type { AnsweredWindowEvidence } from "../stream/answered-window.js";
 
 export type HydratedSuppressionDiagnostic = {
   noOutputCategories?: readonly FinalizerNoOutputCategory[];
@@ -76,28 +79,115 @@ export type HydratedRecentRegeneration = {
 // page a lagging interval draws. Telling them apart used to require two reads far enough apart to
 // watch whether the stamp moved, which is a discriminator no single prompt can carry. The flag is
 // already in the scheduler at describe() time; carrying it here makes one read enough.
+//
+// `sources` is the sixth, and it is the only prospective field the scheduler produces. Everything
+// else on this object is retrospective or about the loop itself: what has already fired, what the
+// window has already spent, how far behind the tick is. A reader holding only those can describe
+// the scheduler's past and its health and can state nothing falsifiable about its next move -- the
+// wakes-by-trigger groups are the same source names counted backwards, which is why carrying this
+// is not a duplicate of them. The per-trigger due stamps are the one field on which a prediction
+// made before a wake fires can turn out wrong, and being wrong is the property the rest of the
+// block cannot offer at any number of reads.
+//
+// `intervalMs` and `droppedIntervalFires` are the fourth and fifth, and both were dropped at the
+// same call site as the three above. The interval length is what turns a series of
+// `scheduledTickAt` stamps into a grid: the stamp is the last tick entry plus the interval, so
+// consecutive reads differ by a multiple of it while one handle stays armed, and a delta that is
+// not a multiple means it was re-armed. Without the period a reader holding two stamps can see
+// that they differ and nothing more. The refused-fire counts answer the question `tickInFlight`
+// raises and cannot close -- a tick holding the anchor is refusing an interval fire every period,
+// and the early return that refuses it is the only event in the scheduler that writes nothing
+// anywhere. A frozen hour and a quiet hour therefore leave the same trace in the budget and
+// outcome counts, which is none; these are that difference, and unlike `tickInFlight` the
+// per-tick count still carries information on an autonomous turn.
 export type AutonomySchedulerMechanismEvidence = {
   observedAt: number;
   enabled: boolean;
   tickInFlight: boolean;
+  intervalMs: number;
+  droppedIntervalFires: AutonomySchedulerDescription["dropped_interval_fires"];
+  intervalArmedAt: number | null;
   nextTickAt: number | null;
   scheduledTickAt: number | null;
+  /** Optional only for historical captures and direct harness fixtures. */
+  windowWakes?: AutonomySchedulerDescription["window_wakes"];
+  /** Filing metadata only; independent of wake admission and outcome. */
+  operatorAttentionIndex?: OperatorAttentionIndex;
   budget: AutonomySchedulerBudgetDescription;
   fleetBrake: AutonomySchedulerFleetBrakeDescription;
+  sources: AutonomySchedulerDescription["sources"];
 };
+
+/**
+ * Per-field disposition at the one boundary where `describe()`'s output crosses
+ * into turn evidence (`retrieval-phase.ts`, hand-written and renamed).
+ *
+ * Five of the ten carried fields were lost at exactly that line and recovered
+ * only when a reader noticed the page was thin. That failure has no symptom: the
+ * target type is unchanged, so nothing is missing from any literal, no assertion
+ * fires, no test goes red -- the surface simply renders less than it could, and
+ * only someone holding both the type and the page can tell. It is not a name
+ * asserting semantics the mechanism lacks; it is an absence, which is why reading
+ * the render never finds it.
+ *
+ * The `Record` key is what makes this load-bearing: a new field on
+ * `AutonomySchedulerDescription` fails typecheck here until someone says which
+ * it is. Carrying it is then a normal edit; dropping it is a decision with a
+ * written reason. Either way the loss stops being silent.
+ *
+ * The dropped reasons are rendered on the block itself, so the page states its
+ * own gap against the read rather than leaving the count of missing fields
+ * unknowable to anyone who cannot also read this file. With nothing dropped the
+ * block says that instead, which is the same sentence in its empty case rather
+ * than a silence: a page that stops mentioning its gap and a page that has none
+ * would otherwise be the same page.
+ */
+export type AutonomySchedulerFieldDisposition = "carried" | { readonly dropped: string };
+
+export const AUTONOMY_SCHEDULER_DESCRIPTION_FIELD_DISPOSITION: Record<
+  keyof AutonomySchedulerDescription,
+  AutonomySchedulerFieldDisposition
+> = {
+  observed_at: "carried",
+  enabled: "carried",
+  tick_in_flight: "carried",
+  interval_ms: "carried",
+  dropped_interval_fires: "carried",
+  interval_armed_at: "carried",
+  next_tick_at: "carried",
+  scheduled_tick_at: "carried",
+  window_wakes: "carried",
+  budget: "carried",
+  fleet_brake: "carried",
+  sources: "carried",
+};
+
+/**
+ * The dropped entries above, in declaration order, for surfaces that state their
+ * own gap. Derived rather than restated so a later drop cannot make the rendered
+ * sentence quietly false.
+ */
+export const AUTONOMY_SCHEDULER_DESCRIPTION_DROPPED_FIELDS: readonly string[] = Object.values(
+  AUTONOMY_SCHEDULER_DESCRIPTION_FIELD_DISPOSITION,
+)
+  .filter((disposition): disposition is { readonly dropped: string } => disposition !== "carried")
+  .map((disposition) => disposition.dropped);
 
 export type TurnMechanismEvidence = {
   recentSuppressions: readonly HydratedRecentSuppression[];
   recentRegenerations: readonly HydratedRecentRegeneration[];
   autonomySchedulerState?: AutonomySchedulerMechanismEvidence;
+  answeredWindow?: AnsweredWindowEvidence;
 };
 
 export type HydrateTurnMechanismEvidenceInput = {
+  nowMs?: number;
   dataDir: string;
   sessionId: SessionId;
   workingMemory: WorkingMemory;
   autonomySchedulerState?: AutonomySchedulerMechanismEvidence;
-  entryIndex?: Pick<StreamEntryIndexRepository, "lookupMany">;
+  entryIndex?: Pick<StreamEntryIndexRepository, "lookupMany"> &
+    Partial<Pick<StreamEntryIndexRepository, "describeAnsweredWindow">>;
   createStreamReader: (sessionId: SessionId) => StreamReader;
 };
 
@@ -232,6 +322,14 @@ export async function hydrateTurnMechanismEvidence(
   });
 
   return {
+    ...(input.entryIndex?.describeAnsweredWindow === undefined
+      ? {}
+      : {
+          answeredWindow: input.entryIndex.describeAnsweredWindow(
+            input.sessionId,
+            input.nowMs ?? Date.now(),
+          ),
+        }),
     recentSuppressions: recentSuppressions.map((entry: RecentSuppressionEntry) => ({
       turnId: entry.turn_id,
       reason: entry.reason,

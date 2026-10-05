@@ -30,18 +30,68 @@ export type AutonomyWakeSourceName = (typeof AUTONOMY_WAKE_SOURCE_NAMES)[number]
 export type AutonomyWakeSourceType = "trigger" | "condition";
 export type AutonomyWakeSourceCategory = "contemplative" | "operational";
 
-export const AUTONOMY_WAKE_OUTCOMES = ["headway", "silent", "error", "busy"] as const;
+export const AUTONOMY_WAKE_OUTCOMES = [
+  "headway",
+  "silent",
+  "error",
+  "busy",
+  "interrupted",
+] as const;
 export type AutonomyWakeOutcome = (typeof AUTONOMY_WAKE_OUTCOMES)[number];
+
+/**
+ * The terminal emission kinds that make a wake `headway` on their own. Named
+ * here rather than inlined at the one comparison because the outcome's
+ * predicate is also printed to the entity, and a list transcribed onto that page
+ * would go quietly false the next time this one changes -- the same
+ * copied-instead-of-derived failure that has already cost this repo a stale
+ * fixture and a stale test array.
+ */
+export const HEADWAY_EMISSION_KINDS = ["message", "continue_thought"] as const;
 
 /**
  * Distinct-detail tally for one outcome bucket over a window. `total` is the
  * bucket's own count, so `reasons` summing short of it is not a discrepancy --
  * `without_detail` is the named difference, and the three always reconcile.
+ *
+ * `triggers` carries the join. The window's wakes are also tallied by trigger a
+ * few fields up, so without it the block prints two independent splits of the
+ * same rows and no way to compose them: a reader with `3 + 1` by reason and
+ * `3 + 1` by trigger can see the shapes agree and cannot tell agreement from
+ * correspondence. The trigger sits on the same row as the detail, so the join is
+ * a `GROUP BY` rather than an inference, and printing it makes the composition a
+ * read instead of a guess.
  */
 export type AutonomyWakeOutcomeDetailTally = {
   total: number;
   without_detail: number;
-  reasons: Array<{ detail: string; count: number }>;
+  reasons: Array<{
+    detail: string;
+    count: number;
+    triggers: Array<{ trigger: string; count: number }>;
+  }>;
+};
+
+/**
+ * Where one outcome's rows sit relative to the window's other wakes. A bucket
+ * count alone cannot distinguish one continuous run from the same number of
+ * failures scattered through successes, and the two support opposite readings:
+ * a run is one incident whose trigger mix is whatever happened to be firing
+ * during it, while a scatter is a rate that can differ by trigger. The rows hold
+ * the ordering; the tally discarded it.
+ *
+ * `other_outcomes_between` counts the window's wakes that fall strictly between
+ * this bucket's first and last row and did NOT land in it -- zero means an
+ * unbroken run, any positive number means the bucket is interleaved.
+ * `extends_before_window` reports whether the wake immediately preceding the
+ * bucket's first row -- which may sit outside the window, the table retains more
+ * than the window covers -- shares the outcome, so a run that started earlier is
+ * not read as beginning at the window edge. It is null when no earlier wake is
+ * retained, which is the absence of evidence rather than a no.
+ */
+export type AutonomyWakeOutcomeSpan = {
+  other_outcomes_between: number;
+  extends_before_window: boolean | null;
 };
 
 export const AUTONOMY_WAKE_SOURCE_METADATA = {
@@ -137,16 +187,30 @@ export type AutonomySchedulerWakeGroupDescription = {
   /**
    * Fire stamps of the rows counted by `in_flight`, oldest first.
    *
-   * `in_flight` alone is identity-free: an outcome write that never lands (the
-   * bookkeeping catch around recordOutcome returns without recording one) leaves
-   * its row NULL forever, and a permanently orphaned row and a healthy transient
-   * both render as the same integer, with the block's arithmetic closing either
-   * way. Carrying the stamps makes the two separable across reads -- a stamp that
-   * repeats is one row not moving; a stamp that changes is a new wake -- which is
-   * a comparison the count cannot support at any number of reads.
+   * `in_flight` alone is identity-free: a healthy transient and a wake whose
+   * terminal write has not yet landed both render as the same integer. The
+   * bookkeeping catch records the latter as `interrupted`, and startup
+   * reconciliation closes any NULL row left by a prior process. Carrying the
+   * stamps still makes open rows separable across reads -- a stamp that repeats
+   * is one row not moving; a stamp that changes is a new wake.
+   *
+   * This count is taken over the rolling budget window, so an open row can leave
+   * it by ageing past the window's lower edge before its terminal outcome lands.
+   * A disappearing stamp therefore means either closure or window expiry.
    */
   in_flight_started_at: number[];
   outcome_counts: Record<AutonomyWakeOutcome, number>;
+};
+
+export type AutonomySchedulerWakeDescription = {
+  /** Current read for the wake's recorded session, never a reconstructed wake-time snapshot. */
+  answered_window?: import("../stream/answered-window.js").AnsweredWindowEvidence | null;
+  ts: number;
+  trigger_name: AutonomyWakeSourceName;
+  outcome: AutonomyWakeOutcome | null;
+  headway_bases: string[] | null;
+  finalizer_rounds: number | null;
+  stall_retries: number | null;
 };
 
 export type AutonomySchedulerBudgetDescription = {
@@ -188,11 +252,11 @@ export type AutonomySchedulerSourceDescription =
 export type AutonomySchedulerFleetBrakeDescription = {
   enabled: boolean;
   /**
-   * Consecutive completed operational wakes recorded `silent`. Errored and
-   * busy-skipped wakes are transparent to it -- they neither increment nor
-   * reset -- so the streak is consecutive within the *completed operational*
-   * subsequence, not within the wake sequence, and can span any number of
-   * intervening wakes and any amount of wall-clock.
+   * Consecutive counted-empty operational wakes. Chosen silence and failed
+   * emission advance it; a post-generation guard block, an error, or a busy
+   * skip is transparent -- it neither increments nor resets -- so the streak is
+   * consecutive within that filtered operational subsequence, not within the
+   * wake sequence, and can span intervening wakes and wall-clock time.
    */
   empty_streak: number;
   empty_streak_threshold: number;
@@ -223,10 +287,16 @@ export type AutonomySchedulerFleetBrakeDescription = {
    * Outcome tally over the *budget* window, across both source categories.
    * A different population from `empty_streak` above: it is time-bounded where
    * the streak is not, counts contemplative wakes where the streak ignores
-   * them, and counts errors where the streak passes over them. It does not
-   * feed the streak and cannot be differenced into one.
+   * them, and counts errors and interruptions where the streak passes over them.
+   * It does not feed the streak and cannot be differenced into one.
    */
   window_outcomes: Record<AutonomyWakeOutcome, number>;
+  /**
+   * The `headway` entry of `window_outcomes`, split by the structural basis the
+   * scheduler recorded for the same rows. A row may name more than one basis;
+   * the joined detail remains one tally key rather than being reinterpreted.
+   */
+  window_headway_reasons: AutonomyWakeOutcomeDetailTally;
   /**
    * The `error` entry of `window_outcomes` above, split by the failure the
    * scheduler recorded -- same rows, same window, same categories, one level of
@@ -236,6 +306,37 @@ export type AutonomySchedulerFleetBrakeDescription = {
    * reasons never have to be read as covering the bucket.
    */
   window_error_reasons: AutonomyWakeOutcomeDetailTally;
+  /**
+   * Where those same errored rows sit in the window's order. Carried for errors
+   * and not for every bucket because this is the bucket whose count invites
+   * a rate reading, and a rate over a window that clips a longer run is a slice
+   * of that run rather than a property of anything the window contains.
+   */
+  window_error_span: AutonomyWakeOutcomeSpan | null;
+  /**
+   * The `silent` entry of `window_outcomes` above, split by what actually ended
+   * the wake -- same rows, same window, same categories, one level of detail
+   * further down, and read the same way as `window_error_reasons`.
+   *
+   * `silent` is a union, not a behaviour: a wake the entity deliberately closed
+   * with no output, a wake whose emission failed on the way out, and a wake a
+   * post-generation guard blocked all land in it. The first two advance
+   * `empty_streak`; the guard block leaves it unchanged. The scheduler uses the
+   * same structural classification (`classifySuppressionReason`) for this row
+   * and the streak disposition, so the diagnostic says which policy was applied
+   * without recomputing the ending.
+   */
+  window_silent_reasons: AutonomyWakeOutcomeDetailTally;
+  /**
+   * Where those same silent rows sit in the window's order, read exactly like
+   * `window_error_span`. Carried for the same reason and one more: `silent` is
+   * the bucket whose count invites a reading about the entity rather than about
+   * the machine, and scattered silences and consecutive ones are the same number
+   * and a different fact -- only the second has the shape of a disposition. The
+   * count alone cannot separate them, and the ordering that would is already in
+   * the table.
+   */
+  window_silent_span: AutonomyWakeOutcomeSpan | null;
 };
 
 export type AutonomySchedulerDescription = {
@@ -270,7 +371,54 @@ export type AutonomySchedulerDescription = {
    * live turn, and any surface rendering it has to say so.
    */
   tick_in_flight: boolean;
+  /**
+   * The interval the handle was armed with. Load-bearing to any consumer
+   * comparing `scheduled_tick_at` across reads: that stamp is the last tick
+   * entry plus this, so while one handle stays armed consecutive values differ
+   * by a multiple of it (plus timer drift), and a delta that is not a multiple
+   * means the handle was re-armed. Without this term a series of stamps is
+   * just a series of stamps -- the phase is only readable against the period.
+   */
   interval_ms: number;
+  /**
+   * Interval fires refused because a tick was already running. The callback
+   * early-returns on those, and the early return is the only event in the
+   * scheduler that writes nothing at all: no wake row, no outcome, no error.
+   * So a stretch in which every fire was refused and a stretch in which
+   * nothing was due leave the same trace in `budget` and `window_outcomes`,
+   * which is none. This is that difference, counted where it is refused.
+   *
+   * `current_tick` is null exactly when no tick is in flight; when one is, it
+   * is that tick's own tally and resets on the next tick entry. It carries
+   * information on an autonomous turn even though `tick_in_flight` cannot --
+   * that turn is inside the tick, so the flag is true by construction, but how
+   * many fires the tick has already refused is a fact about the freeze.
+   */
+  dropped_interval_fires: {
+    since_interval_armed: number;
+    current_tick: number | null;
+  };
+  /**
+   * When the current interval handle was armed, or null when none is. Null under
+   * the same condition as `next_tick_at`/`scheduled_tick_at`, so the three are
+   * never half-present.
+   *
+   * `since_interval_armed` above names an epoch it does not identify: the count
+   * resets to zero on every arm, so a low value is a long-quiet loop and a
+   * freshly restarted one alike, and a value that repeats across two reads is
+   * "unmoved" and "reset then re-earned" alike. That ambiguity is not removable
+   * from the count at any number of reads -- it is the same identity-free-count
+   * shape as `in_flight`, and the same remedy applies. This stamp is the epoch:
+   * one that repeats across reads is one handle still armed, one that changes is
+   * a re-arm, which needs the loop stopped and started.
+   *
+   * The scheduler has held this value since the first version of `start()` (it
+   * is one of the two terms in the tick anchor); it simply never left the class.
+   * Re-arm was inferable only off `scheduled_tick_at` grid arithmetic, which
+   * needs two reads, an unbroken series, and a delta large enough for the
+   * off-grid residue to exceed timer drift.
+   */
+  interval_armed_at: number | null;
   /**
    * `max(scheduled_tick_at, observed_at)` -- a tick already due at the read is
    * reported as the read clock rather than as a past instant, so a consumer
@@ -288,6 +436,8 @@ export type AutonomySchedulerDescription = {
    * interval handle), so the pair is never half-present.
    */
   scheduled_tick_at: number | null;
+  /** Individual rows in the rolling budget window, newest first. */
+  window_wakes: AutonomySchedulerWakeDescription[];
   budget: AutonomySchedulerBudgetDescription;
   fleet_brake: AutonomySchedulerFleetBrakeDescription;
   sources: AutonomySchedulerSourceDescription[];

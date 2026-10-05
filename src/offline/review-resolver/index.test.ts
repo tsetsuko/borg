@@ -21,7 +21,7 @@ import {
   createOfflineTestHarness,
   createSemanticNodeFixture,
 } from "../test-support.js";
-import { ReviewResolverProcess } from "./index.js";
+import { REVIEW_RESOLVER_REASON_SENTINEL, ReviewResolverProcess } from "./index.js";
 
 const REVIEW_RESOLVER_TOOL_NAME = "EmitReviewResolverDecision";
 const NEW_INSIGHT_REVIEW_RESOLVER_TOOL_NAME = "EmitNewInsightVerdict";
@@ -470,7 +470,6 @@ describe("review resolver process", () => {
     llm.pushResponse(
       resolverResponse({
         verdict: "accept_repair",
-        reason: "The cited source says Ben wrote the script.",
         cited_stream_ids: [sourceEntryId],
       }),
     );
@@ -508,6 +507,7 @@ describe("review resolver process", () => {
     expect(resolved?.refs.__borg_review_resolver_repair).toMatchObject({
       mode: "repair_via_supersede",
       corrected_by: sourceEntryId,
+      reason: REVIEW_RESOLVER_REASON_SENTINEL,
     });
     expect(node).toMatchObject({
       status: "superseded",
@@ -552,13 +552,19 @@ describe("review resolver process", () => {
       kind: "misattribution",
       verdict: "accept_repair",
       applied_resolution: "repair_via_supersede",
+      reason: REVIEW_RESOLVER_REASON_SENTINEL,
+    });
+    expect(llm.requests[0]?.tools?.[0]?.inputSchema.properties?.reason).toMatchObject({
+      description: expect.stringContaining("audit rationale"),
     });
   });
 
   it("resolves vector-only duplicate candidates by superseding after LLM compatibility judgment", async () => {
     const llm = new FakeLLMClient();
+    const tracer = new ArrayTracer();
     const harness = await createOfflineTestHarness({
       llmClient: llm,
+      tracer,
       reviewOpenQuestionExtractor: null,
     });
     cleanup.push(harness.cleanup);
@@ -601,7 +607,6 @@ describe("review resolver process", () => {
     llm.pushResponse(
       resolverResponse({
         verdict: "accept_repair",
-        reason: "The supplied node records describe the same deployment service.",
         support_basis: "direct_user_or_source",
         cited_stream_ids: [loser.id, winner.id],
       }),
@@ -642,6 +647,15 @@ describe("review resolver process", () => {
       disclosure_class: "public",
     });
     expect(promptPayload.review?.refs?.overseer_flag).toBeUndefined();
+    expect(
+      tracer.events.find((event) => event.event === "review_resolver.decision.completed"),
+    ).toMatchObject({
+      review_id: item.id,
+      reason: REVIEW_RESOLVER_REASON_SENTINEL,
+    });
+    expect(llm.requests[0]?.tools?.[0]?.inputSchema.properties?.reason).toMatchObject({
+      description: expect.stringContaining("audit rationale"),
+    });
   });
 
   it.each([
@@ -1015,8 +1029,10 @@ describe("review resolver process", () => {
 
   it("resolves contradiction supersede verdicts with a validated semantic-pair winner", async () => {
     const llm = new FakeLLMClient();
+    const tracer = new ArrayTracer();
     const harness = await createOfflineTestHarness({
       llmClient: llm,
+      tracer,
       reviewOpenQuestionExtractor: null,
     });
     cleanup.push(harness.cleanup);
@@ -1052,7 +1068,6 @@ describe("review resolver process", () => {
       semanticPairResolverResponse({
         verdict: "supersede",
         winner_node_id: winner.id,
-        reason: "The Atlas node is better grounded and more current.",
         confidence: "high",
       }),
     );
@@ -1088,6 +1103,15 @@ describe("review resolver process", () => {
       disclosure_class: "public",
     });
     expect(promptPayload.review?.refs?.overseer_flag).toBeUndefined();
+    expect(
+      tracer.events.find((event) => event.event === "review_resolver.decision.completed"),
+    ).toMatchObject({
+      review_id: item.id,
+      reason: REVIEW_RESOLVER_REASON_SENTINEL,
+    });
+    expect(llm.requests[0]?.tools?.[0]?.inputSchema.properties?.reason).toMatchObject({
+      description: expect.stringContaining("audit rationale"),
+    });
   });
 
   it("keeps invalid semantic-pair winners out of the handler and marks needs_manual", async () => {
@@ -1257,8 +1281,10 @@ describe("review resolver process", () => {
 
   it("accepts grounded new insight proposals through the existing review handler", async () => {
     const llm = new FakeLLMClient();
+    const tracer = new ArrayTracer();
     const harness = await createOfflineTestHarness({
       llmClient: llm,
+      tracer,
       reviewOpenQuestionExtractor: null,
     });
     cleanup.push(harness.cleanup);
@@ -1286,7 +1312,6 @@ describe("review resolver process", () => {
       newInsightResolverResponse({
         verdict: "accept",
         confidence: "high",
-        reason: "The supplied episode directly grounds a useful self-memory.",
       }),
     );
 
@@ -1296,11 +1321,16 @@ describe("review resolver process", () => {
     const prompt = String(llm.requests[0]?.messages[0]?.content ?? "");
     const promptPayload = JSON.parse(prompt) as {
       review?: {
+        queue_reason?: string;
+        reason?: string;
         disclosure?: string;
         disclosure_label?: {
           disclosure_class?: string;
           private_to_entity_ids?: string[];
         };
+      };
+      output_fields?: {
+        reason?: string;
       };
       evidence_cluster?: {
         disclosure?: string;
@@ -1329,10 +1359,22 @@ describe("review resolver process", () => {
     expect(prompt).toContain("evidence_fetch_bound");
     expect(prompt).toContain("I repeatedly ask for rollback plans");
     expect(promptPayload.review).toMatchObject({
+      queue_reason: item.reason,
       disclosure_label: expect.objectContaining({
         disclosure_class: "relationship_private",
         private_to_entity_ids: [sourceAudienceId],
       }),
+    });
+    expect(promptPayload.review?.reason).toBeUndefined();
+    expect(promptPayload.output_fields?.reason).toContain("audit rationale");
+    expect(
+      tracer.events.find((event) => event.event === "review_resolver.decision.completed"),
+    ).toMatchObject({
+      review_id: item.id,
+      reason: REVIEW_RESOLVER_REASON_SENTINEL,
+    });
+    expect(llm.requests[0]?.tools?.[0]?.inputSchema.properties?.reason).toMatchObject({
+      description: expect.stringContaining("audit rationale"),
     });
     expect(promptPayload.review?.disclosure).toContain("disclosure_class=relationship_private");
     expect(promptPayload.evidence_cluster).toMatchObject({
@@ -2409,8 +2451,10 @@ describe("review resolver autonomous mode", () => {
 
   it("resolves identity_inconsistency items when autonomous", async () => {
     const llm = new FakeLLMClient();
+    const tracer = new ArrayTracer();
     const harness = await createOfflineTestHarness({
       llmClient: llm,
+      tracer,
       reviewOpenQuestionExtractor: null,
       configOverrides: AUTONOMOUS_OVERRIDES,
     });
@@ -2440,7 +2484,6 @@ describe("review resolver autonomous mode", () => {
     llm.pushResponse(
       identityResolverResponse({
         verdict: "accept_repair",
-        reason: "The reinforcement is supported by the stated evidence.",
       }),
     );
 
@@ -2451,6 +2494,15 @@ describe("review resolver autonomous mode", () => {
     expect(resolved?.resolved_at).not.toBeNull();
     expect(resolved?.resolution).toBe("accept");
     expect(llm.requests).toHaveLength(1);
+    expect(
+      tracer.events.find((event) => event.event === "review_resolver.decision.completed"),
+    ).toMatchObject({
+      review_id: item.id,
+      reason: REVIEW_RESOLVER_REASON_SENTINEL,
+    });
+    expect(llm.requests[0]?.tools?.[0]?.inputSchema.properties?.reason).toMatchObject({
+      description: expect.stringContaining("audit rationale"),
+    });
   });
 
   it("retries needs_manual items and terminally dismisses at the attempt cap", async () => {
@@ -2528,5 +2580,125 @@ describe("review resolver autonomous mode", () => {
       attempts: 1,
     });
     expect(llm.requests).toHaveLength(1);
+  });
+
+  // A repair whose apply throws used to leave the item open with nothing counted,
+  // so the resolver re-picked and re-threw it forever (ai-prod: 5 edge-closure
+  // items x every 4-hourly run). Missing targets and malformed refs never reach
+  // apply -- the resolver pre-rejects those without the handler -- so the throw is
+  // forced where the wedge class actually lives: an apply-time invariant failure
+  // on a valid item, simulated at the storage boundary.
+  it("stamps a bounded-retry attempt when the accepted repair throws", async () => {
+    const llm = new FakeLLMClient();
+    const harness = await createOfflineTestHarness({
+      llmClient: llm,
+      reviewOpenQuestionExtractor: null,
+      configOverrides: {
+        offline: { reviewResolver: { autonomous: true, maxNeedsManualAttempts: 3 } },
+      },
+    });
+    cleanup.push(harness.cleanup);
+    const { item, sourceEntryId } = await enqueueEpisodeMisattribution(harness);
+    vi.spyOn(harness.episodicRepository, "update").mockImplementation(() => {
+      throw new Error("simulated storage failure during repair");
+    });
+    llm.pushResponse(
+      resolverResponse({
+        verdict: "accept_repair",
+        reason: "The cited source supports the repair.",
+        cited_stream_ids: [sourceEntryId],
+      }),
+    );
+
+    const result = await runResolver(harness);
+
+    expect(result.errors).toHaveLength(1);
+    const after = harness.reviewQueueRepository.get(item.id);
+    expect(after?.resolved_at).toBeNull();
+    expect(after?.refs.__borg_review_resolver_diagnostic).toMatchObject({
+      verdict: "apply_failed",
+      attempts: 1,
+    });
+  });
+
+  it("terminally dismisses an item whose apply keeps throwing once attempts are exhausted", async () => {
+    // The prod wedge shape exactly: a semantic_edge repair is SQLITE-scoped, so a
+    // throwing apply rolls back and leaves the refs pristine -- the next pass
+    // re-judges and re-throws identically, forever, unless the attempts cap ends it.
+    // (Cross-store repairs self-limit differently: their leftover applying-state
+    // makes the next pass pre-reject the item as malformed.)
+    const llm = new FakeLLMClient();
+    const harness = await createOfflineTestHarness({
+      llmClient: llm,
+      reviewOpenQuestionExtractor: null,
+      configOverrides: {
+        offline: { reviewResolver: { autonomous: true, maxNeedsManualAttempts: 2 } },
+      },
+    });
+    cleanup.push(harness.cleanup);
+    const source = await insertSource(harness, "The support interval ended at the rollback.", {
+      shared: true,
+    });
+    const first = await harness.semanticNodeRepository.insert(
+      createSemanticNodeFixture({
+        label: "Atlas deploy pipeline",
+        description: "Pipeline node for the drift closure fixture.",
+        source_episode_ids: [source.episode.id],
+      }),
+    );
+    const second = await harness.semanticNodeRepository.insert(
+      createSemanticNodeFixture({
+        label: "Atlas rollback window",
+        description: "Rollback node for the drift closure fixture.",
+        source_episode_ids: [source.episode.id],
+      }),
+    );
+    const edge = harness.semanticEdgeRepository.addEdge({
+      from_node_id: first.id,
+      to_node_id: second.id,
+      relation: "supports",
+      confidence: 0.7,
+      evidence_episode_ids: [source.episode.id],
+      created_at: 1_000,
+      last_verified_at: 1_000,
+    });
+    const item = harness.reviewQueueRepository.enqueue({
+      kind: "temporal_drift",
+      reason: "support interval should close",
+      refs: {
+        target_type: "semantic_edge",
+        target_kind: "semantic_edge",
+        target_id: edge.id,
+        suggested_valid_to: 5_000,
+        reason: "support interval should close",
+        overseer_flag: overseerFlag({
+          kind: "temporal_drift",
+          reason: "support interval should close",
+          sourceEntryId: source.entry.id,
+          sourceEpisodeId: source.episode.id,
+        }),
+      },
+    });
+    vi.spyOn(harness.semanticEdgeRepository, "invalidateEdge").mockImplementation(() => {
+      throw new Error("simulated invariant failure during edge closure");
+    });
+
+    for (const _pass of [1, 2]) {
+      llm.pushResponse(
+        resolverResponse({
+          verdict: "accept_repair",
+          reason: "The cited source supports closing the interval.",
+          cited_stream_ids: [source.entry.id],
+        }),
+      );
+      await runResolver(harness);
+    }
+
+    const after = harness.reviewQueueRepository.get(item.id);
+    expect(after?.resolved_at).not.toBeNull();
+    expect(after?.resolution).toBe("dismiss");
+    expect(after?.refs.__borg_review_resolver_repair).toMatchObject({
+      bypass_handler_reason: "autonomous_apply_failure_exhausted",
+    });
   });
 });

@@ -2,15 +2,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { EmbeddingClient } from "../../embeddings/index.js";
 import { LanceDbStore } from "../../storage/lancedb/index.js";
 import { openDatabase } from "../../storage/sqlite/index.js";
-import { FixedClock } from "../../util/clock.js";
+import { FixedClock, ManualClock } from "../../util/clock.js";
 import { IdentityCasMismatchError, ProvenanceError } from "../../util/errors.js";
 import {
   createEntityId,
+  createMaintenanceRunId,
   createSharedStateEntryId,
   createEpisodeId,
   createSemanticNodeId,
@@ -19,6 +20,10 @@ import {
 import { expectedRecordVersion } from "../common/cas.js";
 
 import { selfMigrations } from "./migrations.js";
+import {
+  OPEN_QUESTION_DUPLICATE_PRESENTATION_LIMIT,
+  buildOpenQuestionDuplicatePresentation,
+} from "./open-question-duplicates.js";
 import { OpenQuestionsRepository, createOpenQuestionsTableSchema } from "./open-questions.js";
 
 class MapEmbeddingClient implements EmbeddingClient {
@@ -230,6 +235,71 @@ describe("OpenQuestionsRepository", () => {
     }
   });
 
+  // Four consecutive resolutions read back with last_ruminated_at null, which is
+  // readable as "nothing ever ruminated on these". It is not: both terminal writes
+  // clear the active-open lifecycle in the same statement that sets the status, so
+  // the null is that write's own doing and carries no history. The notes are the
+  // record that survives it, so pin both halves in one place.
+  it("clears the rumination lifecycle on terminal writes while the notes survive", () => {
+    const db = openDatabase(":memory:", {
+      migrations: selfMigrations,
+    });
+    const repository = new OpenQuestionsRepository({
+      db,
+      clock: new FixedClock(10_000),
+    });
+
+    try {
+      const resolved = repository.add({
+        question: "Which pass settled this?",
+        urgency: 0.5,
+        source: "ruminator",
+        provenance: manualProvenance,
+      });
+      const abandoned = repository.add({
+        question: "Which pass gave up on this?",
+        urgency: 0.5,
+        source: "ruminator",
+        provenance: manualProvenance,
+      });
+
+      for (const question of [resolved, abandoned]) {
+        repository.recordRumination({
+          open_question_id: question.id,
+          note: "A pass ran against this question.",
+          tensions: [],
+          connected_open_question_ids: [],
+          source_process: "test",
+          provenance: manualProvenance,
+          created_at: 11_000,
+        });
+        expect(repository.markRuminated(question.id, 3)).toMatchObject({
+          unresolved_rumination_ticks: 3,
+          last_ruminated_at: 10_000,
+        });
+      }
+
+      const afterResolve = repository.resolve(resolved.id, {
+        resolution_note: "The evidence settled it.",
+        resolution_evidence_episode_ids: [createEpisodeId()],
+      });
+      const afterAbandon = repository.abandon(abandoned.id, "No traction.");
+
+      for (const record of [afterResolve, afterAbandon]) {
+        expect(record.unresolved_rumination_ticks).toBe(0);
+        expect(record.last_ruminated_at).toBeNull();
+      }
+
+      for (const question of [resolved, abandoned]) {
+        expect(
+          repository.listRecentRuminations(question.id, { limit: 5 }).map((item) => item.note),
+        ).toEqual(["A pass ran against this question."]);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
   it("CAS-protects open question deletion", async () => {
     const clock = new FixedClock(10_000);
     const db = openDatabase(":memory:", {
@@ -349,6 +419,116 @@ describe("OpenQuestionsRepository", () => {
         record_version: concurrent.record_version,
         unresolved_rumination_ticks: 0,
       });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("stamps reached runs but only increments ticks when it records a note", () => {
+    const clock = new ManualClock(10_000);
+    const db = openDatabase(":memory:", {
+      migrations: selfMigrations,
+    });
+    const repository = new OpenQuestionsRepository({
+      db,
+      clock,
+    });
+
+    try {
+      const question = repository.add({
+        question: "Which stamped rumination produced a durable note?",
+        urgency: 0.4,
+        source: "ruminator",
+        provenance: manualProvenance,
+      });
+      const noteLessRunId = createMaintenanceRunId();
+      clock.advance(1_000);
+
+      const noteLess = repository.stampRuminationForRun({
+        open_question_id: question.id,
+        source_run_id: noteLessRunId,
+        next_unresolved_rumination_ticks: 1,
+        rumination: null,
+      });
+
+      expect(noteLess).toMatchObject({
+        stamped: true,
+        rumination: null,
+        question: {
+          unresolved_rumination_ticks: 0,
+          last_ruminated_at: 11_000,
+        },
+      });
+      expect(
+        db
+          .prepare(
+            `
+              SELECT stamped_at
+              FROM open_question_rumination_stamps
+              WHERE open_question_id = ? AND source_run_id = ?
+            `,
+          )
+          .get(question.id, noteLessRunId),
+      ).toEqual({ stamped_at: 11_000 });
+
+      const notedRunId = createMaintenanceRunId();
+      clock.advance(1_000);
+      const noted = repository.stampRuminationForRun({
+        open_question_id: question.id,
+        source_run_id: notedRunId,
+        next_unresolved_rumination_ticks: 1,
+        rumination: {
+          note: "This run produced a durable rumination note.",
+          source_process: "test",
+          provenance: manualProvenance,
+        },
+      });
+
+      expect(noted).toMatchObject({
+        stamped: true,
+        rumination: {
+          note: "This run produced a durable rumination note.",
+          source_run_id: notedRunId,
+        },
+        question: {
+          unresolved_rumination_ticks: 1,
+          last_ruminated_at: 12_000,
+        },
+      });
+
+      clock.advance(1_000);
+      const replay = repository.stampRuminationForRun({
+        open_question_id: question.id,
+        source_run_id: notedRunId,
+        next_unresolved_rumination_ticks: 2,
+        rumination: {
+          note: "This replay must not produce a second note.",
+          source_process: "test",
+          provenance: manualProvenance,
+        },
+      });
+
+      expect(replay).toMatchObject({
+        stamped: false,
+        rumination: null,
+        question: {
+          unresolved_rumination_ticks: 1,
+          last_ruminated_at: 12_000,
+        },
+      });
+      expect(repository.listRecentRuminations(question.id)).toEqual([
+        expect.objectContaining({
+          note: "This run produced a durable rumination note.",
+          source_run_id: notedRunId,
+        }),
+      ]);
+      expect(
+        db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM open_question_rumination_stamps WHERE open_question_id = ?",
+          )
+          .get(question.id),
+      ).toEqual({ count: 2 });
     } finally {
       db.close();
     }
@@ -743,6 +923,131 @@ describe("OpenQuestionsRepository", () => {
           .findByHandles({ streamEntryIds: [], episodeIds: [episodeId] })
           .map((question) => question.id),
       ).toEqual([high.id, touchedTie.id, untouchedTie.id, low.id]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("looks up exact open-question duplicates globally without an audience argument", async () => {
+    const db = openDatabase(":memory:", { migrations: selfMigrations });
+    const repository = new OpenQuestionsRepository({ db, clock: new FixedClock(10_000) });
+    try {
+      const question = repository.add({
+        question: "Which constraint is still unresolved?",
+        audience_entity_id: createEntityId(),
+        urgency: 0.5,
+        source: "user",
+        provenance: manualProvenance,
+      });
+      await expect(
+        repository.findSimilarOpenQuestion({
+          question: "Which constraint is still unresolved?",
+        }),
+      ).resolves.toMatchObject({ question: { id: question.id }, similarity: 1 });
+      await expect(
+        repository.findSimilarOpenQuestion({
+          question: "Which separate constraint is unresolved?",
+        }),
+      ).resolves.toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("retrieves cosine candidates globally across audience scopes", async () => {
+    const firstText = "Which private uncertainty belongs to the first audience?";
+    const secondText = "¿Qué incertidumbre equivalente pertenece a la segunda audiencia?";
+    const { repository } = await openVectorFixture(
+      new MapEmbeddingClient(
+        new Map([
+          [firstText, [1, 0, 0, 0]],
+          [secondText, [1, 0, 0, 0]],
+        ]),
+      ),
+    );
+    const first = repository.add({
+      question: firstText,
+      urgency: 0.4,
+      audience_entity_id: createEntityId(),
+      source: "reflection",
+      provenance: manualProvenance,
+    });
+    const second = repository.add({
+      question: secondText,
+      urgency: 0.5,
+      audience_entity_id: createEntityId(),
+      source: "reflection",
+      provenance: manualProvenance,
+    });
+    await repository.waitForPendingEmbeddings();
+
+    expect((await repository.searchSimilar(first, { minSimilarity: 0.9 }))[0]).toMatchObject({
+      question: { id: second.id },
+      similarity: 1,
+    });
+  });
+
+  it("uses the complete open set until the presentation limit, then marks proxy fallback", async () => {
+    const db = openDatabase(":memory:", {
+      migrations: selfMigrations,
+    });
+    const repository = new OpenQuestionsRepository({
+      db,
+      clock: new FixedClock(10_000),
+    });
+
+    try {
+      const questions = Array.from(
+        { length: OPEN_QUESTION_DUPLICATE_PRESENTATION_LIMIT },
+        (_, index) =>
+          repository.add({
+            question: `Open uncertainty ${index}?`,
+            urgency: 0.5,
+            source: "reflection",
+            provenance: manualProvenance,
+          }),
+      );
+      const complete = await buildOpenQuestionDuplicatePresentation({
+        repository,
+        sourceTextProxy: "complete-set proxy",
+      });
+
+      expect(complete).toMatchObject({
+        complete: true,
+        total_open_questions: OPEN_QUESTION_DUPLICATE_PRESENTATION_LIMIT,
+        presented_count: OPEN_QUESTION_DUPLICATE_PRESENTATION_LIMIT,
+        omitted_count: 0,
+      });
+
+      const overflow = repository.add({
+        question: "Overflow uncertainty?",
+        urgency: 0.5,
+        source: "reflection",
+        provenance: manualProvenance,
+      });
+      const nearest = [...questions.slice(1), overflow];
+      const searchByText = vi.spyOn(repository, "searchByText").mockResolvedValue(
+        nearest.map((question, index) => ({
+          question,
+          similarity: 1 - index / 1_000,
+        })),
+      );
+      const incomplete = await buildOpenQuestionDuplicatePresentation({
+        repository,
+        sourceTextProxy: "overflow proxy",
+      });
+
+      expect(searchByText).toHaveBeenCalledWith("overflow proxy", {
+        status: "open",
+        limit: OPEN_QUESTION_DUPLICATE_PRESENTATION_LIMIT,
+      });
+      expect(incomplete).toMatchObject({
+        complete: false,
+        total_open_questions: OPEN_QUESTION_DUPLICATE_PRESENTATION_LIMIT + 1,
+        presented_count: OPEN_QUESTION_DUPLICATE_PRESENTATION_LIMIT,
+        omitted_count: 1,
+      });
+      expect(incomplete.rows.map((row) => row.id)).toEqual(nearest.map((question) => question.id));
     } finally {
       db.close();
     }

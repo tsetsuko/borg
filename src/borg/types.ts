@@ -1,4 +1,10 @@
+import type { EmbeddingProfile } from "../embeddings/bank-profile.js";
 // Shared public and internal Borg composition types used by the facade and setup modules.
+import type { AgentDeliveryRepository } from "../cognition/ingestion/agent-deliveries.js";
+import type {
+  TaskEventService,
+  TaskEventCatchUpRunner,
+} from "../cognition/ingestion/task-events.js";
 
 import type {
   AutonomyScheduler,
@@ -12,11 +18,15 @@ import type {
   ImagePerceptionRepository,
 } from "../attachments/index.js";
 import type {
+  BacklogTerminalService,
+  ChatResponseCatchUpLease,
   ChatResponseCatchUpWorker,
+  ChatResponseCatchUpRunner,
   ChatResponseWatermarkCoordinator,
   MessageEnqueuer,
   StreamIngestionCoordinator,
 } from "../cognition/ingestion/index.js";
+import type { OperatorAttentionRepository } from "../memory/operator-attention/index.js";
 import type { TurnOrchestrator } from "../cognition/index.js";
 import type { PromptOverrideRepository } from "../cognition/prompts/override-repository.js";
 import type { PromptSurfaceHistoryRepository } from "../cognition/prompts/prompt-surface-history.js";
@@ -27,6 +37,7 @@ import type { EmbeddingClient } from "../embeddings/index.js";
 import type { ExecutiveStepsRepository } from "../executive/index.js";
 import type { LLMClient } from "../llm/index.js";
 import type { MoodRepository } from "../memory/affective/index.js";
+import type { SourceStreamAudienceDisclosureResolver } from "../memory/common/index.js";
 import type {
   ActivityRepository,
   LivedExperienceDaySummaryRepository,
@@ -87,6 +98,8 @@ import type {
   RetrievalPipeline,
 } from "../retrieval/index.js";
 import type { SessionsRepository } from "../sessions/index.js";
+import type { BorgActivityFacade } from "./public-facade.js";
+import type { SessionRecord } from "../sessions/index.js";
 import type { LanceDbStore } from "../storage/lancedb/index.js";
 import type { SqliteDatabase } from "../storage/sqlite/index.js";
 import type { StreamEntry, StreamEntryIndexRepository, StreamWriter } from "../stream/index.js";
@@ -100,6 +113,7 @@ export type BorgDependencies = {
   sqlite: SqliteDatabase;
   lance: LanceDbStore;
   entryIndex: StreamEntryIndexRepository;
+  sourceStreamAudienceDisclosureResolver: SourceStreamAudienceDisclosureResolver;
   episodicRepository: EpisodicRepository;
   semanticNodeRepository: SemanticNodeRepository;
   semanticEdgeRepository: SemanticEdgeRepository;
@@ -123,6 +137,7 @@ export type BorgDependencies = {
   commitmentRepository: CommitmentRepository;
   creatorDirectiveRepository: CreatorDirectiveRepository;
   sharedStateRepository: SharedStateRepository;
+  operatorAttentionRepository: OperatorAttentionRepository;
   activityRepository: ActivityRepository;
   livedExperienceDaySummaryRepository: LivedExperienceDaySummaryRepository;
   selfDecisionRepository: SelfDecisionRepository;
@@ -154,6 +169,9 @@ export type BorgDependencies = {
   maintenanceScheduler: MaintenanceScheduler;
   streamIngestionCoordinator?: StreamIngestionCoordinator;
   chatResponseWatermarkCoordinator: ChatResponseWatermarkCoordinator;
+  backlogTerminalService: BacklogTerminalService;
+  taskEventService: TaskEventService;
+  agentDeliveries: AgentDeliveryRepository;
   chatResponseCatchUpWorker: ChatResponseCatchUpWorker;
   messageEnqueuer: MessageEnqueuer;
   auditLog: AuditLog;
@@ -162,6 +180,8 @@ export type BorgDependencies = {
   createStreamWriter: BorgStreamWriterFactory;
   llmFactory: () => LLMClient;
   embeddingClient: EmbeddingClient;
+  releaseEmbeddingBankAccess?: () => Promise<void>;
+  pendingStartupTasks?: readonly Promise<unknown>[];
   tracer: TurnTracer;
   clock: Clock;
 };
@@ -171,6 +191,7 @@ export type BorgOpenOptions = {
   env?: NodeJS.ProcessEnv;
   dataDir?: string;
   embeddingDimensions?: number;
+  embeddingProfile?: EmbeddingProfile;
   embeddingClient?: EmbeddingClient;
   llmClient?: LLMClient;
   clock?: Clock;
@@ -194,6 +215,31 @@ export type BorgOpenOptions = {
   liveCommitmentExtraction?: boolean;
   /** Per-user-entry token accounting cap for live commitment extraction. */
   liveCommitmentExtractionBudget?: number | null;
+  inbox?: {
+    taskEventRunner?: (context: {
+      terminal: BacklogTerminalService;
+      taskEvents: TaskEventService;
+      deliveries: AgentDeliveryRepository;
+      entityRepository: Pick<EntityRepository, "get" | "getSelf">;
+      sessions: Pick<SessionsRepository, "get">;
+      activity: Pick<BorgActivityFacade, "projectRepliedTurn">;
+      tracer: TurnTracer;
+    }) => TaskEventCatchUpRunner;
+    onDeliveryAvailable?: (sessionId: SessionId) => void;
+    runner?:
+      | ChatResponseCatchUpRunner
+      | ((context: {
+          terminal: BacklogTerminalService;
+          entityRepository: Pick<EntityRepository, "get" | "getSelf">;
+          sessions: Pick<SessionsRepository, "get">;
+          activity: Pick<BorgActivityFacade, "projectRepliedTurn">;
+        }) => ChatResponseCatchUpRunner);
+    sessionPredicate?: (session: SessionRecord | null) => boolean;
+    acquireLease?: () => ChatResponseCatchUpLease;
+    onTerminalCommitted?: (terminalEntry: StreamEntry) => void;
+    settleMs?: number;
+    maxSettleMs?: number;
+  };
 };
 
 export type BorgDreamOptions = {

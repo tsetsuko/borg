@@ -1,3 +1,4 @@
+import { similarityThresholds } from "../../../config/similarity.js";
 import {
   appendCommitmentIfMissing,
   type CorrectivePreferenceTurnService,
@@ -76,8 +77,13 @@ import {
   type CognitionRecallContext,
   type DisclosureContext,
 } from "../../../retrieval/index.js";
-import type { IndexedEntryFacts, StreamEntry } from "../../../stream/index.js";
-import { filterActiveStreamEntries, loadSessionStreamEntries } from "../../../stream/index.js";
+import {
+  filterActiveStreamEntries,
+  loadSessionStreamEntries,
+  type IndexedEntryFacts,
+  type StreamConversation,
+  type StreamEntry,
+} from "../../../stream/index.js";
 import type {
   ActionId,
   AttachmentId,
@@ -413,8 +419,11 @@ function creatorDirectiveBriefingLane(
 
 export function buildCreatorDirectiveBriefing(input: {
   applicable: readonly CreatorDirectiveApplicable[];
+  currentUserEntryId?: StreamEntryId;
+  currentUserEntryIds?: readonly StreamEntryId[];
   entityRepository: Pick<EntityRepository, "get">;
 }): CreatorDirectiveBriefing | null {
+  const applicable = currentTurnEligibleCreatorDirectives(input);
   const briefingScope = (item: CreatorDirectiveApplicable) => ({
     directiveId: item.directive.id,
     createdByEntityId: item.directive.created_by_entity_id,
@@ -429,7 +438,7 @@ export function buildCreatorDirectiveBriefing(input: {
     activationAllowedEntityIds: [...item.directive.activation_policy.allowed_entity_ids],
     activationExcludedEntityIds: [...item.directive.activation_policy.excluded_entity_ids],
   });
-  const contentDirectives = input.applicable
+  const contentDirectives = applicable
     .flatMap((item) => {
       if (item.render_mode !== "content") {
         return [];
@@ -464,7 +473,7 @@ export function buildCreatorDirectiveBriefing(input: {
     })
     .sort((left, right) => right.priority - left.priority || left.createdAt - right.createdAt);
   const privateDirectives = [
-    ...input.applicable
+    ...applicable
       .filter(canRenderCreatorDirectivePrivateKnowledge)
       .flatMap((item) => {
         const payload = contentPayloadForCreatorDirective(item.directive);
@@ -491,7 +500,7 @@ export function buildCreatorDirectiveBriefing(input: {
         ];
       })
       .sort((left, right) => right.priority - left.priority || left.createdAt - right.createdAt),
-    ...input.applicable
+    ...applicable
       .filter(canRenderCreatorDirectivePrivateOperation)
       .map((item) => ({
         renderMode: "private" as const,
@@ -504,7 +513,7 @@ export function buildCreatorDirectiveBriefing(input: {
       }))
       .sort((left, right) => right.priority - left.priority || left.createdAt - right.createdAt),
   ];
-  const boundaryDirectives = input.applicable
+  const boundaryDirectives = applicable
     .filter(
       (item) =>
         item.activation.active &&
@@ -601,22 +610,6 @@ function traceCreatorDirectiveRendered(input: {
   }
 }
 
-export function buildCreatorDirectiveBriefingForTurn(input: {
-  applicable: readonly CreatorDirectiveApplicable[];
-  currentUserEntryId?: StreamEntryId;
-  currentUserEntryIds?: readonly StreamEntryId[];
-  entityRepository: Pick<EntityRepository, "get">;
-}): CreatorDirectiveBriefing | null {
-  return buildCreatorDirectiveBriefing({
-    applicable: currentTurnEligibleCreatorDirectives({
-      applicable: input.applicable,
-      currentUserEntryId: input.currentUserEntryId,
-      currentUserEntryIds: input.currentUserEntryIds,
-    }),
-    entityRepository: input.entityRepository,
-  });
-}
-
 function retrievedStreamEntryIds(
   input: Partial<Pick<EvidenceLedgerBuildInput, "retrievedEvidence" | "retrievedEpisodes">>,
 ): StreamEntryId[] {
@@ -690,6 +683,7 @@ export async function runRetrievalPhase(input: {
   audienceEntityId: EntityId | null;
   audienceEntity: ReturnType<TurnPhaseCoordinatorOptions["entityRepository"]["get"]> | null;
   currentSenderBorgRole?: BorgRole | null;
+  currentSenderDisplayName?: string | null;
   operatorOnlyDirectivesAllowed?: boolean;
   audienceProfile: ReturnType<TurnPhaseCoordinatorOptions["socialRepository"]["getProfile"]>;
   sessionAudienceRole?: SessionAudienceRole;
@@ -756,6 +750,9 @@ export async function runRetrievalPhase(input: {
   const activeScoringValues = selfContext.activeScoringValues;
   const retrievalScoringFeatures = selfContext.retrievalScoringFeatures;
   const executiveFocusWithStep = selfContext.executiveFocus;
+  const currentVenue: StreamConversation | undefined =
+    input.persistedUserEntry?.conversation ??
+    input.currentUserEntries?.find((entry) => entry.conversation !== undefined)?.conversation;
 
   const retrievalContext = await input.options.turnRetrievalCoordinator.coordinate({
     turnId: input.turnId,
@@ -770,6 +767,10 @@ export async function runRetrievalPhase(input: {
     recallContext,
     disclosureContext,
     audienceEntity: input.audienceEntity,
+    ...(input.currentSenderDisplayName === null || input.currentSenderDisplayName === undefined
+      ? {}
+      : { currentSenderName: input.currentSenderDisplayName }),
+    ...(currentVenue === undefined ? {} : { currentVenue }),
     audienceProfile: input.audienceProfile,
     perception: input.perception,
     workingMemory: input.workingMemory,
@@ -816,10 +817,15 @@ export async function runRetrievalPhase(input: {
           observedAt: description.observed_at,
           enabled: description.enabled,
           tickInFlight: description.tick_in_flight,
+          intervalMs: description.interval_ms,
+          droppedIntervalFires: description.dropped_interval_fires,
+          intervalArmedAt: description.interval_armed_at,
           nextTickAt: description.next_tick_at,
           scheduledTickAt: description.scheduled_tick_at,
+          windowWakes: description.window_wakes,
           budget: description.budget,
           fleetBrake: description.fleet_brake,
+          sources: description.sources,
         };
       }
     } catch (error) {
@@ -836,7 +842,26 @@ export async function runRetrievalPhase(input: {
       }
     }
   }
+  if (
+    autonomySchedulerState !== undefined &&
+    input.options.operatorAttentionRepository !== undefined
+  ) {
+    try {
+      autonomySchedulerState.operatorAttentionIndex =
+        input.options.operatorAttentionRepository.snapshot();
+    } catch (error) {
+      input.options.tracer.emit("retrieval.degraded", {
+        turnId: input.turnId,
+        component: "operator_attention_index",
+        reason: "attention_index_unavailable",
+        ...(input.options.tracer.includePayloads
+          ? { error: error instanceof Error ? error.message : String(error) }
+          : {}),
+      });
+    }
+  }
   const turnMechanismEvidence = await hydrateTurnMechanismEvidence({
+    nowMs: input.options.clock.now(),
     dataDir: input.options.config.dataDir,
     sessionId: input.sessionId,
     workingMemory: input.workingMemory,
@@ -890,11 +915,9 @@ export async function runRetrievalPhase(input: {
     participantEntityIds: creatorDirectiveParticipantEntityIds,
   });
   const creatorDirectiveBriefing = buildCreatorDirectiveBriefing({
-    applicable: currentTurnEligibleCreatorDirectives({
-      applicable: creatorDirectiveApplicable,
-      currentUserEntryId: input.persistedUserEntry?.id,
-      currentUserEntryIds: input.currentUserEntries?.map((entry) => entry.id),
-    }),
+    applicable: creatorDirectiveApplicable,
+    currentUserEntryId: input.persistedUserEntry?.id,
+    currentUserEntryIds: input.currentUserEntries?.map((entry) => entry.id),
     entityRepository: input.options.entityRepository,
   });
   const recentLivedExperienceConfig =
@@ -1047,6 +1070,7 @@ export async function runRetrievalPhase(input: {
           repository: input.options.observedEventRepository,
           speakerEntityIds: creatorDirectiveParticipantEntityIds,
           queryVector: observedEventQueryVector,
+          topicMinSimilarity: similarityThresholds(input.options.config).observedEventTopic,
           nowMs,
           recencyWindowMs: DEFAULT_OBSERVED_EVENT_INTROSPECTION_RECENCY_WINDOW_MS,
           cap: DEFAULT_OBSERVED_EVENT_INTROSPECTION_CAP,
@@ -1060,6 +1084,8 @@ export async function runRetrievalPhase(input: {
         episodicRepository: input.options.episodicRepository,
         actionRepository: input.options.actionRepository,
         goalsRepository: input.options.goalsRepository,
+        sourceStreamAudienceDisclosureResolver:
+          input.options.sourceStreamAudienceDisclosureResolver,
         openQuestionsRepository: input.options.openQuestionsRepository,
         autobiographicalRepository: input.options.autobiographicalRepository,
         sessionsRepository: input.options.sessionsRepository,
@@ -1307,14 +1333,16 @@ export async function buildCompactedEvidenceLedgerWithoutSharedState(input: {
     relationalSlotRepository: input.options.relationalSlotRepository,
     actionRepository: input.options.actionRepository,
     commitmentRepository: input.options.commitmentRepository,
+    sourceStreamAudienceDisclosureResolver: input.options.sourceStreamAudienceDisclosureResolver,
     goalsRepository: input.options.goalsRepository,
     openQuestionsRepository: input.options.openQuestionsRepository,
     currentSessionTranscriptTokenBudget: config.currentSessionTranscriptTokenBudget,
     actionThreadRenderLimit: config.actionThreadRenderLimit,
-    actionThreadSimilarityThreshold: config.actionThreadSimilarityThreshold,
+    actionThreadSimilarityThreshold: similarityThresholds(input.options.config).actionThread,
     actionThreadSourceRecordLimit: config.actionThreadSourceRecordLimit,
     actionThreadSalienceClassReservedSlots: config.actionThreadSalienceClassReservedSlots,
     actionThreadAudienceReservedSlots: config.actionThreadAudienceReservedSlots,
+    openQuestionStaleNoTractionTicks: input.options.config.offline.ruminator.staleNoTractionTicks,
     entityRepository: input.options.entityRepository,
     attachmentRepository: input.options.attachmentRepository,
     maxImagesPerLedger: input.options.config.attachments.maxImagesPerLedger,
@@ -1822,19 +1850,6 @@ function emitSessionReentryContinuityTrace(input: {
   }
 }
 
-export async function compileSharedStateArtifactForEvidenceLedger(input: {
-  options: TurnPhaseCoordinatorOptions;
-  input: EvidenceLedgerFinalizerBuildInput;
-  previousArtifact?: SharedStateArtifact | null;
-  ledger: EvidenceLedger;
-  promptVisibleLedger: string;
-  compilePass?: SharedStateCompilePass;
-  assistantResponse?: SharedStateCompilerAssistantResponse | null;
-  compileAnchorStreamEntryId?: StreamEntryId;
-}): Promise<SharedStateArtifact | null> {
-  return (await compileSharedStateArtifactForEvidenceLedgerResult(input)).artifact;
-}
-
 export async function compileSharedStateArtifactForEvidenceLedgerResult(input: {
   options: TurnPhaseCoordinatorOptions;
   input: EvidenceLedgerFinalizerBuildInput;
@@ -1966,14 +1981,20 @@ async function compileSharedStateArtifactForEvidenceLedgerResultInternal(input: 
       audienceEntityId,
       activeParticipants: input.input.activeParticipants,
     });
-  const activeGoals = input.options.goalsRepository.list({
+  const rawActiveGoals = input.options.goalsRepository.list({
     status: "active",
     visibleToAudienceEntityId: audienceEntityId,
   });
-  const activeCommitments = input.options.commitmentRepository.list({
+  const rawActiveCommitments = input.options.commitmentRepository.list({
     activeOnly: true,
     audience: audienceEntityId,
   });
+  const resolvedDisclosure = input.options.sourceStreamAudienceDisclosureResolver?.resolve({
+    commitments: rawActiveCommitments,
+    goalTrees: rawActiveGoals,
+  });
+  const activeGoals = resolvedDisclosure?.goalTrees ?? rawActiveGoals;
+  const activeCommitments = resolvedDisclosure?.commitments ?? rawActiveCommitments;
   const activeCommitmentCanonicalizationRecords = activeCommitments.filter(
     isSharedStateCommitmentCanonicalizationRecord,
   );
@@ -2205,12 +2226,13 @@ async function compileSharedStateArtifactForEvidenceLedgerResultInternal(input: 
           semanticNodeRepository: input.options.semanticNodeRepository,
           episodicRepository: input.options.episodicRepository,
           embeddingClient: input.options.embeddingClient,
+          minSimilarity: similarityThresholds(input.options.config).semanticRevision,
           model: input.options.config.anthropic.models.background,
         };
 
   const compileResult = await compileSharedStateArtifact({
     llmClient: sharedStateLlmClient,
-    model: input.options.config.anthropic.models.recallExpansion,
+    model: input.options.config.anthropic.models.sharedStateCompiler,
     repository: input.options.sharedStateRepository,
     audienceEntityId,
     currentAudience: {

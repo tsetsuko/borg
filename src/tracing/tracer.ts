@@ -7,6 +7,8 @@ import { serializeJsonValue, type JsonValue } from "../util/json-value.js";
 import type { SessionId } from "../util/ids.js";
 
 export type TurnTraceEventName =
+  | "task_event.terminal_committed"
+  | "task_event.delivery_created"
   | "attachment.write"
   | "attachment.quarantined"
   | "attachment.fetch_for_ledger"
@@ -165,6 +167,7 @@ export type TurnTraceEventName =
   | "semantic_insert.skipped"
   | "episodic_extractor.skipped"
   | "semantic_node.status.transitioned"
+  | "sidecar.append_projection.degraded"
   | "maintenance_snapshot.completed"
   | "storage.optimize.completed"
   | "commitment_guard.shadow_observation"
@@ -176,6 +179,7 @@ export type TurnTraceEventName =
   | "commitment_guard.regeneration_failed"
   | "commitment_check.completed"
   | "closure_response_guard.completed"
+  | "sidecar.guard_reply.completed"
   | "internal_identifier_guard.completed"
   | "closure_pressure_audit.degraded"
   | "reflection.completed"
@@ -268,26 +272,35 @@ const PAYLOAD_GATED_TRACE_KEYS = new Set([
   "candidate_texts",
   "chunk_text",
   "contextText",
+  "context_turns",
   "conversationContext",
   "description",
   "description_excerpt",
   "dropped_facets",
   "error",
   "facets",
+  "focus",
+  "identity_handles",
   "intent_query",
   "ledger",
   "matched_terms_by_candidate",
   "named_terms",
   "normalizedPayload",
   "original_response",
+  "owner_recent_activity",
   "prompt",
   "rawToolInput",
   "record",
   "recall_intents",
+  "reformulated_query",
+  "resolved_query",
   "response",
   "rewritten_response",
+  "semantic_variants",
   "skipped_promotions",
   "full_text",
+  "typed_queries",
+  "query",
 ]);
 
 function stripPayloadGatedTraceData(data: TurnTraceData): TurnTraceData {

@@ -205,6 +205,16 @@ export type SelfSnapshot = {
   goals: SelfSnapshotGoal[];
   traits: TraitRecord[];
   /**
+   * Stored row counts, read from the values/traits stores by their own
+   * COUNT statements rather than from the draws above. A renderer that wants
+   * to claim it printed every value and trait has to check that claim against
+   * a number the draw did not produce; when these are absent the claim is
+   * unmeasured rather than true. Optional because synthetic snapshots (tests,
+   * fixtures, replays) have no store behind them.
+   */
+  valuesStoredTotal?: number;
+  traitsStoredTotal?: number;
+  /**
    * The being's current autobiographical period (label + narrative). Phase
    * F wires this into the deliberator prompt so the being has a glimpse of
    * its own arc rather than values/goals/traits alone. Null when no period
@@ -259,6 +269,8 @@ export type DeliberationContext = {
   deliberationPath?: "system_1" | "system_2";
   retrievalConfidence?: RetrievalConfidence | null;
   applicableCommitments?: readonly CommitmentRecord[];
+  /** Store-read time for the active commitment membership assembled for this turn. */
+  applicableCommitmentsReadAtMs?: number;
   /** Canonical names resolved during turn assembly for commitment scope refs. */
   commitmentEntityLabels?: Readonly<Record<string, string>>;
   openQuestionsContext?: readonly OpenQuestion[];
@@ -365,6 +377,8 @@ export type CognitionThinkingConfig = {
   budget_tokens: number;
 };
 
+export type FinalizerTransport = "unary" | "streaming";
+
 export type DeliberationResult = {
   path: "system_1" | "system_2";
   response: string;
@@ -393,6 +407,7 @@ export type DeliberatorOptions = {
   hostCapabilities?: string;
   promptBlocks?: Partial<Record<PromptKey, string>>;
   finalizerDynamicPromptCacheEnabled?: boolean;
+  finalizerTransport?: FinalizerTransport;
   finalizerSurfaceVariant?: "compact" | "compact_conversational" | "legacy";
   planRequestedVerificationMembershipTokenBudget?: number;
   finalizerContextCapture?: FinalizerContextCapture;

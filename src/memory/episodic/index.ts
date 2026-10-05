@@ -1,8 +1,8 @@
 export { applyEpisodeDecay, type DecayOptions, type DecayResult } from "./decay.js";
 export {
   filterEpisodesByAudience,
-  inferSinglePrivateAudience,
   isEpisodeAccessVisible,
+  isEpisodeAccessVisibleToAnyAudience,
   type AudienceEpisodeAccess,
   type AudienceFilterResult,
   type AudiencePolicy,
@@ -26,6 +26,7 @@ export {
 } from "./protected-lines.js";
 export {
   episodeParticipantDisplayNames,
+  episodeParticipantEntityId,
   episodeParticipantEntityIds,
   episodeParticipantEntityIdTerm,
   parseEpisodeParticipantEntityIdTerm,

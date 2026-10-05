@@ -1,3 +1,5 @@
+import { similarityThresholds } from "../../config/similarity.js";
+import { goalBlockStateFields } from "../../memory/self/goal-blocks.js";
 import { z } from "zod";
 
 import {
@@ -40,6 +42,7 @@ import type {
   OfflineProcessError,
   OfflineResult,
 } from "../types.js";
+import { estimatePromptTokens } from "../../util/token-estimate.js";
 import { disclosureLabelForEpisodeIds, episodeEvidencePromptRow } from "../evidence-labels.js";
 import { SELF_REFERENTIAL_MEMORY_VOICE_GUIDANCE } from "../../util/self-memory-voice.js";
 
@@ -134,11 +137,11 @@ export const reflectorPlanSchema = z.object({
 export type ReflectorPlan = z.infer<typeof reflectorPlanSchema>;
 
 const ABSOLUTE_CONFIDENCE_CEILING = 0.5;
-const DEDUP_THRESHOLD = 0.88;
 
 type ReflectionCluster = {
   key: string;
   episodes: Episode[];
+  omittedEpisodeCount: number;
 };
 
 type ReflectionGoalVector = {
@@ -194,8 +197,50 @@ function renderActiveGoalPromptRow(goal: GoalRecord): string {
   return JSON.stringify({
     id: goal.id,
     description: goal.description,
+    status: goal.status,
+    ...goalBlockStateFields(goal),
+    counterparty_entity_id: goal.counterparty_entity_id ?? null,
     ...memoryDisclosurePayloadFields(goalMemoryDisclosureLabel(goal)),
   });
+}
+
+function reflectionEpisodePromptRow(episode: Episode): string {
+  return JSON.stringify(
+    episodeEvidencePromptRow(episode, {
+      tags: episode.tags,
+      participants: episode.participants,
+    }),
+  );
+}
+
+// Clusters arrive newest-first, so truncation keeps the most recent evidence.
+// The estimate is over the row that actually enters the prompt. At least
+// minSupport episodes are always kept so a qualifying cluster stays qualified.
+function boundClusterEpisodes(
+  episodesNewestFirst: readonly Episode[],
+  minSupport: number,
+  maxEpisodes: number,
+  maxInputTokens: number,
+): { episodes: Episode[]; omittedEpisodeCount: number } {
+  const kept: Episode[] = [];
+  let inputTokens = 0;
+
+  for (const episode of episodesNewestFirst) {
+    if (kept.length >= Math.max(minSupport, maxEpisodes)) {
+      break;
+    }
+
+    const rowTokens = estimatePromptTokens(reflectionEpisodePromptRow(episode));
+
+    if (kept.length >= minSupport && inputTokens + rowTokens > maxInputTokens) {
+      break;
+    }
+
+    kept.push(episode);
+    inputTokens += rowTokens;
+  }
+
+  return { episodes: kept, omittedEpisodeCount: episodesNewestFirst.length - kept.length };
 }
 
 function buildPrompt(cluster: ReflectionCluster, activeGoals: readonly GoalRecord[]): string {
@@ -204,16 +249,14 @@ function buildPrompt(cluster: ReflectionCluster, activeGoals: readonly GoalRecor
   return [
     OFFLINE_REFLECTOR_PROMPT_PREAMBLE,
     `Cluster key: ${cluster.key}`,
-    `Active goals: ${goals}`,
+    `Unfinished goals (including blocked): ${goals}`,
+    ...(cluster.omittedEpisodeCount > 0
+      ? [
+          `These are the ${cluster.episodes.length} most recent episodes of this cluster; ${cluster.omittedEpisodeCount} older episodes are omitted for length.`,
+        ]
+      : []),
     "Episodes:",
-    ...cluster.episodes.map((episode) =>
-      JSON.stringify(
-        episodeEvidencePromptRow(episode, {
-          tags: episode.tags,
-          participants: episode.participants,
-        }),
-      ),
-    ),
+    ...cluster.episodes.map(reflectionEpisodePromptRow),
   ].join("\n");
 }
 
@@ -245,6 +288,8 @@ function collectReflectionClusters(
   minSupport: number,
   maxInsightsPerRun: number,
   goalSimilarityThreshold: number,
+  maxEpisodesPerCluster: number,
+  maxClusterInputTokens: number,
 ): ReflectionCluster[] {
   const byKey = new Map<string, Episode[]>();
   const tagGroupByTag = new Map<string, string>();
@@ -288,7 +333,16 @@ function collectReflectionClusters(
     }))
     .filter((cluster) => cluster.episodes.length >= minSupport)
     .sort((left, right) => right.episodes.length - left.episodes.length)
-    .slice(0, maxInsightsPerRun);
+    .slice(0, maxInsightsPerRun)
+    .map((cluster) => ({
+      key: cluster.key,
+      ...boundClusterEpisodes(
+        cluster.episodes,
+        minSupport,
+        maxEpisodesPerCluster,
+        maxClusterInputTokens,
+      ),
+    }));
 }
 
 function uniqueEpisodeTags(episodes: readonly Episode[]): string[] {
@@ -368,10 +422,10 @@ async function buildReflectionTagGroups(input: {
 function semanticNodeMatchesReflectorCandidate(
   node: SemanticNode,
   candidateEmbedding: Float32Array,
+  threshold: number,
 ): boolean {
   return (
-    node.kind === "proposition" &&
-    cosineSimilarity(node.embedding, candidateEmbedding) >= DEDUP_THRESHOLD
+    node.kind === "proposition" && cosineSimilarity(node.embedding, candidateEmbedding) >= threshold
   );
 }
 
@@ -389,6 +443,7 @@ async function buildInsightCandidate(
   ctx: OfflineContext,
   llmClient: LLMClient,
   cluster: ReflectionCluster,
+  activeGoals: readonly GoalRecord[],
 ): Promise<{
   label: string;
   description: string;
@@ -411,7 +466,7 @@ async function buildInsightCandidate(
           messages: [
             {
               role: "user",
-              content: buildPrompt(cluster, ctx.goalsRepository.list({ status: "active" })),
+              content: buildPrompt(cluster, activeGoals),
             },
           ],
           tools: [REFLECTOR_TOOL],
@@ -572,11 +627,15 @@ export class ReflectorProcess implements OfflineProcess {
   }
 
   async plan(ctx: OfflineContext, opts: { budget?: number } = {}): Promise<ReflectorPlan> {
+    const thresholds = similarityThresholds(ctx.config);
     const errors: OfflineProcessError[] = [];
     const items: ReflectorPlan["items"] = [];
     const budget = opts.budget ?? ctx.config.offline.reflector.budget;
     const episodes = await ctx.episodicRepository.listEffectivelyVisible();
-    const activeGoals = ctx.goalsRepository.list({ status: "active" });
+    const rawActiveGoals = ctx.goalsRepository.list({ statuses: ["active", "blocked"] });
+    const activeGoals =
+      ctx.sourceStreamAudienceDisclosureResolver?.resolve({ goalTrees: rawActiveGoals })
+        .goalTrees ?? rawActiveGoals;
     let goalVectors: ReflectionGoalVector[] = [];
     let tagGroups: ReflectionTagGroup[] = [];
 
@@ -608,7 +667,7 @@ export class ReflectorProcess implements OfflineProcess {
         tagGroups = await buildReflectionTagGroups({
           embeddingClient: ctx.embeddingClient,
           episodes,
-          similarityThreshold: ctx.config.offline.reflector.goalSimilarityThreshold,
+          similarityThreshold: thresholds.reflectionGoalAndTagGrouping,
         });
       } catch (error) {
         errors.push(offlineProcessError(this.name, error));
@@ -620,7 +679,9 @@ export class ReflectorProcess implements OfflineProcess {
       tagGroups,
       ctx.config.offline.reflector.minSupport,
       ctx.config.offline.reflector.maxInsightsPerRun,
-      ctx.config.offline.reflector.goalSimilarityThreshold,
+      thresholds.reflectionGoalAndTagGrouping,
+      ctx.config.offline.reflector.maxEpisodesPerCluster,
+      ctx.config.offline.reflector.maxClusterInputTokens,
     );
     let tokensUsed = 0;
     let budgetExhausted = false;
@@ -631,7 +692,7 @@ export class ReflectorProcess implements OfflineProcess {
 
         for (const cluster of clusters) {
           try {
-            const candidate = await buildInsightCandidate(ctx, llmClient, cluster);
+            const candidate = await buildInsightCandidate(ctx, llmClient, cluster, activeGoals);
             const byLabel = await ctx.semanticNodeRepository.findByExactLabelOrAlias(
               candidate.label,
               3,
@@ -641,14 +702,20 @@ export class ReflectorProcess implements OfflineProcess {
             );
             const byVector = await ctx.semanticNodeRepository.searchByVector(candidate.embedding, {
               limit: 3,
-              minSimilarity: DEDUP_THRESHOLD,
+              minSimilarity: thresholds.reflectionInsightDuplicate,
               kindFilter: ["proposition"],
               includeArchived: false,
             });
             const eligibleByLabel: SemanticNode[] = [];
 
             for (const node of byLabel) {
-              if (semanticNodeMatchesReflectorCandidate(node, candidate.embedding)) {
+              if (
+                semanticNodeMatchesReflectorCandidate(
+                  node,
+                  candidate.embedding,
+                  thresholds.reflectionInsightDuplicate,
+                )
+              ) {
                 eligibleByLabel.push(node);
               }
             }
@@ -656,7 +723,13 @@ export class ReflectorProcess implements OfflineProcess {
             const eligibleByVector: SemanticNode[] = [];
 
             for (const item of byVector) {
-              if (semanticNodeMatchesReflectorCandidate(item.node, candidate.embedding)) {
+              if (
+                semanticNodeMatchesReflectorCandidate(
+                  item.node,
+                  candidate.embedding,
+                  thresholds.reflectionInsightDuplicate,
+                )
+              ) {
                 eligibleByVector.push(item.node);
               }
             }

@@ -3,7 +3,6 @@ export {
   ActivityRepository,
   type ActivityAutobiographicalSourceEvent,
   type ActivityDailyDensityRow,
-  type ActivityEventRecordInput,
   type ActivityEventKindCounts,
   type ActivityGlobalDailyDensityRow,
   type ActivityProjectionSourceEvent,
@@ -46,6 +45,14 @@ export {
   activityEventSchema,
   activityEventStatusSchema,
   type ActivityEvent,
+  type ActivityEventRecordInput,
   type ActivityEventKind,
   type ActivityEventStatus,
 } from "./types.js";
+export {
+  buildInboxReplyActivityProjection,
+  sessionEnsureInputFromRecord,
+  type InboxReplyActivityProjection,
+  type InboxReplyActivityProjectionInput,
+  type InboxReplyActivitySkipReason,
+} from "./inbox-reply-projection.js";

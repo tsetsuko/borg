@@ -21,9 +21,10 @@ import {
   type TraitId,
   type ValueId,
 } from "../../util/ids.js";
-import { provenanceSchema, type Provenance } from "../common/provenance.js";
+import { provenanceSchema } from "../common/provenance.js";
 import { episodeIdSchema } from "../episodic/types.js";
 import { semanticNodeIdSchema } from "../semantic/types.js";
+import { goalBlockRecordSchema } from "./goal-blocks.js";
 
 export const goalStatusSchema = z.enum(["active", "done", "abandoned", "blocked"]);
 export const identityStateSchema = z.enum(["candidate", "established"]);
@@ -71,6 +72,13 @@ export const goalOwnerEntityIdSchema = z
   .string()
   .refine((value) => entityIdHelpers.is(value), {
     message: "Invalid goal owner entity id",
+  })
+  .transform((value) => value as EntityId);
+
+export const goalCounterpartyEntityIdSchema = z
+  .string()
+  .refine((value) => entityIdHelpers.is(value), {
+    message: "Invalid goal counterparty entity id",
   })
   .transform((value) => value as EntityId);
 
@@ -208,12 +216,15 @@ export const goalSchema = z.object({
   priority: z.number().finite(),
   parent_goal_id: goalIdSchema.nullable(),
   status: goalStatusSchema,
+  block_history: z.array(goalBlockRecordSchema).optional(),
   progress_notes: z.string().nullable(),
   last_progress_ts: z.number().finite().nullable(),
   created_at: z.number().finite(),
   target_at: z.number().finite().nullable(),
+  target_assigned_at: z.number().finite().nullable().optional(),
   audience_entity_id: goalAudienceEntityIdSchema.nullable().default(null),
   owner_entity_id: goalOwnerEntityIdSchema.nullable().optional(),
+  counterparty_entity_id: goalCounterpartyEntityIdSchema.nullable().optional(),
   source_stream_entry_ids: z.array(goalSourceStreamEntryIdSchema).min(1).optional(),
   canonicalized_by_artifact_entry_id: goalCanonicalizedByArtifactEntryIdSchema
     .nullable()
@@ -258,14 +269,18 @@ export const goalPatchSchema = goalSchema
     id: true,
     record_version: true,
     created_at: true,
+    block_history: true,
+    target_assigned_at: true,
     audience_entity_id: true,
     owner_entity_id: true,
+    counterparty_entity_id: true,
     source_stream_entry_ids: true,
   })
   .extend({
     terminal_condition: z.string().min(1).nullable().optional(),
     audience_entity_id: goalAudienceEntityIdSchema.nullable().optional(),
     owner_entity_id: goalOwnerEntityIdSchema.nullable().optional(),
+    counterparty_entity_id: goalCounterpartyEntityIdSchema.nullable().optional(),
     source_stream_entry_ids: z.array(goalSourceStreamEntryIdSchema).min(1).optional(),
   })
   .partial()
@@ -358,8 +373,6 @@ export type TraitRecord = z.infer<typeof traitSchema>;
 export type TraitPatch = z.infer<typeof traitPatchSchema>;
 export type AutobiographicalPeriod = z.infer<typeof autobiographicalPeriodSchema>;
 export type AutobiographicalPeriodPatch = z.infer<typeof autobiographicalPeriodPatchSchema>;
-export type SelfProvenance = Provenance;
-export type IdentityState = z.infer<typeof identityStateSchema>;
 
 export type GoalTreeNode = GoalRecord & {
   children: GoalTreeNode[];
@@ -394,5 +407,4 @@ export type OpenQuestionGoalLookupOptions = {
 
 export type OpenQuestionSimilarLookupOptions = {
   question: string;
-  audienceEntityId?: EntityId | null;
 };

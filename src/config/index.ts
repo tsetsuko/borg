@@ -1,8 +1,26 @@
+import { similarityConfigSchema, similarityValuesSchema } from "./similarity.js";
+export {
+  similarityThresholds,
+  logSimilarityProfile,
+  DEFAULT_SIMILARITY_PROFILES,
+  QWEN_SIMILARITY_MODEL,
+  BGE_SIMILARITY_MODEL,
+} from "./similarity.js";
+export type {
+  SimilarityThresholds,
+  SimilarityConfig,
+  SimilarityConfigSource,
+} from "./similarity.js";
 import { join } from "node:path";
 import { z } from "zod";
 
 import { DEFAULT_HOST_CAPABILITIES_SECTION } from "../cognition/prompts/host-capability-contracts.js";
-import { DEFAULT_PLAN_REQUESTED_VERIFICATION_MEMBERSHIP_TOKEN_BUDGET } from "../cognition/deliberation/constants.js";
+import {
+  DEFAULT_CONTEXT_CAPTURE_ROTATION_KEEP,
+  DEFAULT_FINALIZER_CONTEXT_CAPTURE_MAX_FILE_BYTES,
+  DEFAULT_PLANNER_CONTEXT_CAPTURE_MAX_FILE_BYTES,
+  DEFAULT_PLAN_REQUESTED_VERIFICATION_MEMBERSHIP_TOKEN_BUDGET,
+} from "../cognition/deliberation/constants.js";
 import {
   EVIDENCE_LEDGER_SECTION_DEFINITIONS,
   type EvidenceLedgerSectionId,
@@ -203,7 +221,6 @@ const evidenceLedgerConfigSchema = z
     enabled: z.boolean().default(true),
     currentSessionTranscriptTokenBudget: z.number().int().positive().default(2_500),
     actionThreadRenderLimit: z.number().int().positive().default(12),
-    actionThreadSimilarityThreshold: z.number().min(0).max(1).default(0.85),
     actionThreadSourceRecordLimit: z.number().int().positive().default(256),
     actionThreadSalienceClassReservedSlots: z.number().int().nonnegative().default(1),
     actionThreadAudienceReservedSlots: z.number().int().nonnegative().default(1),
@@ -288,12 +305,28 @@ const deliberationConfigSchema = z
       .positive()
       .default(DEFAULT_PLAN_REQUESTED_VERIFICATION_MEMBERSHIP_TOKEN_BUDGET),
     finalizerDynamicPromptCacheEnabled: z.boolean().default(true),
+    finalizerTransport: z.enum(["unary", "streaming"]).default("unary"),
     finalizerSurfaceVariant: z
       .enum(["compact", "compact_conversational", "legacy"])
       .default("legacy"),
     finalizerContextCaptureSampleRate: z.number().min(0).max(1).default(0),
+    finalizerContextCaptureMaxFileBytes: z
+      .number()
+      .int()
+      .positive()
+      .default(DEFAULT_FINALIZER_CONTEXT_CAPTURE_MAX_FILE_BYTES),
     plannerSurfaceVariant: z.enum(["compact", "legacy"]).default("compact"),
     plannerContextCaptureSampleRate: z.number().min(0).max(1).default(0),
+    plannerContextCaptureMaxFileBytes: z
+      .number()
+      .int()
+      .positive()
+      .default(DEFAULT_PLANNER_CONTEXT_CAPTURE_MAX_FILE_BYTES),
+    contextCaptureRotationKeep: z
+      .number()
+      .int()
+      .nonnegative()
+      .default(DEFAULT_CONTEXT_CAPTURE_ROTATION_KEEP),
   })
   .strict()
   .prefault({});
@@ -327,6 +360,10 @@ const anthropicModelsConfigSchema = z
     background: z.string().min(1).default("claude-opus-5"),
     extraction: z.string().min(1).default("claude-opus-5"),
     recallExpansion: z.string().min(1).default("claude-haiku-4-5-20251001"),
+    // Corrective preferences need careful interpretation of participant restrictions.
+    correctivePreference: z.string().min(1).default("claude-sonnet-5"),
+    // Shared-state compilation must distinguish corrections and decisions from completed acts.
+    sharedStateCompiler: z.string().min(1).default("claude-sonnet-5"),
     creatorDirective: z.string().min(1).default("claude-sonnet-4-6"),
     imagePerception: z.string().min(1).default("claude-haiku-4-5-20251001"),
   })
@@ -384,6 +421,7 @@ const configBaseSchema = z.object({
   frameAnomaly: frameAnomalyConfigSchema,
   internalIdentifierGuard: internalIdentifierGuardConfigSchema,
   affective: affectiveConfigSchema,
+  similarity: similarityConfigSchema,
   embedding: z
     .object({
       baseUrl: z.string().url().default("http://localhost:1234/v1"),
@@ -401,7 +439,6 @@ const configBaseSchema = z.object({
   anthropic: anthropicConfigSchema,
   procedural: z
     .object({
-      skillSelectionMinSimilarity: z.number().min(0).max(1).default(0.5),
       // Retention of an imitated behaviour, read as
       // P(true success rate > floor) > confidence over the skill's own posterior.
       // Two numbers because one number over a curve names no quantity. Defaults
@@ -414,6 +451,15 @@ const configBaseSchema = z.object({
   retrieval: z
     .object({
       semanticOverfetchMultiplier: z.number().int().min(1).max(10).default(3),
+      // Hard cap for the recall-expansion LLM call (ms); recall degrades to
+      // raw-query intents on timeout. 0 disables the cap. Sized so expansion
+      // (2000) plus a double-stalled query embedding (2x1000) plus local
+      // retrieval work still fits the memory client's hard 5s recall budget.
+      recallExpansionTimeoutMs: z.number().int().min(0).default(2000),
+      recallExpansionSemanticVariantCount: z.number().int().min(1).max(8).default(3),
+      // IANA zone the recall planner resolves relative time references in ("yesterday", "in
+      // July"); the audience's calendar, not the pod's.
+      recallPlannerTimeZone: z.string().min(1).default("UTC"),
       // Live-turn attention weights. Deployment-tunable on purpose: `semantic`
       // is fused against a RAW cosine similarity, whose spread is a property of
       // the corpus rather than of the code. A corpus whose episodes are
@@ -506,14 +552,11 @@ const configBaseSchema = z.object({
     .object({
       consolidator: z
         .object({
-          similarityThreshold: z.number().positive().default(0.82),
-          maxClusterDiameter: z.number().min(0).max(2).default(0.18),
           temporalProximityMs: z
             .number()
             .int()
             .nonnegative()
             .default(30 * 24 * 60 * 60 * 1_000),
-          highSimilarityTemporalBypassThreshold: z.number().min(0).max(1).default(0.97),
           highSimilarityTemporalBypassMaxGapMs: z
             .number()
             .int()
@@ -528,9 +571,16 @@ const configBaseSchema = z.object({
       reflector: z
         .object({
           minSupport: z.number().int().positive().default(3),
-          goalSimilarityThreshold: z.number().min(0).max(1).default(0.82),
           ceilingConfidence: z.number().positive().max(0.5).default(0.5),
           maxInsightsPerRun: z.number().int().positive().default(2),
+          // Bound the evidence in one cluster prompt. Clusters are newest-first,
+          // so the cap keeps the most recent episodes. Tokens are the chars/4
+          // estimate over the actual prompt row, roughly half of provider
+          // tokens (util/token-estimate.ts); the count cap is the structural
+          // guarantee. Without this the prompt grows with the corpus and the
+          // budget below is only a runaway guard, not a bound.
+          maxEpisodesPerCluster: z.number().int().positive().default(120),
+          maxClusterInputTokens: z.number().int().positive().default(40_000),
           // Sized against observed usage, not guessed. The budget sink runs
           // AFTER each call, so an abort total is a LOWER bound on what a
           // completing run costs -- reflector aborted at 248k-271k against the
@@ -562,7 +612,6 @@ const configBaseSchema = z.object({
         .object({
           minSupport: z.number().int().positive().default(2),
           maxSkillsPerRun: z.number().int().positive().default(3),
-          dedupThreshold: z.number().min(0).max(1).default(0.88),
           minContextAttemptsForSplit: z.number().int().positive().default(5),
           minDivergenceForSplit: z.number().min(0).max(1).default(0.3),
           splitCooldownDays: z.number().positive().default(7),
@@ -582,6 +631,10 @@ const configBaseSchema = z.object({
             .number()
             .positive()
             .default(24 * 60 * 60 * 1_000),
+          traitDecayIntervalMs: z
+            .number()
+            .positive()
+            .default(24 * 60 * 60 * 1_000),
           episodeSalienceHalfLifeDays: z.number().positive().default(30),
           episodeHeatHalfLifeDays: z.number().positive().default(7),
           traitHalfLifeDays: z.number().positive().default(30),
@@ -592,6 +645,19 @@ const configBaseSchema = z.object({
         .object({
           lookbackHours: z.number().positive().default(24),
           maxChecksPerRun: z.number().int().positive().default(8),
+          // One call audits one memory item, and its flags array was unbounded:
+          // prod 2026-09-11 truncated EmitOverseerFlags at max_tokens (8000) and
+          // lost the whole check. A per-target flag cap is what bounds the
+          // output; the max_tokens ceiling is only headroom above it.
+          maxFlagsPerTarget: z.number().int().positive().default(4),
+          // Output ceiling for one EmitOverseerFlags call. Healthy calls are small
+          // (replayed 2026-09-13 across 141 prod targets: max 1,318 output tokens,
+          // a 2.5k-char patch); the only calls that ever reached the ceiling were
+          // degenerate loops that emit nothing usable, so headroom above the
+          // flag cap only buys a loop more time and tokens. Raise it if a
+          // legitimate long repair (a full-narrative patch on a long episode)
+          // is ever seen cut off.
+          maxOutputTokens: z.number().int().positive().default(8_000),
           budget: z.number().int().positive().nullable().default(null),
         })
         .prefault({}),
@@ -629,7 +695,10 @@ const configBaseSchema = z.object({
           // Threshold applies to RetrievalConfidence.overall, a conservative
           // epistemic evidence-quality signal, not the relevance ranking score.
           resolveConfidenceThreshold: z.number().min(0).max(1).default(0.55),
-          duplicateSimilarityThreshold: z.number().min(0).max(1).default(0.9),
+          duplicateJudgmentMaxPairs: z.number().int().positive().default(24),
+          duplicateJudgmentMinRemainingBudgetFraction: z.number().min(0).max(1).default(0.25),
+          revisitPeriodMinDays: z.number().positive().default(2),
+          revisitPeriodMaxDays: z.number().positive().default(30),
           stalenessDays: z.number().positive().default(30),
           staleNoTractionTicks: z.number().int().positive().default(4),
           // Aborted at 40k-48k against the old 40k cap on five of nine runs.
@@ -645,6 +714,14 @@ const configBaseSchema = z.object({
           budget: z.number().int().positive().default(500_000),
           maxObservationsPerRun: z.number().int().positive().default(4),
           minSupportEpisodes: z.number().int().positive().default(2),
+          // Bound the episode evidence in one narration call. Without this the
+          // prompt grows with the period (259k provider tokens on one bank,
+          // over the 262k context). Rows are estimated with the chars/4
+          // estimator, which understates provider tokens by roughly 2x on
+          // measured surfaces (util/token-estimate.ts), so the count cap is
+          // the structural guarantee and the token cap a second bound.
+          maxEpisodesPerRun: z.number().int().positive().default(150),
+          maxInputTokensPerRun: z.number().int().positive().default(60_000),
           cadenceHintDays: z.number().positive().default(7),
         })
         .prefault({}),
@@ -737,6 +814,7 @@ const configBaseSchema = z.object({
       // deployments once their records have matured.
       enabled: z.boolean().default(true),
       intervalMs: z.number().int().positive().default(60_000),
+      prepToolTimeoutMs: z.number().int().positive().default(30_000),
       maxWakesPerWindow: z.number().int().positive().default(6),
       goalWakeBatchMax: z.number().int().positive().default(5),
       budgetWindowMs: z.number().int().positive().default(86_400_000),
@@ -905,6 +983,14 @@ export const configSchema = configOutputSchema.superRefine((value, context) => {
       code: z.ZodIssueCode.custom,
       message: `Maintenance light/heavy process lists must be disjoint: ${overlap.join(", ")}`,
       path: ["maintenance", "heavyProcesses"],
+    });
+  }
+
+  if (value.offline.ruminator.revisitPeriodMinDays > value.offline.ruminator.revisitPeriodMaxDays) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Ruminator minimum revisit period must not exceed its maximum revisit period",
+      path: ["offline", "ruminator", "revisitPeriodMinDays"],
     });
   }
 });
@@ -1102,6 +1188,21 @@ function setConfigOverride(
 
 function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
   const overrides: ConfigOverrides = {};
+  const similarityOverrides = readOptionalEnvString(env, "BORG_SIMILARITY_OVERRIDES");
+  if (similarityOverrides !== undefined) {
+    try {
+      setConfigOverride(
+        overrides,
+        ["similarity", "overrides"],
+        similarityValuesSchema.partial().parse(JSON.parse(similarityOverrides) as unknown),
+      );
+    } catch (cause) {
+      throw new ConfigError(
+        "BORG_SIMILARITY_OVERRIDES must be a JSON object of valid similarity overrides",
+        { cause },
+      );
+    }
+  }
 
   setConfigOverride(overrides, ["dataDir"], readOptionalEnvString(env, "BORG_DATA_DIR"));
   setConfigOverride(overrides, ["defaultUser"], readOptionalEnvString(env, "BORG_DEFAULT_USER"));
@@ -1250,6 +1351,16 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
   );
   setConfigOverride(
     overrides,
+    ["anthropic", "models", "correctivePreference"],
+    readOptionalEnvString(env, "BORG_MODEL_CORRECTIVE_PREFERENCE"),
+  );
+  setConfigOverride(
+    overrides,
+    ["anthropic", "models", "sharedStateCompiler"],
+    readOptionalEnvString(env, "BORG_MODEL_SHARED_STATE_COMPILER"),
+  );
+  setConfigOverride(
+    overrides,
     ["anthropic", "models", "creatorDirective"],
     readOptionalEnvString(env, "BORG_MODEL_CREATOR_DIRECTIVE"),
   );
@@ -1292,11 +1403,6 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["anthropic", "transportStallMaxRetries"],
     readOptionalEnvNumber(env, "BORG_ANTHROPIC_TRANSPORT_STALL_MAX_RETRIES"),
-  );
-  setConfigOverride(
-    overrides,
-    ["procedural", "skillSelectionMinSimilarity"],
-    readOptionalEnvUnitInterval(env, "BORG_PROCEDURAL_SKILL_SELECTION_MIN_SIMILARITY"),
   );
   setConfigOverride(
     overrides,
@@ -1360,6 +1466,21 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
   );
   setConfigOverride(
     overrides,
+    ["retrieval", "recallExpansionTimeoutMs"],
+    readOptionalEnvNumber(env, "BORG_RETRIEVAL_RECALL_EXPANSION_TIMEOUT_MS"),
+  );
+  setConfigOverride(
+    overrides,
+    ["retrieval", "recallExpansionSemanticVariantCount"],
+    readOptionalEnvNumber(env, "BORG_RETRIEVAL_RECALL_EXPANSION_SEMANTIC_VARIANT_COUNT"),
+  );
+  setConfigOverride(
+    overrides,
+    ["retrieval", "recallPlannerTimeZone"],
+    readOptionalEnvString(env, "BORG_RETRIEVAL_RECALL_PLANNER_TIME_ZONE"),
+  );
+  setConfigOverride(
+    overrides,
     ["deliberation", "contradictionRouting", "enabled"],
     readOptionalEnvBoolean(env, "BORG_DELIBERATION_CONTRADICTION_ROUTING_ENABLED"),
   );
@@ -1378,6 +1499,11 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
   );
   setConfigOverride(
     overrides,
+    ["deliberation", "finalizerTransport"],
+    readOptionalEnvString(env, "BORG_DELIBERATION_FINALIZER_TRANSPORT"),
+  );
+  setConfigOverride(
+    overrides,
     ["deliberation", "finalizerSurfaceVariant"],
     readOptionalEnvString(env, "BORG_DELIBERATION_FINALIZER_SURFACE_VARIANT"),
   );
@@ -1388,6 +1514,11 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
   );
   setConfigOverride(
     overrides,
+    ["deliberation", "finalizerContextCaptureMaxFileBytes"],
+    readOptionalEnvNumber(env, "BORG_DELIBERATION_FINALIZER_CONTEXT_CAPTURE_MAX_FILE_BYTES"),
+  );
+  setConfigOverride(
+    overrides,
     ["deliberation", "plannerSurfaceVariant"],
     readOptionalEnvString(env, "BORG_DELIBERATION_PLANNER_SURFACE_VARIANT"),
   );
@@ -1395,6 +1526,16 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["deliberation", "plannerContextCaptureSampleRate"],
     readOptionalEnvUnitInterval(env, "BORG_DELIBERATION_PLANNER_CONTEXT_CAPTURE_SAMPLE_RATE"),
+  );
+  setConfigOverride(
+    overrides,
+    ["deliberation", "plannerContextCaptureMaxFileBytes"],
+    readOptionalEnvNumber(env, "BORG_DELIBERATION_PLANNER_CONTEXT_CAPTURE_MAX_FILE_BYTES"),
+  );
+  setConfigOverride(
+    overrides,
+    ["deliberation", "contextCaptureRotationKeep"],
+    readOptionalEnvNumber(env, "BORG_DELIBERATION_CONTEXT_CAPTURE_ROTATION_KEEP"),
   );
   setConfigOverride(
     overrides,
@@ -1451,14 +1592,6 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["generation", "evidenceLedger", "actionThreadRenderLimit"],
     readOptionalEnvNumber(env, "BORG_GENERATION_EVIDENCE_LEDGER_ACTION_THREAD_RENDER_LIMIT"),
-  );
-  setConfigOverride(
-    overrides,
-    ["generation", "evidenceLedger", "actionThreadSimilarityThreshold"],
-    readOptionalEnvUnitInterval(
-      env,
-      "BORG_GENERATION_EVIDENCE_LEDGER_ACTION_THREAD_SIMILARITY_THRESHOLD",
-    ),
   );
   setConfigOverride(
     overrides,
@@ -1547,11 +1680,6 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
   );
   setConfigOverride(
     overrides,
-    ["offline", "consolidator", "similarityThreshold"],
-    readOptionalEnvFloat(env, "BORG_OFFLINE_CONSOLIDATOR_SIMILARITY_THRESHOLD"),
-  );
-  setConfigOverride(
-    overrides,
     ["offline", "consolidator", "minClusterSize"],
     readOptionalEnvNumber(env, "BORG_OFFLINE_CONSOLIDATOR_MIN_CLUSTER_SIZE"),
   );
@@ -1572,11 +1700,6 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
   );
   setConfigOverride(
     overrides,
-    ["offline", "reflector", "goalSimilarityThreshold"],
-    readOptionalEnvFloat(env, "BORG_OFFLINE_REFLECTOR_GOAL_SIMILARITY_THRESHOLD"),
-  );
-  setConfigOverride(
-    overrides,
     ["offline", "reflector", "ceilingConfidence"],
     readOptionalEnvFloat(env, "BORG_OFFLINE_REFLECTOR_CEILING_CONFIDENCE"),
   );
@@ -1584,6 +1707,16 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["offline", "reflector", "maxInsightsPerRun"],
     readOptionalEnvNumber(env, "BORG_OFFLINE_REFLECTOR_MAX_INSIGHTS_PER_RUN"),
+  );
+  setConfigOverride(
+    overrides,
+    ["offline", "reflector", "maxEpisodesPerCluster"],
+    readOptionalEnvNumber(env, "BORG_OFFLINE_REFLECTOR_MAX_EPISODES_PER_CLUSTER"),
+  );
+  setConfigOverride(
+    overrides,
+    ["offline", "reflector", "maxClusterInputTokens"],
+    readOptionalEnvNumber(env, "BORG_OFFLINE_REFLECTOR_MAX_CLUSTER_INPUT_TOKENS"),
   );
   setConfigOverride(
     overrides,
@@ -1639,11 +1772,6 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["offline", "proceduralSynthesizer", "maxSkillsPerRun"],
     readOptionalEnvNumber(env, "BORG_OFFLINE_PROCEDURAL_SYNTHESIZER_MAX_SKILLS_PER_RUN"),
-  );
-  setConfigOverride(
-    overrides,
-    ["offline", "proceduralSynthesizer", "dedupThreshold"],
-    readOptionalEnvUnitInterval(env, "BORG_OFFLINE_PROCEDURAL_SYNTHESIZER_DEDUP_THRESHOLD"),
   );
   setConfigOverride(
     overrides,
@@ -1713,6 +1841,11 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
   );
   setConfigOverride(
     overrides,
+    ["offline", "curator", "traitDecayIntervalMs"],
+    readOptionalEnvFloat(env, "BORG_OFFLINE_CURATOR_TRAIT_DECAY_INTERVAL_MS"),
+  );
+  setConfigOverride(
+    overrides,
     ["offline", "curator", "episodeSalienceHalfLifeDays"],
     readOptionalEnvFloat(env, "BORG_OFFLINE_CURATOR_EPISODE_SALIENCE_HALF_LIFE_DAYS"),
   );
@@ -1740,6 +1873,16 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["offline", "overseer", "maxChecksPerRun"],
     readOptionalEnvNumber(env, "BORG_OFFLINE_OVERSEER_MAX_CHECKS_PER_RUN"),
+  );
+  setConfigOverride(
+    overrides,
+    ["offline", "overseer", "maxFlagsPerTarget"],
+    readOptionalEnvNumber(env, "BORG_OFFLINE_OVERSEER_MAX_FLAGS_PER_TARGET"),
+  );
+  setConfigOverride(
+    overrides,
+    ["offline", "overseer", "maxOutputTokens"],
+    readOptionalEnvNumber(env, "BORG_OFFLINE_OVERSEER_MAX_OUTPUT_TOKENS"),
   );
   setConfigOverride(
     overrides,
@@ -1778,6 +1921,29 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
   );
   setConfigOverride(
     overrides,
+    ["offline", "ruminator", "duplicateJudgmentMaxPairs"],
+    readOptionalEnvNumber(env, "BORG_OFFLINE_RUMINATOR_DUPLICATE_JUDGMENT_MAX_PAIRS"),
+  );
+  setConfigOverride(
+    overrides,
+    ["offline", "ruminator", "duplicateJudgmentMinRemainingBudgetFraction"],
+    readOptionalEnvUnitInterval(
+      env,
+      "BORG_OFFLINE_RUMINATOR_DUPLICATE_JUDGMENT_MIN_REMAINING_BUDGET_FRACTION",
+    ),
+  );
+  setConfigOverride(
+    overrides,
+    ["offline", "ruminator", "revisitPeriodMinDays"],
+    readOptionalEnvFloat(env, "BORG_OFFLINE_RUMINATOR_REVISIT_PERIOD_MIN_DAYS"),
+  );
+  setConfigOverride(
+    overrides,
+    ["offline", "ruminator", "revisitPeriodMaxDays"],
+    readOptionalEnvFloat(env, "BORG_OFFLINE_RUMINATOR_REVISIT_PERIOD_MAX_DAYS"),
+  );
+  setConfigOverride(
+    overrides,
     ["offline", "ruminator", "stalenessDays"],
     readOptionalEnvFloat(env, "BORG_OFFLINE_RUMINATOR_STALENESS_DAYS"),
   );
@@ -1800,6 +1966,16 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["offline", "selfNarrator", "minSupportEpisodes"],
     readOptionalEnvNumber(env, "BORG_OFFLINE_SELF_NARRATOR_MIN_SUPPORT_EPISODES"),
+  );
+  setConfigOverride(
+    overrides,
+    ["offline", "selfNarrator", "maxEpisodesPerRun"],
+    readOptionalEnvNumber(env, "BORG_OFFLINE_SELF_NARRATOR_MAX_EPISODES_PER_RUN"),
+  );
+  setConfigOverride(
+    overrides,
+    ["offline", "selfNarrator", "maxInputTokensPerRun"],
+    readOptionalEnvNumber(env, "BORG_OFFLINE_SELF_NARRATOR_MAX_INPUT_TOKENS_PER_RUN"),
   );
   setConfigOverride(
     overrides,
@@ -1971,6 +2147,11 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["autonomy", "intervalMs"],
     readOptionalEnvNumber(env, "BORG_AUTONOMY_INTERVAL_MS"),
+  );
+  setConfigOverride(
+    overrides,
+    ["autonomy", "prepToolTimeoutMs"],
+    readOptionalEnvNumber(env, "BORG_AUTONOMY_PREP_TOOL_TIMEOUT_MS"),
   );
   setConfigOverride(
     overrides,
@@ -2291,11 +2472,11 @@ export function redactConfig(config: Config): Config {
       ...config.anthropic,
       apiKey: redactSecret(config.anthropic.apiKey),
     },
-    procedural: {
-      ...config.procedural,
-    },
     retrieval: {
       semanticOverfetchMultiplier: config.retrieval.semanticOverfetchMultiplier,
+      recallExpansionTimeoutMs: config.retrieval.recallExpansionTimeoutMs,
+      recallPlannerTimeZone: config.retrieval.recallPlannerTimeZone,
+      recallExpansionSemanticVariantCount: config.retrieval.recallExpansionSemanticVariantCount,
       attentionWeights: {
         ...config.retrieval.attentionWeights,
       },

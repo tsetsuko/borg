@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+import { refreshSerializedEmbeddings } from "../../embeddings/serialized.js";
 
 import { LanceDbStore } from "../../storage/lancedb/index.js";
 import { composeMigrations, openDatabase } from "../../storage/sqlite/index.js";
@@ -15,6 +16,8 @@ import {
   createEntityId,
   createSemanticNodeId,
   createStreamEntryId,
+  commitmentIdHelpers,
+  entityIdHelpers,
   type EpisodeId,
   type SkillId,
 } from "../../util/ids.js";
@@ -116,6 +119,97 @@ describe("review queue", () => {
     }
   });
 
+  it("rejects a queued update with an unrecoverable serialized vector before resolving it", async () => {
+    const harness = await createOfflineTestHarness();
+    cleanup.push(harness.cleanup);
+    const queue = new ReviewQueueRepository({
+      db: harness.db,
+      prepareSerializedEmbeddings: (payload) =>
+        refreshSerializedEmbeddings(payload, harness.createContext().embeddingClient),
+    });
+    registerBuiltinReviewQueueHandlers(queue);
+    const item = queue.enqueue({
+      kind: "new_insight",
+      reason: "Pending old-model update",
+      refs: createPendingInsightRefs({
+        nodeId: createSemanticNodeId(),
+        episodeId: createEpisodeFixture().id,
+        description: "Updated description",
+        confidence: 0.7,
+        lastVerifiedAt: 1000,
+        embedding: [1, 2, 3, 4],
+      }),
+    });
+    await expect(queue.resolve(item.id, "accept")).rejects.toMatchObject({
+      code: "SERIALIZED_EMBEDDING_INCOMPATIBLE",
+    });
+    expect(queue.get(item.id)?.resolved_at).toBeNull();
+    expect(harness.db.raw.inTransaction).toBe(false);
+  });
+
+  it("accepts an embedding-bearing item after refreshing its vectors instead of racing itself", async () => {
+    const harness = await createOfflineTestHarness();
+    cleanup.push(harness.cleanup);
+    const episodeId = createEpisodeFixture().id;
+    const node = await harness.semanticNodeRepository.insert(
+      createSemanticNodeFixture(
+        {
+          label: "Refresh target",
+          description: "Original description.",
+          source_episode_ids: [episodeId],
+        },
+        [1, 0, 0, 0],
+      ),
+    );
+    // Stands in for a re-embed under the current model: same text, different
+    // floats. Prod 2026-09-11: the refreshed refs were handed to the CAS as
+    // the EXPECTED stored value while the row still held the old vector, so
+    // every accept of a new_insight failed as a phantom "applying-state race".
+    const refreshed = [9, 9, 9, 9];
+    const replaceEmbeddings = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(replaceEmbeddings);
+      if (value === null || typeof value !== "object") return value;
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+          key,
+          key === "embedding" && Array.isArray(entry) ? [...refreshed] : replaceEmbeddings(entry),
+        ]),
+      );
+    };
+    const queue = new ReviewQueueRepository({
+      db: harness.db,
+      semanticNodeRepository: harness.semanticNodeRepository,
+      prepareSerializedEmbeddings: async (payload) => replaceEmbeddings(payload),
+    });
+    registerBuiltinReviewQueueHandlers(queue);
+    const item = queue.enqueue({
+      kind: "new_insight",
+      reason: "Pending insight with a stale vector",
+      refs: createPendingInsightRefs({
+        nodeId: node.id,
+        episodeId,
+        description: "Refreshed description.",
+        confidence: 0.8,
+        lastVerifiedAt: 1000,
+        embedding: [1, 2, 3, 4],
+      }),
+    });
+
+    const resolved = await queue.resolve(item.id, "accept");
+
+    expect(resolved?.resolution).toBe("accept");
+    const stored = queue.get(item.id);
+    expect(stored?.resolved_at).not.toBeNull();
+    // The refreshed vector is what got saved, not the stale one.
+    expect(
+      (stored?.refs.reflector_pending_insight as { target: { patch: { embedding: number[] } } })
+        .target.patch.embedding,
+    ).toEqual(refreshed);
+    expect((await harness.semanticNodeRepository.get(node.id))?.description).toBe(
+      "Refreshed description.",
+    );
+  });
+
   it("opens review_queue schema on empty databases and databases with existing review rows", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
     cleanup.push(async () => {
@@ -172,13 +266,14 @@ describe("review queue", () => {
     cleanup.push(async () => {
       rmSync(tempDir, { recursive: true, force: true });
     });
-    const firstId = createCommitmentId();
-    const secondId = createCommitmentId();
-    const alice = createEntityId();
-    const bob = createEntityId();
+    const firstId = commitmentIdHelpers.parse("cmt_zzzzzzzzzzzzzzzz");
+    const secondId = commitmentIdHelpers.parse("cmt_aaaaaaaaaaaaaaaa");
+    const alice = entityIdHelpers.parse("ent_zzzzzzzzzzzzzzzz");
+    const bob = entityIdHelpers.parse("ent_aaaaaaaaaaaaaaaa");
     const firstEntryId = createStreamEntryId();
     const secondEntryId = createStreamEntryId();
-    const sortedAudienceIds = [alice, bob].sort();
+    // Origins keep source chronology; authorization IDs use lexical set order.
+    const authorizationAudienceIds = [bob, alice];
     const db = openDatabase(join(tempDir, "borg.db"), {
       migrations: [...semanticMigrations],
     });
@@ -195,7 +290,7 @@ describe("review queue", () => {
       refs: {
         target_type: "commitment_reconciliation",
         subkind: "cross_scope_conflict",
-        commitment_ids: [firstId, secondId],
+        commitment_ids: [secondId, firstId],
         scope_key: {
           kind: "participant_preference",
           restricted_audience: null,
@@ -209,26 +304,6 @@ describe("review queue", () => {
         },
         reason: "The cross-scope commitments conflict.",
         members: [
-          {
-            id: firstId,
-            kind: "participant_preference",
-            type: "preference",
-            directive_family: "reply_style",
-            directive: "Keep Alice replies short.",
-            scope_key: {
-              kind: "participant_preference",
-              restricted_audience: alice,
-              made_to_entity: null,
-              about_entity: null,
-            },
-            source_stream_entry_ids: [firstEntryId],
-            disclosure_label: {
-              disclosureClass: "relationship_private",
-              originAudienceEntityIds: [alice],
-              privateToEntityIds: [alice],
-              publicToEntityIds: [],
-            },
-          },
           {
             id: secondId,
             kind: "participant_preference",
@@ -249,9 +324,29 @@ describe("review queue", () => {
               publicToEntityIds: [],
             },
           },
+          {
+            id: firstId,
+            kind: "participant_preference",
+            type: "preference",
+            directive_family: "reply_style",
+            directive: "Keep Alice replies short.",
+            scope_key: {
+              kind: "participant_preference",
+              restricted_audience: alice,
+              made_to_entity: null,
+              about_entity: null,
+            },
+            source_stream_entry_ids: [firstEntryId],
+            disclosure_label: {
+              disclosureClass: "relationship_private",
+              originAudienceEntityIds: [alice],
+              privateToEntityIds: [alice],
+              publicToEntityIds: [],
+            },
+          },
         ],
         judgment: {
-          commitment_ids: [firstId, secondId],
+          commitment_ids: [secondId, firstId],
           resolution: "conflict",
           survivor_commitment_id: null,
           superseded_commitment_ids: [],
@@ -259,9 +354,9 @@ describe("review queue", () => {
         },
         source_stream_entry_ids: [firstEntryId, secondEntryId],
         disclosure_label: {
-          disclosureClass: "public",
-          originAudienceEntityIds: [],
-          privateToEntityIds: [],
+          disclosureClass: "relationship_private",
+          originAudienceEntityIds: [alice, bob],
+          privateToEntityIds: authorizationAudienceIds,
           publicToEntityIds: [],
         },
       },
@@ -276,24 +371,24 @@ describe("review queue", () => {
     expect(reviews[0]).toMatchObject({
       reason: "cross-scope commitment reconciliation",
       subkind: "cross_scope_conflict",
-      commitment_ids: [firstId, secondId],
+      commitment_ids: [secondId, firstId],
       source_stream_entry_ids: [firstEntryId, secondEntryId],
       disclosureLabel: {
         disclosureClass: "relationship_private",
-        originAudienceEntityIds: sortedAudienceIds,
-        privateToEntityIds: sortedAudienceIds,
+        originAudienceEntityIds: [alice, bob],
+        privateToEntityIds: authorizationAudienceIds,
         publicToEntityIds: [],
       },
     });
     expect(reviews[0]?.refs.disclosure_label).toEqual({
-      disclosureClass: "public",
-      originAudienceEntityIds: [],
-      privateToEntityIds: [],
+      disclosureClass: "relationship_private",
+      originAudienceEntityIds: [alice, bob],
+      privateToEntityIds: authorizationAudienceIds,
       publicToEntityIds: [],
     });
     expect(reviews[0]?.members.map((member) => member.directive)).toEqual([
-      "Keep Alice replies short.",
       "Give Bob detailed replies.",
+      "Keep Alice replies short.",
     ]);
   });
 
@@ -1246,13 +1341,37 @@ describe("review queue", () => {
     expect(harness.semanticNodeRepository.listDistinctKinds()).toContain(kind);
   });
 
+  // Rows written BEFORE enqueue-time validation existed (or by an older build)
+  // are exactly what the resolve-time guards below protect against, and enqueue()
+  // now refuses to create them -- so these tests insert the legacy rows raw.
+  function insertLegacyRow(
+    harness: {
+      db: {
+        prepare(sql: string): { run(...args: unknown[]): { lastInsertRowid: number | bigint } };
+      };
+      reviewQueueRepository: { get(id: number): { id: number } | null };
+    },
+    input: { kind: string; refs: Record<string, unknown>; reason: string },
+  ) {
+    const result = harness.db
+      .prepare(
+        "INSERT INTO review_queue (kind, refs, reason, created_at, resolved_at, resolution) VALUES (?, ?, ?, ?, NULL, NULL)",
+      )
+      .run(input.kind, JSON.stringify(input.refs), input.reason, 1_000);
+    const item = harness.reviewQueueRepository.get(Number(result.lastInsertRowid));
+    if (item === null) {
+      throw new Error("legacy row readback failed");
+    }
+    return item;
+  }
+
   it("rejects legacy new insight refs even for dismiss", async () => {
     const harness = await createOfflineTestHarness({
       clock: new FixedClock(8_500),
     });
     cleanup.push(harness.cleanup);
 
-    const legacy = harness.reviewQueueRepository.enqueue({
+    const legacy = insertLegacyRow(harness, {
       kind: "new_insight",
       refs: {
         node_ids: ["semn_cccccccccccccccc"],
@@ -1278,7 +1397,7 @@ describe("review queue", () => {
         kind: "manual",
       },
     });
-    const underSpecifiedMisattribution = harness.reviewQueueRepository.enqueue({
+    const underSpecifiedMisattribution = insertLegacyRow(harness, {
       kind: "misattribution",
       refs: {
         target_type: "episode",
@@ -1286,7 +1405,7 @@ describe("review queue", () => {
       },
       reason: "under-specified row missing patch",
     });
-    const underSpecifiedTemporalDrift = harness.reviewQueueRepository.enqueue({
+    const underSpecifiedTemporalDrift = insertLegacyRow(harness, {
       kind: "temporal_drift",
       refs: {
         target_type: "episode",
@@ -1294,7 +1413,7 @@ describe("review queue", () => {
       },
       reason: "under-specified row missing corrected timestamps",
     });
-    const underSpecifiedIdentityRepair = harness.reviewQueueRepository.enqueue({
+    const underSpecifiedIdentityRepair = insertLegacyRow(harness, {
       kind: "identity_inconsistency",
       refs: {
         target_type: "goal",
@@ -1333,14 +1452,14 @@ describe("review queue", () => {
     });
     cleanup.push(harness.cleanup);
 
-    const malformedDuplicate = harness.reviewQueueRepository.enqueue({
+    const malformedDuplicate = insertLegacyRow(harness, {
       kind: "duplicate",
       refs: {
         node_ids: ["semn_aaaaaaaaaaaaaaaa"],
       },
       reason: "under-specified row lost one side of the pair",
     });
-    const malformedContradiction = harness.reviewQueueRepository.enqueue({
+    const malformedContradiction = insertLegacyRow(harness, {
       kind: "contradiction",
       refs: {},
       reason: "under-specified row lost the pair refs",
@@ -1868,5 +1987,89 @@ describe("review queue", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+describe("enqueue-time refs validation", () => {
+  const cleanup: Array<() => Promise<void> | void> = [];
+
+  afterEach(async () => {
+    while (cleanup.length > 0) {
+      await cleanup.pop()?.();
+    }
+  });
+
+  function queueWithBuiltins() {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    const db = openDatabase(join(tempDir, "borg.db"), {
+      migrations: [...semanticMigrations],
+    });
+    const reviewQueue = new ReviewQueueRepository({ db, clock: new FixedClock(1_000) });
+    registerBuiltinReviewQueueHandlers(reviewQueue);
+    cleanup.push(() => {
+      db.close();
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+    return reviewQueue;
+  }
+
+  it("rejects refs its registered handler could never resolve", () => {
+    // The exact ai-prod payload: a well-cited overseer flag whose patch key no
+    // target accepts. Refs used to be parsed only at resolve time, so this item
+    // entered the queue and would have thrown on every accept attempt.
+    const reviewQueue = queueWithBuiltins();
+
+    expect(() =>
+      reviewQueue.enqueue({
+        kind: "misattribution",
+        reason: "ownership correction",
+        refs: {
+          target_type: "episode",
+          target_id: "ep_0qab598kxvnelxyv",
+          patch: { business_owner: "Karolina Sabala" },
+        },
+      }),
+    ).toThrow(/unresolvable/);
+
+    expect(reviewQueue.getOpen()).toEqual([]);
+  });
+
+  it("accepts refs that satisfy the handler schema", () => {
+    const reviewQueue = queueWithBuiltins();
+
+    const item = reviewQueue.enqueue({
+      kind: "misattribution",
+      reason: "narrative repair",
+      refs: {
+        target_type: "episode",
+        target_id: "ep_0qab598kxvnelxyv",
+        patch: { narrative: "Corrected narrative." },
+      },
+    });
+
+    expect(item.kind).toBe("misattribution");
+    expect(reviewQueue.getOpen()).toHaveLength(1);
+  });
+
+  it("keeps enqueueing kinds that have no registered handler", () => {
+    // No handler means no schema to hold the refs to; producers of such kinds
+    // must not start failing because validation exists for the others.
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    const db = openDatabase(join(tempDir, "borg.db"), {
+      migrations: [...semanticMigrations],
+    });
+    const reviewQueue = new ReviewQueueRepository({ db, clock: new FixedClock(1_000) });
+    cleanup.push(() => {
+      db.close();
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    const item = reviewQueue.enqueue({
+      kind: "misattribution",
+      reason: "no handler registered on this instance",
+      refs: { anything: "goes" },
+    });
+
+    expect(item.id).toBeGreaterThan(0);
   });
 });

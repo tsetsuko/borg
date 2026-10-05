@@ -7,12 +7,15 @@ import type {
   LLMConverseOptions,
   LLMSystemBlock,
 } from "../../llm/index.js";
-import { willSendThinkingUnderAutoToolChoice } from "../../llm/index.js";
+import {
+  LLM_STREAMING_CALL_TIMEOUT_MS,
+  willSendThinkingUnderAutoToolChoice,
+} from "../../llm/index.js";
 import type { ToolDefinition, ToolDispatcher } from "../../tools/dispatcher.js";
 import type { BorgRole } from "../../memory/commitments/index.js";
-import type { SessionAudienceRole } from "../../sessions/index.js";
+import type { SessionAudienceRole, SessionParticipationPolicy } from "../../sessions/index.js";
 import type { EntityId, SessionId } from "../../util/ids.js";
-import type { TurnOrigin } from "../types.js";
+import { exposesOutboundTool, type TurnOrigin } from "../types.js";
 import {
   emitTurnTokenFlushTrace,
   emitTurnTokenTrace,
@@ -43,12 +46,14 @@ import { resolveFinalizerNonTerminalTools } from "./autonomous-finalizer-tools.j
 import { OUTBOUND_POST_TOOL_NAME } from "../../tools/internal/outbound-post-name.js";
 import {
   buildCompactFinalizerSystemPrompt,
+  renderFinalizerToolAvailability,
   type FinalizerContextTraceSummary,
   type FinalizerResolvedSurfaceVariant,
   type FinalizerSurfaceVariant,
+  type FinalizerToolAvailabilityState,
 } from "./prompt/finalizer-context.js";
 import type { BuildBaseSystemPromptOptions } from "./prompt/system-prompt.js";
-import type { DeliberationContext } from "./types.js";
+import type { DeliberationContext, FinalizerTransport } from "./types.js";
 import { toTraceJsonValue } from "../../tracing/tracer.js";
 import type {
   FinalizerCaptureOutcome,
@@ -274,13 +279,10 @@ function formatEmissionToolList(names: readonly EmissionToolName[]): string {
 // of content -- and it was previously only implied by "available tools" framing plus one
 // aside, which let a thinking-mode turn (tool_choice:auto) occasionally answer in prose and
 // emit nothing. Naming the mechanism up front is the fix.
-function emissionContractPreamble(availableEmissionNames: readonly EmissionToolName[]): string {
-  const onePhrase =
-    availableEmissionNames.length === 1
-      ? `my only terminal emission tool, ${availableEmissionNames[0]}`
-      : `exactly one of ${formatEmissionToolList(availableEmissionNames)}`;
+function emissionContractPreamble(advertisedEmissionNames: readonly EmissionToolName[]): string {
   return [
-    `Every turn I take ends with one terminal emission tool call: I call ${onePhrase}, never zero and never more than one.`,
+    `The origin-static advertised terminal tools are ${formatEmissionToolList(advertisedEmissionNames)}. <borg_finalizer_tool_availability> names the enabled subset for this turn.`,
+    "Every turn I take ends with exactly one enabled terminal emission tool call, never zero and never more than one. An advertised tool whose live state is unavailable returns a clear tool error; an available tool executes normally.",
     "That single tool call is my entire output for the turn. Any text I write outside a terminal emission tool call -- even a complete, well-formed reply in plain prose -- is internal scratch that the harness never delivers to anyone. Whatever I want to say or decide, I put it inside the terminal tool; writing prose instead of calling one emits nothing at all.",
   ].join(" ");
 }
@@ -348,17 +350,13 @@ function buildEmissionToolInstructions(
   ].join("\n");
 }
 
-function buildEmissionFinalizerInstructions(
-  allowedEmissions: readonly EmissionToolName[] | undefined,
-  outboundToolAvailable: boolean,
-  turnOrigin?: TurnOrigin,
-): string {
+function buildEmissionFinalizerInstructions(turnOrigin?: TurnOrigin): string {
   return [
-    buildEmissionToolInstructions(resolveAvailableEmissionNames(allowedEmissions, turnOrigin)),
-    ...(outboundToolAvailable
+    buildEmissionToolInstructions(resolveAvailableEmissionNames(undefined, turnOrigin)),
+    ...(exposesOutboundTool(turnOrigin)
       ? [
           "",
-          "Non-terminal outbound tool: when a structurally authorized creator in an operator session asks me to send a message into another session, or when an autonomous turn has an authorized target listed in <reachable_threads>, I call tool.outbound.post first with the target_session_id and an instruction for the target-scoped composition turn. I wait for the tool result, then call exactly one terminal emission tool for the current turn. I do not expose tool names, session ids, or dispatch internals in visible text.",
+          "Non-terminal outbound tool: when <borg_finalizer_tool_availability> says outbound_post=available and a structurally authorized creator in an operator session asks me to send a message into another session, or an autonomous turn has an authorized target listed in <reachable_threads>, I may call tool.outbound.post first with the target_session_id and an instruction for the target-scoped composition turn. When the label says outbound_post=unavailable, I do not call it; if I do, the host returns a clear unavailable-tool error. I wait for any tool result, then call exactly one enabled terminal emission tool for the current turn. I do not expose tool names, session ids, or dispatch internals in visible text.",
         ]
       : []),
     "",
@@ -417,6 +415,7 @@ export type RunFinalizerOptions = {
   additionalPromptSections?: readonly PromptSurfaceAdditionalSection[];
   cacheableSystemPrompt?: CacheableFinalizerSystemPrompt;
   finalizerDynamicPromptCacheEnabled?: boolean;
+  finalizerTransport?: FinalizerTransport;
   finalizerSurfaceVariant?: FinalizerSurfaceVariant;
   compactSurface?: {
     context: DeliberationContext;
@@ -424,6 +423,7 @@ export type RunFinalizerOptions = {
   };
   allowedEmissions?: readonly EmissionToolName[];
   outboundToolAvailable?: boolean;
+  participationPolicy?: SessionParticipationPolicy;
   nonTerminalTools?: readonly ToolDefinition[];
   turnOrigin?: TurnOrigin;
   currentSenderBorgRole?: BorgRole | null;
@@ -516,18 +516,13 @@ function buildDynamicSystemPromptParts(options: RunFinalizerOptions): {
 function createFinalizerPromptSurfaceRenderContext(
   options: RunFinalizerOptions,
 ): PromptSurfaceRenderContext {
-  const outboundAvailableForPrompt =
-    options.nonTerminalTools?.some((tool) => tool.name === OUTBOUND_POST_TOOL_NAME) ?? false;
-
   return {
     renderBlock: (id) => {
       switch (id) {
         case "finalizer_emission_protocol":
-          return buildEmissionFinalizerInstructions(
-            options.allowedEmissions,
-            outboundAvailableForPrompt,
-            options.turnOrigin,
-          );
+          return buildEmissionFinalizerInstructions(options.turnOrigin);
+        case "borg_finalizer_tool_availability":
+          return renderFinalizerToolAvailability(finalizerToolAvailability(options));
         case "finalizer_cacheable_static_prefix":
           return options.cacheableSystemPrompt?.staticPrefix ?? null;
         case "finalizer_base_dynamic_prompt":
@@ -548,6 +543,23 @@ function createFinalizerPromptSurfaceRenderContext(
           return null;
       }
     },
+  };
+}
+
+function finalizerToolAvailability(options: RunFinalizerOptions): FinalizerToolAvailabilityState {
+  return {
+    turnOrigin: options.turnOrigin ?? "user",
+    participationPolicy:
+      options.participationPolicy ??
+      options.compactSurface?.context.participationPolicy ??
+      "active",
+    enabledTerminalEmissions: resolveAvailableEmissionNames(
+      options.allowedEmissions,
+      options.turnOrigin,
+    ),
+    outboundPostAvailable:
+      options.outboundToolAvailable === true &&
+      options.nonTerminalTools?.some((tool) => tool.name === OUTBOUND_POST_TOOL_NAME) === true,
   };
 }
 
@@ -595,14 +607,12 @@ function legacyFinalizerTraceSummary(
       terminal_static_head: {
         chars: staticText.length,
         estimatedTokens: estimatePromptTokens(staticText),
-        ttl: "1h",
+        ttl: system[0]?.cache_control?.ttl ?? null,
       },
-      terminal_durable_global: { chars: 0, estimatedTokens: 0, ttl: "1h" },
-      terminal_durable_audience: { chars: 0, estimatedTokens: 0, ttl: "1h" },
       terminal_turn_context: {
         chars: turnText.length,
         estimatedTokens: estimatePromptTokens(turnText),
-        ttl: "5m",
+        ttl: system[1]?.cache_control?.ttl ?? null,
       },
     },
     totalChars: totalText.length,
@@ -633,17 +643,47 @@ export function buildFinalizerSystemPrompt(options: RunFinalizerOptions): {
       context: options.compactSurface.context,
       baseSystemPromptOptions: options.compactSurface.baseSystemPromptOptions,
       staticHead: buildStaticSystemPrompt(options),
+      toolAvailability: finalizerToolAvailability(options),
       path: options.path,
       additionalPromptSections: stableAdditionalSections,
     });
+    if (dynamicPrompt.regeneration === null) return compact;
+
+    // Keep the fourth marker on the final system block, including regeneration.
+    // Preserve the suffix's exact boundary bytes and include it in tier telemetry.
+    const system = compact.system.map((block, index) =>
+      index === compact.system.length - 1
+        ? { ...block, text: block.text + dynamicPrompt.regeneration }
+        : block,
+    );
+    const fastText = system[system.length - 1]!.text;
+    const totalText = system.map((block) => block.text).join("\n\n");
     return {
-      system: [
-        ...compact.system,
-        ...(dynamicPrompt.regeneration === null
-          ? []
-          : [{ type: "text" as const, text: dynamicPrompt.regeneration }]),
-      ],
-      traceSummary: compact.traceSummary,
+      system,
+      traceSummary: {
+        ...compact.traceSummary,
+        sections: {
+          ...compact.traceSummary.sections,
+          regeneration: {
+            chars: dynamicPrompt.regeneration.length,
+            estimatedTokens: estimatePromptTokens(dynamicPrompt.regeneration),
+            rowCount: 0,
+            truncationCount: 0,
+            omissionCount: 0,
+            cacheTier: "terminal_fast_turn",
+          },
+        },
+        blocks: {
+          ...compact.traceSummary.blocks,
+          terminal_fast_turn: {
+            chars: fastText.length,
+            estimatedTokens: estimatePromptTokens(fastText),
+            ttl: "5m",
+          },
+        },
+        totalChars: totalText.length,
+        totalEstimatedTokens: estimatePromptTokens(totalText),
+      },
     };
   }
 
@@ -1063,11 +1103,13 @@ function emitFinalizerContextTrace(
 export async function runFinalizer(options: RunFinalizerOptions): Promise<FinalizerResult> {
   const toolProvenance =
     options.userEntryId === undefined ? undefined : { user_entry_id: options.userEntryId };
-  const emissionTools = resolveAvailableEmissionTools(options.allowedEmissions, options.turnOrigin);
+  const emissionTools = resolveAvailableEmissionTools(undefined, options.turnOrigin);
+  const enabledEmissionNames = new Set(
+    resolveAvailableEmissionNames(options.allowedEmissions, options.turnOrigin),
+  );
   const nonTerminalTools = resolveFinalizerNonTerminalTools({
     dispatcher: options.dispatcher,
     turnOrigin: options.turnOrigin,
-    outboundToolAvailable: options.outboundToolAvailable,
   });
   const preparedPrompt = prepareFinalizerPrompt(options, nonTerminalTools);
   const renderedSystemPrompt = preparedPrompt.rendered;
@@ -1076,6 +1118,14 @@ export async function runFinalizer(options: RunFinalizerOptions): Promise<Finali
   emitFinalizerContextTrace(options, renderedSystemPrompt.traceSummary);
   const availableTools = [...emissionTools, ...nonTerminalTools];
   const terminalToolNames = emissionTools.map((tool) => tool.name);
+  const unavailableToolNames = availableTools
+    .filter(
+      (tool) =>
+        (terminalToolNames.includes(tool.name) &&
+          !enabledEmissionNames.has(tool.name as EmissionToolName)) ||
+        (tool.name === OUTBOUND_POST_TOOL_NAME && options.outboundToolAvailable !== true),
+    )
+    .map((tool) => tool.name);
   const effectiveThinking =
     options.finalizerAttempt === "regenerate" ? undefined : options.thinking;
   const effectiveEffort = options.finalizerAttempt === "regenerate" ? undefined : options.effort;
@@ -1083,6 +1133,7 @@ export async function runFinalizer(options: RunFinalizerOptions): Promise<Finali
   // an emission tool so a structured emission stays guaranteed (e.g. manual
   // thinking on Opus is omitted by the client, so forcing is correct there).
   const useAutoToolChoice = willSendThinkingUnderAutoToolChoice(options.model, effectiveThinking);
+  const finalizerTransport = options.finalizerTransport ?? "unary";
   let tokenSequence = 0;
 
   let result: ToolLoopResult;
@@ -1102,6 +1153,8 @@ export async function runFinalizer(options: RunFinalizerOptions): Promise<Finali
       sessionAudienceRole: options.sessionAudienceRole,
       provenance: toolProvenance,
       maxTokens: options.maxTokens,
+      // Buffered delivery keeps the finalizer's existing streaming deadline.
+      timeoutMs: LLM_STREAMING_CALL_TIMEOUT_MS,
       ...(effectiveThinking === undefined ? {} : { thinking: effectiveThinking }),
       ...(effectiveEffort === undefined ? {} : { effort: effectiveEffort }),
       // Emission-tool protocol: the answer lives in the terminal tool input, so any
@@ -1121,7 +1174,8 @@ export async function runFinalizer(options: RunFinalizerOptions): Promise<Finali
       turnId: options.turnId,
       traceLabel: `${options.path}_finalizer`,
       terminalToolNames,
-      stream: true,
+      unavailableToolNames,
+      stream: finalizerTransport === "streaming",
       onTextDelta: (chunkText) => {
         tokenSequence += 1;
         emitTurnTokenTrace({
@@ -1183,13 +1237,28 @@ export async function runFinalizer(options: RunFinalizerOptions): Promise<Finali
     result.toolCallsMade.length,
   );
 
-  if (tokenSequence > 0) {
+  const flushText = finalizerFlushText(result, decision);
+  if (finalizerTransport === "unary" && flushText.length > 0) {
+    // Buffered unary calls have no incremental deltas. Preserve the downstream
+    // live-token contract with one complete, accepted terminal-emission chunk;
+    // the authoritative flush immediately follows just as it does for streaming.
+    tokenSequence += 1;
+    emitTurnTokenTrace({
+      tracer: options.tracer,
+      turnId: options.turnId,
+      sessionId: options.sessionId,
+      phase: "final",
+      chunkText: flushText,
+      sequence: tokenSequence,
+    });
+  }
+  if (finalizerTransport === "unary" || tokenSequence > 0) {
     emitTurnTokenFlushTrace({
       tracer: options.tracer,
       turnId: options.turnId,
       sessionId: options.sessionId,
       phase: "final",
-      fullText: finalizerFlushText(result, decision),
+      fullText: flushText,
     });
   }
   emitFinalizerTrace(options, decision);

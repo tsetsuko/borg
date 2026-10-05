@@ -77,14 +77,32 @@ export const autonomyMigrations = [
     },
   },
   {
-    id: 5,
-    name: "autonomy_wakes_prediction_error_spike",
+    id: 4,
+    name: "autonomy_wakes_outcome_detail",
     up: (db) => {
-      // SQLite cannot alter a CHECK in place, so the table is rebuilt to widen both
-      // name CHECKs with prediction_error_spike (M2). Live rows carry across; the
-      // column set reproduces baseline + migrations 2-4 exactly.
+      // The scheduler already formats the failure that ended a wake -- it writes
+      // it into the stream as `autonomous_action.outcome_summary` -- and then
+      // dropped it on the way to this table, so `outcome='error'` was a count
+      // with its own discriminator computed and discarded one line earlier.
+      // Nullable by construction: rows written before this column existed have
+      // no detail and must stay distinguishable from rows whose outcome carries
+      // none, which is why nothing backfills a placeholder here.
       db.exec(`
-        CREATE TABLE autonomy_wakes_new (
+        ALTER TABLE autonomy_wakes
+        ADD COLUMN outcome_detail TEXT;
+      `);
+    },
+  },
+  {
+    id: 5,
+    name: "autonomy_wakes_interrupted_outcome",
+    up: (db) => {
+      // Fork note: this rebuild also carries prediction_error_spike (M2) in both
+      // name CHECKs. The fork first widened them in its own rebuild, which upstream's
+      // rebuild here would otherwise silently narrow again. That earlier migration is
+      // kept at the end of this list under its applied name, as a no-op.
+      db.exec(`
+        CREATE TABLE autonomy_wakes__next (
           id TEXT PRIMARY KEY,
           ts INTEGER NOT NULL,
           trigger_name TEXT NOT NULL CHECK (
@@ -115,39 +133,81 @@ export const autonomyMigrations = [
             source_category IN ('contemplative', 'operational')
           ),
           outcome TEXT CHECK (
-            outcome IS NULL OR outcome IN ('headway', 'silent', 'error', 'busy')
+            outcome IS NULL OR outcome IN ('headway', 'silent', 'error', 'busy', 'interrupted')
           ),
           outcome_detail TEXT
         );
-        INSERT INTO autonomy_wakes_new (
-          id, ts, trigger_name, condition_name, session_id, wake_source_type,
-          source_category, outcome, outcome_detail
+
+        INSERT INTO autonomy_wakes__next (
+          id, ts, trigger_name, condition_name, session_id, wake_source_type, source_category,
+          outcome, outcome_detail
         )
         SELECT
-          id, ts, trigger_name, condition_name, session_id, wake_source_type,
-          source_category, outcome, outcome_detail
+          id, ts, trigger_name, condition_name, session_id, wake_source_type, source_category,
+          outcome, outcome_detail
         FROM autonomy_wakes;
+
         DROP TABLE autonomy_wakes;
-        ALTER TABLE autonomy_wakes_new RENAME TO autonomy_wakes;
-        CREATE INDEX idx_autonomy_wakes_ts ON autonomy_wakes (ts);
+        ALTER TABLE autonomy_wakes__next RENAME TO autonomy_wakes;
+
+        CREATE INDEX idx_autonomy_wakes_ts
+          ON autonomy_wakes (ts);
       `);
     },
   },
   {
-    id: 4,
-    name: "autonomy_wakes_outcome_detail",
+    id: 6,
+    name: "autonomy_wakes_selected_goal",
     up: (db) => {
-      // The scheduler already formats the failure that ended a wake -- it writes
-      // it into the stream as `autonomous_action.outcome_summary` -- and then
-      // dropped it on the way to this table, so `outcome='error'` was a count
-      // with its own discriminator computed and discarded one line earlier.
-      // Nullable by construction: rows written before this column existed have
-      // no detail and must stay distinguishable from rows whose outcome carries
-      // none, which is why nothing backfills a placeholder here.
       db.exec(`
         ALTER TABLE autonomy_wakes
-        ADD COLUMN outcome_detail TEXT;
+        ADD COLUMN selected_goal_id TEXT;
       `);
+    },
+  },
+  {
+    id: 7,
+    name: "autonomy_wakes_headway_bases",
+    up: (db) => {
+      // Nullable with no backfill: older rows have only their legacy display
+      // detail, which cannot be losslessly reconstructed into structural bases.
+      db.exec(`
+        ALTER TABLE autonomy_wakes
+        ADD COLUMN headway_bases_json TEXT;
+      `);
+    },
+  },
+  {
+    id: 8,
+    name: "autonomy_wakes_execution_counts",
+    up: (db) => {
+      // Nullable with no backfill: the trace held these facts for older wakes,
+      // but migrations must not parse trace files or invent zeroes for them.
+      db.exec(`
+        ALTER TABLE autonomy_wakes
+        ADD COLUMN finalizer_rounds INTEGER CHECK (
+          finalizer_rounds IS NULL OR (
+            typeof(finalizer_rounds) = 'integer' AND finalizer_rounds >= 0
+          )
+        );
+
+        ALTER TABLE autonomy_wakes
+        ADD COLUMN stall_retries INTEGER CHECK (
+          stall_retries IS NULL OR (
+            typeof(stall_retries) = 'integer' AND stall_retries >= 0
+          )
+        );
+      `);
+    },
+  },
+  {
+    id: 9,
+    name: "autonomy_wakes_prediction_error_spike",
+    up: () => {
+      // Folded into autonomy_wakes_interrupted_outcome above. Kept under its name
+      // because banks that applied it record it in _migrations, and the runner
+      // refuses an applied migration name it cannot find. On those banks the
+      // runner re-ids the row here by name; on new banks this does nothing.
     },
   },
 ] as const satisfies readonly Migration[];

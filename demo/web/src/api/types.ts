@@ -232,6 +232,12 @@ export type AutonomyWakeRecord = {
   session_label: string | null;
   wake_source_type: "trigger" | "condition";
   source_category: "contemplative" | "operational";
+  selected_goal_id: string | null;
+  outcome: "headway" | "silent" | "error" | "busy" | null;
+  outcome_detail: string | null;
+  headway_bases: string[] | null;
+  finalizer_rounds: number | null;
+  stall_retries: number | null;
 };
 
 export type AutonomyStateResponse = {
@@ -350,7 +356,22 @@ export type IdentityValue = {
   contradiction_count: number;
 };
 
+export type GoalBlocker =
+  | { kind: "goal"; goal_id: string }
+  | { kind: "entity"; entity_id: string }
+  | { kind: "until"; until: number };
+export type GoalBlockRecord = {
+  blocker: GoalBlocker | { kind: "legacy_unknown" };
+  attempt_status: "attempted_unavailable" | "not_recorded";
+  reason: string;
+  blocked_at: number | null;
+  disclosure_label?: DisclosureLabel;
+  unblocked_at: number | null;
+  unblock_reason: string | null;
+  attempt_evidence?: { kind: string; id: string | number };
+};
 export type IdentityGoal = {
+  block_history?: GoalBlockRecord[];
   id: string;
   description: string;
   priority: number;
@@ -359,6 +380,9 @@ export type IdentityGoal = {
   last_progress_ts: number | null;
   created_at: number;
   target_at: number | null;
+  counterparty_entity_id: string | null;
+  disclosure?: string;
+  disclosure_label?: DisclosureLabel;
   children?: IdentityGoal[];
 };
 
@@ -433,7 +457,7 @@ export type IdentityResponse = {
 
 export type GoalPatchBody =
   | { action: "complete"; note?: string }
-  | { action: "block"; note?: string }
+  | { action: "block"; note: string; blocker: GoalBlocker; attempt_status: "attempted_unavailable" }
   | { action: "progress"; note?: string; progress?: number };
 
 export type IdentityValueCreateBody = {
@@ -503,6 +527,8 @@ export type Commitment = {
   revoked_reason: string | null;
   superseded_by_id: string | null;
   last_reinforced_at: number;
+  disclosure?: string;
+  disclosure_label?: DisclosureLabel;
 };
 
 export type CommitmentsResponse = {

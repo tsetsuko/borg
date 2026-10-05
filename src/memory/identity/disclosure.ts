@@ -1,16 +1,18 @@
-import { legacyCommitmentSchema } from "../commitments/index.js";
+import { legacyCommitmentSchema, type CommitmentRecord } from "../commitments/index.js";
 import {
+  isMemoryDisclosureLabelVisibleToAnyAudience,
   memoryDisclosureLabelFromMetadata,
+  unknownMemoryDisclosureLabel,
   type MemoryDisclosureLabel,
 } from "../common/disclosure-label.js";
 import { isEpisodeAccessVisible, type Episode, type EpisodeAccessLike } from "../episodic/index.js";
 import { entityIdHelpers, episodeIdHelpers, type EntityId } from "../../util/ids.js";
 import type { IdentityEvent } from "./types.js";
 
-type CommitmentAccess = {
-  made_to_entity: EntityId | null;
-  restricted_audience: EntityId | null;
-};
+export type CommitmentAccess = Pick<
+  CommitmentRecord,
+  "id" | "made_to_entity" | "restricted_audience" | "source_stream_entry_ids"
+>;
 
 export type IdentityEventValueDisclosureSources = {
   audienceEntityIds: EntityId[];
@@ -234,8 +236,10 @@ function collectIdentityEventValueDisclosureSources(
       result.malformed = true;
     } else {
       result.commitmentAccesses.push({
+        id: parsedCommitment.data.id,
         made_to_entity: parsedCommitment.data.made_to_entity,
         restricted_audience: parsedCommitment.data.restricted_audience,
+        source_stream_entry_ids: parsedCommitment.data.source_stream_entry_ids,
       });
     }
   }
@@ -276,6 +280,19 @@ function collectIdentityEventValueDisclosureSources(
       continue;
     }
     result.disclosureLabels.push(disclosureLabel);
+  }
+
+  if (recordType === "goal" && hasOwnKey(value, "block_history")) {
+    // Historical audit snapshots remain verbatim. An unlabeled block rationale
+    // cannot inherit the enclosing goal's owner when its change is rendered.
+    result.recognized = true;
+    if (!Array.isArray(value.block_history)) {
+      result.malformed = true;
+    } else if (
+      value.block_history.some((block) => !isRecord(block) || !hasOwnKey(block, "disclosure_label"))
+    ) {
+      result.disclosureLabels.push(unknownMemoryDisclosureLabel());
+    }
   }
 
   for (const key of AUDIENCE_ENTITY_ID_KEYS) {
@@ -344,16 +361,10 @@ function isDisclosureLabelVisible(
   label: MemoryDisclosureLabel,
   audienceEntityId: EntityId | null,
 ): boolean {
-  if (label.disclosureClass === "public") {
-    return true;
-  }
-  if (label.disclosureClass === "unknown") {
-    return false;
-  }
-  if (audienceEntityId === null) {
-    return false;
-  }
-  return label.privateToEntityIds.includes(audienceEntityId);
+  return isMemoryDisclosureLabelVisibleToAnyAudience(
+    label,
+    audienceEntityId === null ? [] : [audienceEntityId],
+  );
 }
 
 function isIdentityEventValueVisible(

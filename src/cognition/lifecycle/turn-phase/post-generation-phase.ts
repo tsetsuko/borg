@@ -29,7 +29,7 @@ import type { ActivityEventStatus } from "../../../memory/activity/index.js";
 import { CognitionError } from "../../../util/errors.js";
 import type { SharedStateEntry } from "../../../memory/shared-state/index.js";
 import type { OutboundDeliveryReceipt, OutboundDeliveryResult } from "../../../outbound/types.js";
-import type { SessionSourceType } from "../../../sessions/index.js";
+import type { SessionAudienceRole, SessionSourceType } from "../../../sessions/index.js";
 import {
   ACTION_ARCHIVE_ACTIVE_STATES,
   ACTION_ARCHIVE_SCAN_LIMIT,
@@ -83,6 +83,7 @@ type ActionArchiveScanResult = {
 type PersistedMessageEmission = {
   entry: StreamEntry;
   outboundDelivery?: OutboundDeliveryReceipt;
+  journalEntryId?: number;
 };
 
 function currentTurnSharedStateEntries(input: {
@@ -159,6 +160,17 @@ async function persistMessageEmission(input: {
     ...(input.turnInput.audience === undefined ? {} : { audience: input.turnInput.audience }),
   };
 
+  // This branch is the only call to `OutboundDelivery.deliver` in the system, and its condition is
+  // `origin === "directed_outbound"`. So transport is a property of how the turn was started, not
+  // of the session or its connector: a self-initiated post goes through the connector and can throw
+  // a `transport_failed` sibling, while an ordinary reply -- same session, same source_type, same
+  // wired connector -- falls to the bare append below and never touches the connector at all. Its
+  // content leaves as the response to whoever called the turn.
+  //
+  // The consequence for anything reading the stream afterwards: an `agent_msg` with no
+  // `outbound_delivery.*` sibling means "delivered" only on the directed-outbound path. On every
+  // other origin the same absence means the question was never asked, so stream presence cannot be
+  // read as evidence that a connector accepted anything.
   if (
     isDirectedOutboundTurnOrigin(input.turnInput.origin) &&
     input.options.outboundDelivery !== undefined
@@ -228,7 +240,10 @@ async function persistContinueThoughtEmission(input: {
     audience: input.turnInput.audience,
   });
 
-  return { entry };
+  return {
+    entry,
+    journalEntryId: stored.id,
+  };
 }
 
 function advanceChatResponseWatermark(input: {
@@ -236,7 +251,7 @@ function advanceChatResponseWatermark(input: {
   sessionId: SessionId;
   responseTo?: StreamResponseTo;
 }): void {
-  if (input.responseTo === undefined) {
+  if (input.responseTo?.kind !== "stream_backlog") {
     return;
   }
 
@@ -487,6 +502,7 @@ export async function runPostGenerationPhase(input: {
   llmClient: LLMClient;
   sessionId: SessionId;
   sessionSourceType: SessionSourceType | null;
+  sessionAudienceRole: SessionAudienceRole;
   turnId: string;
   turnInput: TurnPhaseInput;
   streamWriter: StreamWriter;
@@ -540,6 +556,7 @@ export async function runPostGenerationPhase(input: {
     turnId: input.turnId,
     sessionId: input.sessionId,
     sessionSourceType: input.sessionSourceType,
+    sessionAudienceRole: input.sessionAudienceRole,
     deliberation: input.deliberation,
     workingMemory,
     userMessage: input.turnInput.userMessage,
@@ -626,6 +643,18 @@ export async function runPostGenerationPhase(input: {
   });
   const activityRepository = input.options.activityRepository;
 
+  // This gate reads the delivery outcome to withhold: a directed-outbound post that failed or found
+  // no connector records no activity event, while every other origin (`outboundDelivery ===
+  // undefined`) always records one. Success itself appends no stream event, so the activity row --
+  // not the stream -- is where the difference between a carried post and a refused one survives,
+  // and it survives as an absence.
+  //
+  // It is not the only reader of that outcome downstream of `deliver`, and it is the only one that
+  // withholds. The tool that started this turn writes an action record from the same outcome either
+  // way, and the autonomy scheduler reads it again to decide whether the posting wake is recorded
+  // as headway or as silence. An earlier version of this comment asserted uniqueness, and the
+  // prompt line derived from it repeated the claim to the entity; both went stale the moment a
+  // reader was added elsewhere. Count readers at the call sites, not from here.
   const shouldRecordActivity =
     persistedEmission.outboundDelivery === undefined ||
     persistedEmission.outboundDelivery.status === "transported";
@@ -807,7 +836,7 @@ export async function runPostGenerationPhase(input: {
     });
   }
 
-  await traceTurnPhase({
+  const reflection = await traceTurnPhase({
     tracer: input.options.tracer,
     clock: input.options.clock,
     turnId: input.turnId,
@@ -841,8 +870,11 @@ export async function runPostGenerationPhase(input: {
         suppressionSet: input.suppressionSet,
         persistedUserEntryId: input.persistedUserEntryId,
         sourceUserEntryIds: input.sourceUserEntryIds,
+        sourceUserEntries: input.sourceUserEntries,
         persistedPerceptionEntry: input.persistedPerceptionEntry,
         persistedAgentEntry,
+        currentTurnJournalEntryIds:
+          persistedEmission.journalEntryId === undefined ? [] : [persistedEmission.journalEntryId],
         isUserTurn: input.isUserTurn,
         frameAnomaly: input.currentTurnFrameAnomaly,
         streamWriter: input.streamWriter,
@@ -917,6 +949,7 @@ export async function runPostGenerationPhase(input: {
     referencedEpisodeIds: [...(deliberation.referencedEpisodeIds ?? [])],
     intents: actionResult.intents,
     toolCalls: [...actionResult.tool_calls],
+    reflectionRetiredGoalIds: [...(reflection?.effects.retiredGoalIds ?? [])],
     ...(actionEmission.kind === "message" ? { agentMessageId: persistedAgentEntry.id } : {}),
     ...(persistedEmission.outboundDelivery === undefined
       ? {}
@@ -1361,6 +1394,7 @@ export async function finalizeAssessedTurn(input: {
   turnId: string;
   sessionId: SessionId;
   turnInput: TurnPhaseInput;
+  sourceUserEntries: readonly StreamEntry[];
   isUserTurn: boolean;
   perception: PerceptionResult;
   workingMood: AffectiveSignal;
@@ -1373,6 +1407,7 @@ export async function finalizeAssessedTurn(input: {
   const { moodSnapshot } = await input.options.turnReflectionCoordinator.recordReception({
     sessionId: input.sessionId,
     userMessage: input.turnInput.userMessage,
+    sourceUserEntries: input.sourceUserEntries,
     perception: input.perception,
     workingMood: input.workingMood,
     isUserTurn: input.isUserTurn,

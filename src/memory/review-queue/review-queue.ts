@@ -1,3 +1,4 @@
+import type { SerializedEmbeddingPreparer } from "../../embeddings/serialized.js";
 import { z } from "zod";
 
 import { NOOP_TRACER, type TurnTracer } from "../../tracing/tracer.js";
@@ -119,6 +120,7 @@ export type ReviewResolveOptions = {
 };
 
 export type ReviewQueueRepositoryOptions = {
+  prepareSerializedEmbeddings?: SerializedEmbeddingPreparer;
   db: SqliteDatabase;
   clock?: Clock;
   episodicRepository?: EpisodicRepository;
@@ -254,9 +256,7 @@ const REVIEW_RESOLVER_REF_PREFIX = "__borg_review_resolver_";
 // from a refs record so the strict per-kind refs schemas can parse it. Used
 // by handler resolution here and by the resolver itself when it re-judges a
 // previously stamped item in autonomous mode.
-export function stripReviewResolverRefs(
-  refs: Record<string, unknown>,
-): Record<string, unknown> {
+export function stripReviewResolverRefs(refs: Record<string, unknown>): Record<string, unknown> {
   const next = { ...refs };
 
   for (const key of Object.keys(next)) {
@@ -351,7 +351,7 @@ export function commitmentReconciliationReviewDisclosureLabel(
     (member) => member.disclosure_label ?? unknownMemoryDisclosureLabel(),
   );
   const labels =
-    refs.disclosure_label === undefined ? memberLabels : [...memberLabels, refs.disclosure_label];
+    refs.disclosure_label === undefined ? memberLabels : [refs.disclosure_label, ...memberLabels];
 
   return combineMemoryDisclosureLabels(labels);
 }
@@ -526,6 +526,32 @@ export class ReviewQueueRepository {
 
   enqueue(input: ReviewQueueInsertInput): ReviewQueueItem {
     const parsed = reviewKindSchema.parse(input.kind);
+
+    // Fail fast at the producer. Refs were otherwise validated only at RESOLVE
+    // time, so an unresolvable item entered the queue and threw on every accept
+    // attempt with nothing counting the failures (observed twice in ai-prod: an
+    // edge-closure suggested_valid_to below the edge's valid_from, and an
+    // overseer patch whose keys no target accepts). Kinds without a registered
+    // handler keep enqueueing freely -- there is no schema to hold them to.
+    const handler = this.handlers.get(parsed);
+
+    if (handler !== null) {
+      const refsResult = handler.refsSchema.safeParse(
+        this.refsForHandlerParsing(input.refs, this.handlerApplyingStateKey(handler)),
+      );
+
+      if (!refsResult.success) {
+        throw new SemanticError(
+          `Review refs for kind "${parsed}" would be unresolvable: ${
+            refsResult.error.issues[0]?.message ?? "invalid refs"
+          }`,
+          {
+            code: "REVIEW_QUEUE_REFS_INVALID",
+            cause: { kind: parsed, issues: refsResult.error.issues },
+          },
+        );
+      }
+    }
 
     const timestamp = this.clock.now();
     const result = this.db
@@ -1211,6 +1237,49 @@ export class ReviewQueueRepository {
       );
     }
 
+    if (
+      this.options.prepareSerializedEmbeddings &&
+      !["dismiss", "reject"].includes(resolution.decision)
+    ) {
+      const refreshedRefs = z
+        .record(z.string(), z.unknown())
+        .parse(await this.options.prepareSerializedEmbeddings(item.refs));
+
+      // Save the refreshed vectors to the row BEFORE any handler path runs.
+      // Every later write compares the stored refs against `item.refs` as an
+      // optimistic-concurrency check; handing those paths refreshed refs while
+      // the row still held the old vectors made the check fail on every accept
+      // of an embedding-bearing kind (prod 2026-09-11: new_insight, misreported
+      // as "resolution lost applying-state race"). Persisting first keeps the
+      // row and `item.refs` in agreement, so the check means what it says.
+      const result = this.db
+        .prepare(
+          `
+            UPDATE review_queue
+            SET refs = ?
+            WHERE id = ? AND resolved_at IS NULL AND refs = ?
+          `,
+        )
+        .run(serializeJsonValue(refreshedRefs), item.id, serializeJsonValue(item.refs));
+
+      if (result.changes !== 1) {
+        const current = this.get(item.id);
+
+        if (current !== null && current.resolved_at !== null) {
+          throw new SemanticError(`Review item ${item.id} was already resolved`, {
+            code: "REVIEW_QUEUE_ALREADY_RESOLVED",
+            cause: { itemId: item.id, resolution: current.resolution },
+          });
+        }
+
+        throw new SemanticError(`Review item ${item.id} refs changed before its vectors could be refreshed`, {
+          code: "REVIEW_QUEUE_RESOLUTION_RACE",
+          cause: { itemId: item.id },
+        });
+      }
+
+      item = { ...item, refs: refreshedRefs };
+    }
     const refs = this.parseHandlerRefs(handler, item);
     const scope = handler.transactionScope({
       item,

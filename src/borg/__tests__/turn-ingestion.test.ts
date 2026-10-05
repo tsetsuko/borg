@@ -219,6 +219,9 @@ describe("Borg", () => {
         refs: {
           target_type: "episode",
           target_id: "ep_aaaaaaaaaaaaaaaa",
+          // enqueue() now refuses refs the handler could not resolve; the hook
+          // drain under test needs a well-formed item, not a malformed one.
+          patch: { participants: ["Alice"] },
         },
         reason: "La memoria mezcla dos atribuciones.",
       });
@@ -233,6 +236,8 @@ describe("Borg", () => {
         dataDir: tempDir,
         clock,
         embeddingDimensions: 4,
+        // Preserve the effective injected model used by the initial open.
+        embeddingProfile: { model: "fake-embed", dimensions: 4 },
         embeddingClient: new ScriptedEmbeddingClient(),
         llmClient: new FakeLLMClient(),
       });

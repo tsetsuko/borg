@@ -1,5 +1,9 @@
+import { similarityThresholds } from "../config/similarity.js";
+import { refreshSerializedEmbeddings } from "../embeddings/serialized.js";
+import { parseSemanticNodeId } from "../util/ids.js";
 // Builds Borg's repository graph and the cross-repository services that sit on top of it.
 
+import { OperatorAttentionRepository } from "../memory/operator-attention/index.js";
 import { AutonomyWakesRepository, ScheduledWakesRepository } from "../autonomy/index.js";
 import type { AttachmentRepository } from "../attachments/index.js";
 import { ImagePerceptionRepository } from "../attachments/index.js";
@@ -9,6 +13,7 @@ import type { EmbeddingClient } from "../embeddings/index.js";
 import { ExecutiveStepsRepository } from "../executive/index.js";
 import type { LLMClient } from "../llm/index.js";
 import { MoodRepository } from "../memory/affective/index.js";
+import { SourceStreamAudienceDisclosureResolver } from "../memory/common/index.js";
 import {
   ActivityRepository,
   LivedExperienceDaySummaryRepository,
@@ -85,6 +90,7 @@ import {
 export type BorgRepositorySetup = Pick<
   BorgDependencies,
   | "entryIndex"
+  | "sourceStreamAudienceDisclosureResolver"
   | "episodicRepository"
   | "semanticNodeRepository"
   | "semanticEdgeRepository"
@@ -108,6 +114,7 @@ export type BorgRepositorySetup = Pick<
   | "commitmentRepository"
   | "creatorDirectiveRepository"
   | "sharedStateRepository"
+  | "operatorAttentionRepository"
   | "activityRepository"
   | "livedExperienceDaySummaryRepository"
   | "selfDecisionRepository"
@@ -135,6 +142,7 @@ export type BorgRepositorySetup = Pick<
 };
 
 export type BuildBorgRepositoriesOptions = {
+  pendingStartupTasks?: Promise<unknown>[];
   config: Config;
   sqlite: SqliteDatabase;
   episodesTable: LanceDbTable;
@@ -157,10 +165,15 @@ export async function buildBorgRepositories(
   options: BuildBorgRepositoriesOptions,
 ): Promise<BorgRepositorySetup> {
   const { config, sqlite, clock, embeddingClient } = options;
+  const operatorAttentionRepository = new OperatorAttentionRepository({ db: sqlite });
   const autonomyWakesRepository = new AutonomyWakesRepository({
     db: sqlite,
     clock,
   });
+  // Borg permits only one writer per data directory. At composition time, a
+  // NULL wake older than the repository grace window therefore cannot belong
+  // to another live process and is safe to reconcile as interrupted.
+  autonomyWakesRepository.interruptOrphanedWakesAtStartup();
   const scheduledWakesRepository = new ScheduledWakesRepository({
     db: sqlite,
     clock,
@@ -206,7 +219,10 @@ export async function buildBorgRepositories(
       clock,
       entryIndex,
       repairSession: repairSessionStreamEntryIndex,
-      onAppend: options.onStreamAppend,
+      onAppend: (entries) => {
+        goalsRepository.reconcileBlocks();
+        options.onStreamAppend?.(entries);
+      },
     });
   const createNonNotifyingStreamWriter = (sessionId: Parameters<BorgStreamWriterFactory>[0]) =>
     new StreamWriter({
@@ -215,6 +231,7 @@ export async function buildBorgRepositories(
       clock,
       entryIndex,
       repairSession: repairSessionStreamEntryIndex,
+      onAppend: () => goalsRepository.reconcileBlocks(),
     });
   const createDefaultStreamWriter = () => createStreamWriter(DEFAULT_SESSION_ID);
   let reviewQueueRepository: ReviewQueueRepository | undefined;
@@ -224,9 +241,9 @@ export async function buildBorgRepositories(
     table: options.openQuestionsTable,
     embeddingClient,
     clock,
-    onEmbeddingFailure: (error, details) => {
+    onEmbeddingFailure: async (error, details) => {
       const writer = createDefaultStreamWriter();
-      void appendInternalFailureEvent(writer, "open_question_embedding", error, {
+      await appendInternalFailureEvent(writer, "open_question_embedding", error, {
         operation: details.operation,
         questionId: details.questionId,
       }).finally(() => {
@@ -234,14 +251,17 @@ export async function buildBorgRepositories(
       });
     },
   });
-  void openQuestionsRepository.backfillMissingEmbeddings().catch((error) => {
-    const writer = createDefaultStreamWriter();
-    void appendInternalFailureEvent(writer, "open_question_embedding_backfill", error).finally(
-      () => {
-        writer.close();
-      },
-    );
-  });
+  const questionBackfill = openQuestionsRepository
+    .backfillMissingEmbeddings()
+    .catch(async (error) => {
+      const writer = createDefaultStreamWriter();
+      await appendInternalFailureEvent(writer, "open_question_embedding_backfill", error).finally(
+        () => {
+          writer.close();
+        },
+      );
+    });
+  options.pendingStartupTasks?.push(questionBackfill);
   const executiveStepsRepository = new ExecutiveStepsRepository({
     db: sqlite,
     clock,
@@ -262,6 +282,7 @@ export async function buildBorgRepositories(
     clock,
   });
   const semanticReviewService = new SemanticReviewService({
+    similarityConfig: config,
     nodeRepository: semanticNodeRepository,
     enqueueReview,
     llmClient: options.llmClient,
@@ -297,10 +318,12 @@ export async function buildBorgRepositories(
   });
   const goalsRepository = new GoalsRepository({
     db: sqlite,
+    dataDir: config.dataDir,
     clock,
     identityEventRepository,
     executiveStepsRepository,
   });
+  goalsRepository.reconcileBlocks();
   const traitsRepository = new TraitsRepository({
     db: sqlite,
     clock,
@@ -327,6 +350,12 @@ export async function buildBorgRepositories(
     db: sqlite,
     clock,
     identityEventRepository,
+  });
+  const sourceStreamAudienceDisclosureResolver = new SourceStreamAudienceDisclosureResolver({
+    dataDir: config.dataDir,
+    entryIndex,
+    sessionsRepository,
+    entityRepository,
   });
   const creatorDirectiveRepository = new CreatorDirectiveRepository({
     db: sqlite,
@@ -361,9 +390,9 @@ export async function buildBorgRepositories(
     table: options.observedEventsTable,
     embeddingClient,
     clock,
-    onEmbeddingFailure: (error, details) => {
+    onEmbeddingFailure: async (error, details) => {
       const writer = createDefaultStreamWriter();
-      void appendInternalFailureEvent(writer, "observed_event_embedding", error, {
+      await appendInternalFailureEvent(writer, "observed_event_embedding", error, {
         operation: details.operation,
         eventId: details.eventId,
       }).finally(() => {
@@ -378,7 +407,7 @@ export async function buildBorgRepositories(
       recall_consistency: "topic_recall_eventual_until_complete",
     });
   }
-  void observedEventRepository
+  const eventBackfill = observedEventRepository
     .backfillMissingEmbeddings()
     .then((report) => {
       if (options.tracer?.enabled === true) {
@@ -392,7 +421,7 @@ export async function buildBorgRepositories(
         });
       }
     })
-    .catch((error) => {
+    .catch(async (error) => {
       if (options.tracer?.enabled === true) {
         options.tracer.emit("observed_event_embedding_backfill.failed", {
           turnId: "startup",
@@ -403,12 +432,13 @@ export async function buildBorgRepositories(
         });
       }
       const writer = createDefaultStreamWriter();
-      void appendInternalFailureEvent(writer, "observed_event_embedding_backfill", error).finally(
+      await appendInternalFailureEvent(writer, "observed_event_embedding_backfill", error).finally(
         () => {
           writer.close();
         },
       );
     });
+  options.pendingStartupTasks?.push(eventBackfill);
   const identityService = new IdentityService({
     valuesRepository,
     goalsRepository,
@@ -453,6 +483,10 @@ export async function buildBorgRepositories(
     }),
   );
   const createdReviewQueueRepository = new ReviewQueueRepository({
+    prepareSerializedEmbeddings: (payload) =>
+      refreshSerializedEmbeddings(payload, embeddingClient, (id) =>
+        semanticNodeRepository.get(parseSemanticNodeId(id)),
+      ),
     db: sqlite,
     clock,
     handlers: reviewHandlers,
@@ -469,7 +503,9 @@ export async function buildBorgRepositories(
     tracer: options.tracer,
     onEnqueue: (item) =>
       enqueueOpenQuestionForReview(identityService, item, {
+        minSimilarity: similarityThresholds(config).openQuestionDuplicateBackstop,
         extractor: reviewOpenQuestionExtractor,
+        openQuestionsRepository,
       }),
     onEnqueueError: (error) => {
       const writer = createDefaultStreamWriter();
@@ -517,18 +553,23 @@ export async function buildBorgRepositories(
     clock,
   });
   const skillSelector = new SkillSelector({
+    similarityConfig: config,
     repository: skillRepository,
     contextStatsRepository: proceduralContextStatsRepository,
-    minSimilarity: config.procedural.skillSelectionMinSimilarity,
   });
   const recallStateRepository = new RecallStateRepository({
     db: sqlite,
     clock,
   });
   const retrievalPipeline = new RetrievalPipeline({
+    similarityConfig: config,
     embeddingClient,
     llmClient: options.llmClient,
     recallExpansionModel: config.anthropic.models.recallExpansion,
+    recallExpansionTimeoutMs: config.retrieval.recallExpansionTimeoutMs,
+    recallPlannerTimeZone: config.retrieval.recallPlannerTimeZone,
+    plannerCueTimeWeight: config.retrieval.attentionWeights.time,
+    recallExpansionSemanticVariantCount: config.retrieval.recallExpansionSemanticVariantCount,
     episodicRepository,
     semanticNodeRepository,
     semanticEdgeRepository,
@@ -540,6 +581,7 @@ export async function buildBorgRepositories(
     recallStateRepository,
     dataDir: config.dataDir,
     entryIndex,
+    sourceStreamAudienceDisclosureResolver,
     clock,
     tracer: options.tracer,
     semanticUnderReviewMultiplier: config.retrieval.semantic.underReviewMultiplier,
@@ -565,12 +607,14 @@ export async function buildBorgRepositories(
     socialRepository,
     entityRepository,
     commitmentRepository,
+    sourceStreamAudienceDisclosureResolver,
     reviewQueueRepository: createdReviewQueueRepository,
     identityService,
     identityEventRepository,
   });
   applyCorrectionReview = (item) => correctionService.applyCorrectionReview(item);
   const workingMemoryStore = new WorkingMemoryStore({
+    similarityConfig: config,
     dataDir: config.dataDir,
     clock,
   });
@@ -588,6 +632,7 @@ export async function buildBorgRepositories(
   }
   return {
     entryIndex,
+    sourceStreamAudienceDisclosureResolver,
     episodicRepository,
     semanticNodeRepository,
     semanticEdgeRepository,
@@ -611,6 +656,7 @@ export async function buildBorgRepositories(
     commitmentRepository,
     creatorDirectiveRepository,
     sharedStateRepository,
+    operatorAttentionRepository,
     activityRepository,
     livedExperienceDaySummaryRepository,
     selfDecisionRepository,

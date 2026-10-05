@@ -5,6 +5,7 @@ import {
   SemanticExtractor,
   createUserStreamEntryRelationshipEvidenceTrustValidator,
 } from "../memory/semantic/index.js";
+import { AutobiographicalRecallService } from "../cognition/autobiographical-recall.js";
 import { buildParticipantRosterFromRepositories } from "../cognition/perception/index.js";
 import { resolveEpisodeSourceParticipants } from "../cognition/participants.js";
 import {
@@ -22,14 +23,20 @@ import {
   PROMPT_SURFACES,
   promptSurfaceBlocksForSurface,
 } from "../cognition/prompts/prompt-surface-registry.js";
-import type { BorgPromptBlockView, BorgPromptsFacade } from "./facade-types.js";
+import type {
+  BorgCommitmentWithDisclosure,
+  BorgGoalTreeWithDisclosure,
+  BorgGoalWithDisclosure,
+  BorgPromptBlockView,
+  BorgPromptsFacade,
+} from "./facade-types.js";
 import {
   OFFLINE_PROCESS_NAMES,
   revalidateReviewQueue,
   runStorageOptimization,
 } from "../offline/index.js";
 import type { MaintenancePlan, OfflineProcessName, OrchestratorResult } from "../offline/index.js";
-import type { DisclosureRetrievalOptions } from "../retrieval/index.js";
+import type { DisclosureRetrievalOptions, RetrievalSharedOptions } from "../retrieval/pipeline.js";
 import {
   mapWithDisclosureConcurrency,
   memoryDisclosureLabelForEpisodeIds,
@@ -37,13 +44,14 @@ import {
   resolveMemoryDisclosureLabelsByEpisodeId,
   type MemoryDisclosureLabel,
 } from "../retrieval/index.js";
-import { StreamReader } from "../stream/index.js";
-import { AttachmentError, StorageError } from "../util/errors.js";
+import { hydrateStreamEntriesById, StreamReader } from "../stream/index.js";
+import { AttachmentError, CognitionError, StorageError } from "../util/errors.js";
 import {
   DEFAULT_SESSION_ID,
   createSemanticNodeId,
   type EntityId,
   type ImagePerceptionId,
+  type StreamEntryId,
 } from "../util/ids.js";
 import type { BorgFacades } from "./facade-types.js";
 import type {
@@ -58,6 +66,17 @@ import type {
   BorgDreamRunner,
   BorgEpisodeSearchOptions,
 } from "./types.js";
+import {
+  commitmentMemoryDisclosureLabel,
+  goalMemoryDisclosureLabel,
+  memoryDisclosurePayloadFields,
+} from "../memory/common/disclosure-serializers.js";
+import type { CommitmentRecord } from "../memory/commitments/index.js";
+import type { GoalRecord, GoalTreeNode } from "../memory/self/index.js";
+import type { IdentityUpdateResult } from "../memory/identity/index.js";
+import { reconcileInboxReplyActivity } from "../cognition/ingestion/index.js";
+import { rankActivityByRelevance } from "../memory/activity/projection.js";
+import { TenantFactRememberer } from "../memory/episodic/remember.js";
 
 function errorCode(error: unknown): unknown {
   return error !== null && typeof error === "object" && "code" in error
@@ -73,6 +92,67 @@ function isCommittedStreamIndexUpdateFailure(error: unknown): boolean {
 
 function describeCaughtError(error: unknown): string {
   return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+
+function commitmentWithDisclosure(
+  deps: BorgDependencies,
+  commitment: CommitmentRecord,
+): BorgCommitmentWithDisclosure {
+  const resolved =
+    deps.sourceStreamAudienceDisclosureResolver.resolve({ commitments: [commitment] })
+      .commitments[0] ?? commitment;
+
+  return {
+    ...resolved,
+    ...memoryDisclosurePayloadFields(commitmentMemoryDisclosureLabel(resolved)),
+  };
+}
+
+function commitmentsWithDisclosure(
+  deps: BorgDependencies,
+  commitments: readonly CommitmentRecord[],
+): BorgCommitmentWithDisclosure[] {
+  const resolved = deps.sourceStreamAudienceDisclosureResolver.resolve({ commitments }).commitments;
+
+  return resolved.map((commitment) => ({
+    ...commitment,
+    ...memoryDisclosurePayloadFields(commitmentMemoryDisclosureLabel(commitment)),
+  }));
+}
+
+function goalWithDisclosure(deps: BorgDependencies, goal: GoalRecord): BorgGoalWithDisclosure {
+  const resolved =
+    deps.sourceStreamAudienceDisclosureResolver.resolve({ goals: [goal] }).goals[0] ?? goal;
+
+  return {
+    ...resolved,
+    ...memoryDisclosurePayloadFields(goalMemoryDisclosureLabel(resolved)),
+  };
+}
+
+function goalTreesWithDisclosure(
+  deps: BorgDependencies,
+  goals: readonly GoalTreeNode[],
+): BorgGoalTreeWithDisclosure[] {
+  const resolved = deps.sourceStreamAudienceDisclosureResolver.resolve({
+    goalTrees: goals,
+  }).goalTrees;
+  const decorate = (goal: (typeof resolved)[number]): BorgGoalTreeWithDisclosure => ({
+    ...goal,
+    ...memoryDisclosurePayloadFields(goalMemoryDisclosureLabel(goal)),
+    children: goal.children.map(decorate),
+  });
+
+  return resolved.map(decorate);
+}
+
+function identityResultWithDisclosure<TSource, TResult>(
+  result: IdentityUpdateResult<TSource>,
+  decorate: (record: TSource) => TResult,
+): IdentityUpdateResult<TResult> {
+  return result.status === "applied"
+    ? { status: "applied", record: decorate(result.record) }
+    : { status: "requires_review", current: decorate(result.current) };
 }
 
 function participationPolicyRollbackFailedError(
@@ -142,6 +222,104 @@ async function countPendingSemanticExtractionEpisodes(
 }
 
 type CreatorDirectivesFacadeDeps = Pick<BorgDependencies, "creatorDirectiveRepository">;
+
+export function createActivityFacade(
+  deps: Pick<BorgDependencies, "sqlite" | "activityRepository" | "sessionsRepository"> &
+    Partial<Pick<BorgDependencies, "embeddingClient" | "config">>,
+): BorgFacades["activity"] {
+  type ObservedTurnInput = Parameters<BorgFacades["activity"]["projectObservedTurn"]>[0];
+  type RepliedTurnInput = Parameters<BorgFacades["activity"]["projectRepliedTurn"]>[0];
+  type CompletedTurnInput = Parameters<BorgFacades["activity"]["projectCompletedTurn"]>[0];
+
+  const projectTurn = (input: ObservedTurnInput | RepliedTurnInput | CompletedTurnInput) => {
+    const project = deps.sqlite.transaction(() => {
+      const userContactAlreadyStored =
+        !("userContact" in input) ||
+        deps.activityRepository.getByKindAndSource(
+          input.userContact.kind,
+          input.userContact.sourceStreamEntryIds,
+        ) !== null;
+      const borgReplyAlreadyStored =
+        !("borgReplied" in input) ||
+        deps.activityRepository.getByKindAndSource(
+          input.borgReplied.kind,
+          input.borgReplied.sourceStreamEntryIds,
+        ) !== null;
+      const session = deps.sessionsRepository.ensure(input.session);
+      const userContact =
+        "userContact" in input ? deps.activityRepository.record(input.userContact) : undefined;
+      const borgReplied =
+        "borgReplied" in input ? deps.activityRepository.record(input.borgReplied) : undefined;
+      const touchedSession =
+        userContactAlreadyStored && borgReplyAlreadyStored
+          ? session
+          : deps.sessionsRepository.touch(input.session.session_id, input.touch);
+
+      if (touchedSession === null) {
+        throw new StorageError(`Session ${input.session.session_id} was not stored`, {
+          code: "SESSION_TURN_PROJECTION_FAILED",
+        });
+      }
+
+      return { userContact, borgReplied, session: touchedSession };
+    });
+
+    return project.immediate();
+  };
+
+  return {
+    record: (...args) => deps.activityRepository.record(...args),
+    projectObservedTurn: (input) => {
+      const projected = projectTurn(input);
+
+      if (projected.userContact === undefined) {
+        throw new StorageError("Observed turn projection did not store the user contact", {
+          code: "SESSION_TURN_PROJECTION_FAILED",
+        });
+      }
+
+      return { ...projected, userContact: projected.userContact };
+    },
+    projectRepliedTurn: (input) => {
+      const projected = projectTurn(input);
+
+      if (projected.borgReplied === undefined) {
+        throw new StorageError("Replied turn projection did not store the Borg reply", {
+          code: "SESSION_TURN_PROJECTION_FAILED",
+        });
+      }
+
+      return { ...projected, borgReplied: projected.borgReplied };
+    },
+    projectCompletedTurn: (input) => {
+      const projected = projectTurn(input);
+
+      if (projected.userContact === undefined || projected.borgReplied === undefined) {
+        throw new StorageError("Completed turn projection did not store both activity events", {
+          code: "SESSION_TURN_PROJECTION_FAILED",
+        });
+      }
+
+      return {
+        ...projected,
+        userContact: projected.userContact,
+        borgReplied: projected.borgReplied,
+      };
+    },
+    listObservedGroupAudienceEntityIdsForSpeaker: (...args) =>
+      deps.activityRepository.listObservedGroupAudienceEntityIdsForSpeaker(...args),
+    listRecentOtherActiveSessionEvents: (...args) =>
+      deps.activityRepository.listRecentOtherActiveSessionEvents(...args),
+    rankByRelevance: async (input) => {
+      if (deps.embeddingClient === undefined) {
+        throw new StorageError("Activity ranking requires an embedding client", {
+          code: "ACTIVITY_RANKING_UNAVAILABLE",
+        });
+      }
+      return rankActivityByRelevance(input, deps.embeddingClient, deps.config);
+    },
+  };
+}
 
 export function createCreatorDirectivesFacade(
   deps: CreatorDirectivesFacadeDeps,
@@ -286,6 +464,22 @@ async function semanticWalkStepsWithDisclosure(
 }
 
 export function createBorgFacades(deps: BorgDependencies): BorgFacades {
+  // Built lazily: partial dependency sets (tests, facades that never remember)
+  // must not require config or storage at construction time.
+  let tenantFactRememberer: TenantFactRememberer | undefined;
+  const getTenantFactRememberer = (): TenantFactRememberer =>
+    (tenantFactRememberer ??= new TenantFactRememberer({
+      dataDir: deps.config.dataDir,
+      entryIndex: deps.entryIndex,
+      episodicRepository: deps.episodicRepository,
+      entityRepository: deps.entityRepository,
+      createStreamWriter: deps.createStreamWriter,
+      embeddingClient: deps.embeddingClient,
+      llmFactory: deps.llmFactory,
+      model: deps.config.anthropic.models.extraction,
+      timeZone: deps.config.retrieval.recallPlannerTimeZone,
+      clock: deps.clock,
+    }));
   const resolveEpisodeAudienceEntityId = (
     options:
       | {
@@ -312,7 +506,7 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
   };
 
   const resolveEpisodeAudienceTerms = (
-    options: BorgEpisodeSearchOptions | undefined,
+    options: Pick<BorgEpisodeSearchOptions, "audience" | "audienceTerms"> | undefined,
     audienceEntityId: EntityId | null | undefined,
   ): readonly string[] | undefined => {
     if (options?.audienceTerms !== undefined) {
@@ -336,10 +530,10 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
     ];
   };
 
-  const resolveEpisodeSearchOptions = (
-    options: BorgEpisodeSearchOptions | undefined,
-  ): DisclosureRetrievalOptions => {
-    const audienceEntityId = resolveEpisodeAudienceEntityId(options);
+  const resolveEpisodeRankingOptions = (
+    options: (RetrievalSharedOptions & { audience?: string | null }) | undefined,
+    audienceEntityId: EntityId | null | undefined,
+  ): RetrievalSharedOptions => {
     const audienceProfile =
       options?.audienceProfile !== undefined
         ? options.audienceProfile
@@ -354,7 +548,6 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
 
     return {
       ...options,
-      audienceEntityId,
       audienceProfile,
       audienceTerms,
       strictTimeRange: options?.strictTimeRange ?? options?.timeRange !== undefined,
@@ -390,6 +583,17 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
               heat: configuredAttentionWeights.heat,
               suppression_penalty: configuredAttentionWeights.suppression_penalty,
             }),
+    };
+  };
+
+  const resolveEpisodeSearchOptions = (
+    options: BorgEpisodeSearchOptions | undefined,
+  ): DisclosureRetrievalOptions => {
+    const audienceEntityId = resolveEpisodeAudienceEntityId(options);
+    return {
+      ...options,
+      ...resolveEpisodeRankingOptions(options, audienceEntityId),
+      audienceEntityId,
     };
   };
 
@@ -511,11 +715,31 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
           sessionId: options.session ?? DEFAULT_SESSION_ID,
           entryIndex: deps.entryIndex,
         }),
+      hydrateIndexed: (streamEntryIds: readonly StreamEntryId[], options = {}) =>
+        hydrateStreamEntriesById({
+          dataDir: deps.config.dataDir,
+          sessionId: DEFAULT_SESSION_ID,
+          streamEntryIds,
+          entryIndex: deps.entryIndex,
+          budgetMs: options.budgetMs,
+          activeOnly: options.activeOnly,
+        }),
     },
     episodic: {
+      rememberForTenant: (input) => getTenantFactRememberer().remember(input),
+      recallForCognition: (query, options) => {
+        const rankingAudienceEntityId =
+          options.rankingAudienceEntityId ?? options.recallContext.currentAudienceEntityId;
+        return deps.retrievalPipeline.recallEpisodeHitsForCognition(query, {
+          ...options,
+          ...resolveEpisodeRankingOptions(options, rankingAudienceEntityId),
+          rankingAudienceEntityId,
+        });
+      },
       get: (id, options = {}) =>
         deps.retrievalPipeline.getEpisode(id, {
           audienceEntityId: resolveEpisodeAudienceEntityId(options),
+          visibleAudienceEntityIds: options.visibleAudienceEntityIds,
           crossAudience: options.crossAudience,
         }),
       inspect: (id) => deps.episodicRepository.get(id, { includeArchived: true }),
@@ -524,6 +748,13 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
           query,
           resolveEpisodeSearchOptions(options),
         ),
+      searchWithTimeRangeFallback: (query, options) =>
+        deps.retrievalPipeline.searchEpisodesForDisclosureWithTimeRangeFallback(query, {
+          ...resolveEpisodeSearchOptions(options),
+          timeRange: options.timeRange,
+        }),
+      recordRetrieval: (episodeId, score) =>
+        deps.episodicRepository.recordRetrieval(episodeId, deps.clock.now(), score),
       extract: async (options = {}) => {
         const extractor = new EpisodicExtractor({
           dataDir: deps.config.dataDir,
@@ -553,9 +784,26 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
         Promise.resolve({ ran: false, processedEntries: 0 }),
       list: (...args) => deps.episodicRepository.list(...args),
       listAll: () => deps.episodicRepository.listAll(),
+      listRecentForSession: (...args) =>
+        deps.episodicRepository.listRecentForSessionForDisclosure(...args),
       getStats: (...args) => deps.episodicRepository.getStats(...args),
     },
     self: {
+      livedExperience: {
+        // Newest first, limited after ordering: the repository orders ascending before LIMIT, which
+        // would hand a wide window its oldest days.
+        listDaySummaries: (options) => {
+          const self = deps.entityRepository.getSelf();
+          const { limit, ...window } = options;
+          const rows = deps.livedExperienceDaySummaryRepository
+            .listForWindow({
+              ...window,
+              ...(self === null ? {} : { selfEntityId: self.id }),
+            })
+            .sort((a, b) => b.day_start_ms - a.day_start_ms);
+          return limit === undefined ? rows : rows.slice(0, Math.max(0, Math.floor(limit)));
+        },
+      },
       values: {
         get: (...args) => deps.valuesRepository.get(...args),
         list: (...args) => deps.valuesRepository.list(...args),
@@ -568,12 +816,27 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
           deps.valuesRepository.listContradictionEvents(...args),
       },
       goals: {
-        get: (...args) => deps.goalsRepository.get(...args),
-        list: (...args) => deps.goalsRepository.list(...args),
-        add: (...args) => deps.identityService.addGoal(...args),
-        update: (...args) => deps.identityService.updateGoal(...args),
-        updateStatus: (...args) => deps.identityService.updateGoalStatus(...args),
-        updateProgress: (...args) => deps.identityService.updateGoalProgress(...args),
+        block: (...args) => goalWithDisclosure(deps, deps.goalsRepository.block(...args)),
+        unblock: (goalId, reason, provenance) =>
+          goalWithDisclosure(deps, deps.goalsRepository.unblock(goalId, reason, provenance)),
+        get: (...args) => {
+          const goal = deps.goalsRepository.get(...args);
+          return goal === null ? null : goalWithDisclosure(deps, goal);
+        },
+        list: (...args) => goalTreesWithDisclosure(deps, deps.goalsRepository.list(...args)),
+        add: (...args) => goalWithDisclosure(deps, deps.identityService.addGoal(...args)),
+        update: (...args) =>
+          identityResultWithDisclosure(deps.identityService.updateGoal(...args), (goal) =>
+            goalWithDisclosure(deps, goal),
+          ),
+        updateStatus: (...args) =>
+          identityResultWithDisclosure(deps.identityService.updateGoalStatus(...args), (goal) =>
+            goalWithDisclosure(deps, goal),
+          ),
+        updateProgress: (...args) =>
+          identityResultWithDisclosure(deps.identityService.updateGoalProgress(...args), (goal) =>
+            goalWithDisclosure(deps, goal),
+          ),
       },
       traits: {
         get: (...args) => deps.traitsRepository.get(...args),
@@ -587,6 +850,27 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
           deps.traitsRepository.listContradictionEvents(...args),
       },
       autobiographical: {
+        recall: (input, options = {}) =>
+          new AutobiographicalRecallService({
+            ...options,
+            clock: deps.clock,
+            activityRepository: deps.activityRepository,
+            selfDecisionRepository: deps.selfDecisionRepository,
+            observedEventRepository: deps.observedEventRepository,
+            episodicRepository: deps.episodicRepository,
+            actionRepository: deps.actionRepository,
+            goalsRepository: deps.goalsRepository,
+            sourceStreamAudienceDisclosureResolver: deps.sourceStreamAudienceDisclosureResolver,
+            openQuestionsRepository: deps.openQuestionsRepository,
+            autobiographicalRepository: deps.autobiographicalRepository,
+            sessionsRepository: deps.sessionsRepository,
+            createStreamReader: (sessionId) =>
+              new StreamReader({
+                dataDir: deps.config.dataDir,
+                sessionId,
+                entryIndex: deps.entryIndex,
+              }),
+          }).recall(input),
         currentPeriod: () => deps.autobiographicalRepository.currentPeriod(),
         listPeriods: (...args) => deps.autobiographicalRepository.listPeriods(...args),
         upsertPeriod: upsertAutobiographicalPeriod,
@@ -789,6 +1073,7 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
           entityRepository: deps.entityRepository,
         });
         const extractor = new SemanticExtractor({
+          similarityConfig: deps.config,
           nodeRepository: deps.semanticNodeRepository,
           edgeRepository: deps.semanticEdgeRepository,
           embeddingClient: deps.embeddingClient,
@@ -841,49 +1126,61 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
     },
     commitments: {
       add: (input) =>
-        deps.identityService.addCommitment({
-          type: input.type,
-          kind: input.kind,
-          enforcementClass: input.enforcementClass,
-          criticalDomain: input.criticalDomain,
-          directiveFamily: input.directiveFamily,
-          directive: input.directive,
-          priority: input.priority,
-          madeToEntity:
-            input.madeTo === undefined || input.madeTo === null
-              ? null
-              : deps.entityRepository.resolve(input.madeTo),
-          restrictedAudience:
-            input.audience === undefined || input.audience === null
-              ? null
-              : deps.entityRepository.resolve(input.audience),
-          aboutEntity:
-            input.about === undefined || input.about === null
-              ? null
-              : deps.entityRepository.resolve(input.about),
-          provenance: input.provenance,
-          expiresAt: input.expiresAt ?? null,
-        }),
-      get: (id) => deps.commitmentRepository.get(id),
-      revoke: (...args) => deps.commitmentRepository.revoke(...args),
-      list: (options = {}) =>
-        deps.commitmentRepository.list({
-          activeOnly: options.activeOnly,
-          audience:
-            options.audienceEntityId !== undefined
-              ? options.audienceEntityId
-              : options.audience === undefined
-                ? undefined
-                : options.audience === null
-                  ? null
-                  : deps.entityRepository.resolve(options.audience),
-          aboutEntity:
-            options.aboutEntity === undefined
-              ? undefined
-              : options.aboutEntity === null
+        commitmentWithDisclosure(
+          deps,
+          deps.identityService.addCommitment({
+            type: input.type,
+            kind: input.kind,
+            enforcementClass: input.enforcementClass,
+            criticalDomain: input.criticalDomain,
+            directiveFamily: input.directiveFamily,
+            directive: input.directive,
+            priority: input.priority,
+            madeToEntity:
+              input.madeTo === undefined || input.madeTo === null
                 ? null
-                : deps.entityRepository.resolve(options.aboutEntity),
-        }),
+                : deps.entityRepository.resolve(input.madeTo),
+            restrictedAudience:
+              input.audience === undefined || input.audience === null
+                ? null
+                : deps.entityRepository.resolve(input.audience),
+            aboutEntity:
+              input.about === undefined || input.about === null
+                ? null
+                : deps.entityRepository.resolve(input.about),
+            provenance: input.provenance,
+            expiresAt: input.expiresAt ?? null,
+          }),
+        ),
+      get: (id) => {
+        const commitment = deps.commitmentRepository.get(id);
+        return commitment === null ? null : commitmentWithDisclosure(deps, commitment);
+      },
+      revoke: (...args) => {
+        const commitment = deps.commitmentRepository.revoke(...args);
+        return commitment === null ? null : commitmentWithDisclosure(deps, commitment);
+      },
+      list: (options = {}) =>
+        commitmentsWithDisclosure(
+          deps,
+          deps.commitmentRepository.list({
+            activeOnly: options.activeOnly,
+            audience:
+              options.audienceEntityId !== undefined
+                ? options.audienceEntityId
+                : options.audience === undefined
+                  ? undefined
+                  : options.audience === null
+                    ? null
+                    : deps.entityRepository.resolve(options.audience),
+            aboutEntity:
+              options.aboutEntity === undefined
+                ? undefined
+                : options.aboutEntity === null
+                  ? null
+                  : deps.entityRepository.resolve(options.aboutEntity),
+          }),
+        ),
       countActive: () => deps.commitmentRepository.countActive(),
       countActiveByKind: () => deps.commitmentRepository.countActiveByKind(),
       countActiveByEnforcementClass: () =>
@@ -893,13 +1190,25 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
       countExpired: () => deps.commitmentRepository.countExpired(),
       countCanonicalized: () => deps.commitmentRepository.countCanonicalized(),
     },
+    operatorAttention: {
+      record: (input) => deps.operatorAttentionRepository.record(input),
+      snapshot: () => deps.operatorAttentionRepository.snapshot(),
+    },
+    activity: createActivityFacade(deps),
     creatorDirectives: createCreatorDirectivesFacade(deps),
     identity: {
       updateValue: (...args) => deps.identityService.updateValue(...args),
-      updateGoal: (...args) => deps.identityService.updateGoal(...args),
+      updateGoal: (...args) =>
+        identityResultWithDisclosure(deps.identityService.updateGoal(...args), (goal) =>
+          goalWithDisclosure(deps, goal),
+        ),
       updateTrait: (...args) => deps.identityService.updateTrait(...args),
-      addCommitment: (...args) => deps.identityService.addCommitment(...args),
-      updateCommitment: (...args) => deps.identityService.updateCommitment(...args),
+      addCommitment: (...args) =>
+        commitmentWithDisclosure(deps, deps.identityService.addCommitment(...args)),
+      updateCommitment: (...args) =>
+        identityResultWithDisclosure(deps.identityService.updateCommitment(...args), (commitment) =>
+          commitmentWithDisclosure(deps, commitment),
+        ),
       updatePeriod: (...args) => deps.identityService.updatePeriod(...args),
       updateGrowthMarker: (...args) => deps.identityService.updateGrowthMarker(...args),
       updateOpenQuestion: (...args) => deps.identityService.updateOpenQuestion(...args),
@@ -1017,7 +1326,48 @@ export function createBorgFacades(deps: BorgDependencies): BorgFacades {
       countPendingSemanticExtractionEpisodes: () => countPendingSemanticExtractionEpisodes(deps),
     },
     inbox: {
+      enqueueTaskEvent: async ({ sessionId, event }) => {
+        if (!deps.chatResponseCatchUpWorker.isTaskEventEnabled()) {
+          throw new CognitionError("Task-event lane is disabled", {
+            code: "TASK_EVENT_LANE_DISABLED",
+          });
+        }
+        const session = deps.sessionsRepository.get(sessionId);
+        if (session?.source_type !== "teams_inbox") return null;
+        const result = await deps.taskEventService.enqueue({
+          sessionId,
+          event,
+          audience: session.audience_entity_id ?? session.audience_label,
+        });
+        // Also wake duplicates: a previous request may have committed just before a restart.
+        deps.chatResponseCatchUpWorker.onPendingTaskSession(sessionId, deps.clock.now());
+        return result;
+      },
+      listUnansweredTaskEvents: (sessionId) => deps.taskEventService.listUnanswered(sessionId),
+      findTaskEventTerminal: (sessionId, event) =>
+        deps.taskEventService.findTerminal(sessionId, event),
+      deliveries: {
+        claim: (input) => deps.agentDeliveries.claim(input),
+        ack: (input) => deps.agentDeliveries.ack(input),
+      },
       catchUp: deps.chatResponseCatchUpWorker,
+      appendBacklogTerminal: (input) => deps.backlogTerminalService.appendBacklogTerminal(input),
+      sealPendingBacklog: (input) => deps.backlogTerminalService.sealPendingBacklog(input),
+      sealStaleBacklog: (input) => deps.backlogTerminalService.sealStaleBacklog(input),
+      findTerminalCoveringEntry: (input) =>
+        deps.backlogTerminalService.findTerminalCoveringEntry(input),
+      reconcileReplyActivity: (input) =>
+        reconcileInboxReplyActivity(
+          {
+            entryIndex: deps.entryIndex,
+            sessionsRepository: deps.sessionsRepository,
+            entityRepository: deps.entityRepository,
+            activityRepository: deps.activityRepository,
+            projectRepliedTurn: (projection) =>
+              createActivityFacade(deps).projectRepliedTurn(projection),
+          },
+          input,
+        ),
     },
     workmem: {
       load: (sessionId = DEFAULT_SESSION_ID) => deps.workingMemoryStore.load(sessionId),

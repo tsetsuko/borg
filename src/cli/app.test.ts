@@ -16,12 +16,14 @@ import { createTestConfig } from "../offline/test-support.js";
 import { FixedClock } from "../util/clock.js";
 import { readJsonFile, writeFileAtomic, writeJsonFileAtomic } from "../util/atomic-write.js";
 import { createMigrations as createBorgMigrations } from "../borg/storage-setup.js";
+import { seedTestEmbeddingProfile } from "../test-support/embedding-profile.js";
 import { runCli } from "./app.js";
 
 const CONSOLIDATION_TOOL_NAME = "EmitConsolidation";
 const EPISODE_TOOL_NAME = "EmitEpisodeCandidates";
 
 class ScriptedEmbeddingClient implements EmbeddingClient {
+  readonly profile = { model: "fake-embed", dimensions: 4 };
   async embed(text: string): Promise<Float32Array> {
     return this.vector(text);
   }
@@ -58,9 +60,11 @@ function createOutputBuffer() {
 function createCliTempDir(tempDirs: string[]): string {
   const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
   tempDirs.push(tempDir);
+  seedTestEmbeddingProfile(tempDir);
   writeJsonFileAtomic(join(tempDir, "config.json"), {
     embedding: {
       dims: 4,
+      model: "fake-embed",
     },
   });
   return tempDir;
@@ -378,6 +382,63 @@ describe("cli", () => {
     expect(JSON.parse(goalProgressOut.read())).toMatchObject({
       id: goal.id,
       progress_notes: "Almost there",
+    });
+
+    for (const flags of [
+      ["--attempted-unavailable", "--reason", "待ち"],
+      [
+        "--attempted-unavailable",
+        "--reason",
+        "待ち",
+        "--until",
+        "8000000000000",
+        "--blocker-goal",
+        goal.id,
+      ],
+      ["--reason", "待ち", "--until", "8000000000000"],
+      ["--attempted-unavailable", "--until", "8000000000000"],
+    ]) {
+      expect(
+        await runCli(["node", "borg", "goal", "block", goal.id, ...flags], {
+          stdout: createOutputBuffer().stream,
+          stderr: createOutputBuffer().stream,
+          dataDir: tempDir,
+        }),
+      ).toBe(1);
+    }
+    const blockOut = createOutputBuffer();
+    expect(
+      await runCli(
+        [
+          "node",
+          "borg",
+          "goal",
+          "block",
+          goal.id,
+          "--attempted-unavailable",
+          "--reason",
+          "試行後、時間待ち",
+          "--until",
+          "8000000000000",
+        ],
+        {
+          stdout: blockOut.stream,
+          stderr: createOutputBuffer().stream,
+          dataDir: tempDir,
+        },
+      ),
+    ).toBe(0);
+    expect(JSON.parse(blockOut.read())).toMatchObject({
+      id: goal.id,
+      status: "blocked",
+      block_history: [
+        {
+          blocker: { kind: "until", until: 8_000_000_000_000 },
+          attempt_status: "attempted_unavailable",
+          reason: "試行後、時間待ち",
+          disclosure_label: { disclosure_class: "unknown" },
+        },
+      ],
     });
 
     const valueAddOut = createOutputBuffer();
@@ -1311,6 +1372,7 @@ describe("cli", () => {
                 classification: "none",
                 type: null,
                 directive: null,
+                directive_source_stream_entry_id: null,
                 directive_family: null,
                 closure_pressure_relevance: null,
                 priority: null,

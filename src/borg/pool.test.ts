@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { EMBEDDING_ACCESS_FILE, EMBEDDING_FENCE_FILE } from "../embeddings/bank-profile.js";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -6,11 +7,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Borg } from "../borg.js";
 import { BorgPool, type BorgPoolOptions } from "./pool.js";
+import { BANK_DB_FILENAME } from "./storage-setup.js";
 import { FakeEmbeddingClient } from "../embeddings/index.js";
 import { FakeLLMClient } from "../llm/test-support/fake-client.js";
 import type { TurnTraceData, TurnTraceEventName, TurnTracer } from "../tracing/tracer.js";
 import { ConfigError } from "../util/errors.js";
 import { createSessionId } from "../util/ids.js";
+import { FILE_LOCK_STALE_MS } from "../stream/file-lock.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 
@@ -57,6 +60,24 @@ function recordingTracer(events: Array<{ event: TurnTraceEventName; data: TurnTr
 }
 
 describe("BorgPool", () => {
+  it("renews an idle bank beyond the stale window until pool eviction", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const { pool, root } = makePool();
+    const path = join(root, "alpha", EMBEDDING_ACCESS_FILE);
+    try {
+      await pool.withTenant("alpha", () => undefined);
+      await vi.advanceTimersByTimeAsync(FILE_LOCK_STALE_MS * 3);
+      expect(JSON.parse(readFileSync(path, "utf8")).heartbeat).toBe(Date.now());
+      expect(pool.has("alpha")).toBe(true);
+      await pool.evict("alpha");
+      await vi.advanceTimersByTimeAsync(FILE_LOCK_STALE_MS);
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      await pool.closeAll();
+      vi.useRealTimers();
+    }
+  });
+
   it("isolates tenants in separate dataDirs (no cross-tenant recall)", async () => {
     const { pool, root } = makePool();
 
@@ -110,6 +131,21 @@ describe("BorgPool", () => {
 
     expect(a1).toBe(a2);
     expect(pool.size()).toBe(1);
+  });
+
+  it("applies the narrow per-tenant open-options factory", async () => {
+    const factory = vi.fn((tenantId: string) => ({
+      inbox: {
+        sessionPredicate: () => tenantId === "alpha",
+      },
+    }));
+    const { pool } = makePool({ openOptionsForTenant: factory });
+
+    await pool.withTenant("alpha", append("alpha"));
+    await pool.withTenant("beta", append("beta"));
+
+    expect(factory).toHaveBeenCalledWith("alpha");
+    expect(factory).toHaveBeenCalledWith("beta");
   });
 
   it("treats the post-open self initializer as idempotent provisioning, including dry-run opens", async () => {
@@ -245,6 +281,86 @@ describe("BorgPool", () => {
 
     release();
     expect(await alphaOp).toBe("alpha-done");
+  });
+
+  it("does not evict a tenant while its inbox drain is scheduled", async () => {
+    let pool!: BorgPool;
+    const made = makePool({
+      maxOpen: 1,
+      openOptionsForTenant: (tenantId) => ({
+        inbox: {
+          acquireLease: () => pool.acquireBackgroundLease(tenantId),
+          settleMs: 60_000,
+          maxSettleMs: 60_000,
+        },
+      }),
+    });
+    pool = made.pool;
+    const sessionId = createSessionId();
+
+    await pool.withTenant("alpha", async (borg) => {
+      borg.inbox.catchUp.start();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await borg.stream.append(
+        { kind: "user_msg", content: "scheduled background drain" },
+        { session: sessionId },
+      );
+    });
+    await pool.withTenant("beta", () => "beta");
+
+    expect(pool.has("alpha")).toBe(true);
+    expect(pool.has("beta")).toBe(true);
+    await pool.withTenant("alpha", (borg) => borg.inbox.catchUp.stop({ graceful: false }));
+  });
+
+  it("opens an unrelated tenant without waiting for an in-flight inbox drain", async () => {
+    let pool!: BorgPool;
+    let releaseRun: () => void = () => {};
+    const runGate = new Promise<void>((resolve) => {
+      releaseRun = resolve;
+    });
+    let signalRunStarted: () => void = () => {};
+    const runStarted = new Promise<void>((resolve) => {
+      signalRunStarted = resolve;
+    });
+    const made = makePool({
+      maxOpen: 1,
+      openOptionsForTenant: (tenantId) => ({
+        inbox: {
+          acquireLease: () => pool.acquireBackgroundLease(tenantId),
+          runner: ({ terminal }) => ({
+            run: async (input) => {
+              signalRunStarted();
+              await runGate;
+              await terminal.appendBacklogTerminal({
+                sessionId: input.sessionId,
+                sourceEntryIds: input.inboundBatch.entryIds,
+                terminal: { kind: "agent_observed", reason: "test complete" },
+              });
+            },
+          }),
+        },
+      }),
+    });
+    pool = made.pool;
+    const sessionId = createSessionId();
+    let drain!: ReturnType<Borg["inbox"]["catchUp"]["tick"]>;
+
+    await pool.withTenant("alpha", async (borg) => {
+      await borg.stream.append(
+        { kind: "user_msg", content: "held by background runner" },
+        { session: sessionId },
+      );
+      drain = borg.inbox.catchUp.tick(sessionId);
+      await runStarted;
+    });
+
+    await expect(pool.withTenant("beta", () => "beta")).resolves.toBe("beta");
+    expect(pool.has("alpha")).toBe(true);
+    expect(pool.has("beta")).toBe(true);
+
+    releaseRun();
+    await expect(drain).resolves.toMatchObject({ status: "drained" });
   });
 
   it("evict drains an in-flight op before closing (no use-after-close)", async () => {
@@ -545,5 +661,79 @@ describe("BorgPool", () => {
     } finally {
       errorSpy.mockRestore();
     }
+  });
+});
+
+describe("BorgPool.listTenantIds", () => {
+  function bank(root: string, tenantId: string) {
+    mkdirSync(join(root, tenantId), { recursive: true });
+    writeFileSync(join(root, tenantId, BANK_DB_FILENAME), "");
+  }
+
+  it("discovers every banked tenant on the volume, sorted", async () => {
+    const { pool, root } = makePool();
+    bank(root, "team-agent-esb");
+    bank(root, "team-agent-ai");
+    bank(root, "team-agent-rtm");
+
+    expect(await pool.listTenantIds()).toEqual([
+      "team-agent-ai",
+      "team-agent-esb",
+      "team-agent-rtm",
+    ]);
+  });
+
+  it("skips archived banks, foreign directories, files and empty tenant dirs", async () => {
+    const { pool, root } = makePool();
+    bank(root, "team-agent-ai");
+    // Quarantined bank: the dot in the suffix fails the tenant-id slug, so a
+    // corrupt archive can never be fanned out to.
+    bank(root, "team-agent-ai.corrupt-20260714");
+    bank(root, "lost+found");
+    // Present but not a bank -- e.g. a half-created directory.
+    mkdirSync(join(root, "team-agent-half"), { recursive: true });
+    writeFileSync(join(root, "stray-file"), "");
+
+    expect(await pool.listTenantIds()).toEqual(["team-agent-ai"]);
+  });
+
+  it("returns an empty list for a volume with no banks yet", async () => {
+    const { pool } = makePool();
+
+    expect(await pool.listTenantIds()).toEqual([]);
+  });
+
+  it("discovers a tenant the pool has never opened, and does not open it", async () => {
+    const { pool, root } = makePool();
+    bank(root, "team-agent-esb");
+
+    expect(await pool.listTenantIds()).toEqual(["team-agent-esb"]);
+    expect(pool.openTenantIds()).toEqual([]);
+    expect(pool.size()).toBe(0);
+  });
+
+  it("honours a custom tenant-id pattern", async () => {
+    const { pool, root } = makePool({ tenantIdPattern: /^team-agent-[a-z]+$/ });
+    bank(root, "team-agent-ai");
+    bank(root, "acme");
+
+    expect(await pool.listTenantIds()).toEqual(["team-agent-ai"]);
+  });
+});
+
+describe("embedding migration fence", () => {
+  it("rejects fenced tenants already open or unopened, but permits eviction and other tenants", async () => {
+    const { pool, root } = makePool();
+    await pool.withTenant("alpha", append("retained"));
+    writeFileSync(join(root, "alpha", EMBEDDING_FENCE_FILE), "{}");
+    await expect(pool.withTenant("alpha", tailContents)).rejects.toMatchObject({
+      code: "EMBEDDING_MIGRATION_FENCED",
+    });
+    await pool.evict("alpha");
+    expect(pool.has("alpha")).toBe(false);
+    await expect(pool.withTenant("alpha", tailContents)).rejects.toMatchObject({
+      code: "EMBEDDING_MIGRATION_FENCED",
+    });
+    await pool.withTenant("beta", append("available"));
   });
 });

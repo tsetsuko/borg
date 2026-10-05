@@ -1,4 +1,5 @@
 import type { GoalRecord } from "../memory/self/index.js";
+import { goalSchedulingTimes } from "../memory/self/goal-blocks.js";
 
 import type {
   ExecutiveFocus,
@@ -41,11 +42,12 @@ function normalizePriority(goal: GoalRecord, maxPriority: number): number {
 }
 
 function computeDeadlinePressure(goal: GoalRecord, nowMs: number, lookaheadMs: number): number {
-  if (goal.target_at === null || !Number.isFinite(goal.target_at) || lookaheadMs <= 0) {
+  const targetAt = goalSchedulingTimes(goal).targetAt;
+  if (targetAt === null || !Number.isFinite(targetAt) || lookaheadMs <= 0) {
     return 0;
   }
 
-  const remainingMs = goal.target_at - nowMs;
+  const remainingMs = targetAt - nowMs;
 
   if (remainingMs <= 0) {
     return 1;
@@ -58,12 +60,17 @@ function computeDeadlinePressure(goal: GoalRecord, nowMs: number, lookaheadMs: n
   return clamp01(1 - remainingMs / lookaheadMs);
 }
 
+// staleMs is supplied per scoring context, not by this module. Turn selection and
+// both wake-time selectors all receive autonomy.triggers.goalFollowupDue.staleMs,
+// so the progress-debt divisor agrees everywhere. The executive-focus trigger's
+// shorter stalenessSec remains a due-cadence threshold only. The divisor is
+// rendered for the model in score_basis; keep that surface in step if it moves.
 function computeProgressDebt(goal: GoalRecord, nowMs: number, staleMs: number): number {
   if (staleMs <= 0) {
     return 0;
   }
 
-  const progressAnchor = goal.last_progress_ts ?? goal.created_at;
+  const progressAnchor = goalSchedulingTimes(goal).progressAnchor;
 
   if (!Number.isFinite(progressAnchor)) {
     return 0;
@@ -99,6 +106,27 @@ function compareGoalScores(left: ExecutiveGoalScore, right: ExecutiveGoalScore):
     left.goal.created_at - right.goal.created_at ||
     left.goal.id.localeCompare(right.goal.id)
   );
+}
+
+export function topExecutiveCandidateGoalIds(input: {
+  candidates: readonly ExecutiveGoalScore[];
+  eligibleGoalIds: ReadonlySet<GoalRecord["id"]>;
+  limit: number;
+}): GoalRecord["id"][] {
+  const limit = Number.isFinite(input.limit) ? Math.max(0, Math.floor(input.limit)) : 0;
+  const seenGoalIds = new Set<GoalRecord["id"]>();
+
+  return [...input.candidates]
+    .sort((left, right) => right.score - left.score || left.goal_id.localeCompare(right.goal_id))
+    .map((candidate) => candidate.goal_id)
+    .filter((goalId) => {
+      if (seenGoalIds.has(goalId) || !input.eligibleGoalIds.has(goalId)) {
+        return false;
+      }
+      seenGoalIds.add(goalId);
+      return true;
+    })
+    .slice(0, limit);
 }
 
 export function selectExecutiveFocus(input: SelectExecutiveFocusInput): ExecutiveFocus {

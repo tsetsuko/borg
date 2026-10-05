@@ -1,5 +1,11 @@
 import { z } from "zod";
 
+import {
+  misattributionEpisodePatchSchema,
+  semanticNodeMisattributionPatchSchema,
+} from "../../memory/review-queue/review-handlers/misattribution.js";
+import { temporalDriftReviewRefsSchema } from "../../memory/review-queue/review-handlers/temporal-drift.js";
+
 import { memoryDisclosurePayloadFields } from "../../memory/common/disclosure-serializers.js";
 import { entityIdSchema } from "../../memory/commitments/index.js";
 import {
@@ -22,6 +28,7 @@ import { reviewKindSchema } from "../../memory/review-queue/index.js";
 import { streamEntryIdSchema, type StreamEntry } from "../../stream/index.js";
 import { dedupePreservingOrder } from "../../util/collections.js";
 import type { EntityId, EpisodeId, StreamEntryId } from "../../util/ids.js";
+import { isoInstantEpochMsSchema } from "../../util/iso-instant.js";
 import { valueAppearsIn } from "../../util/text-presence.js";
 import type { OfflineContext } from "../types.js";
 
@@ -66,6 +73,72 @@ export const overseerFlagPayloadSchema = z.object({
 
 export type OverseerFlagPayload = z.infer<typeof overseerFlagPayloadSchema>;
 
+// The schema the MODEL fills. It differs from the persisted/audit payload above
+// in one way: every time value is an ISO-8601 date-time string on the wire and
+// is parsed to epoch milliseconds here, so the plan, the review refs and every
+// handler keep numeric time untouched. Asking the model to type a 13-digit
+// epoch-millisecond integer is what truncated EmitOverseerFlags in prod
+// (2026-09-13): the model started the number and never found its end.
+const overseerToolFlagSchema = overseerFlagPayloadSchema.extend({
+  corrected_start_time: isoInstantEpochMsSchema(
+    "Corrected episode start as an ISO-8601 date-time with zone offset.",
+  ).optional(),
+  corrected_end_time: isoInstantEpochMsSchema(
+    "Corrected episode end as an ISO-8601 date-time with zone offset.",
+  ).optional(),
+  suggested_valid_to: isoInstantEpochMsSchema(
+    "When the edge stopped holding, as an ISO-8601 date-time with zone offset.",
+  ).optional(),
+});
+
+export type OverseerTargetType = OverseerSourceTarget["type"];
+
+// Each target type is offered exactly the repair fields its review refs can
+// take (see the strict per-target refs schemas in review-handlers). Offering an
+// episode-only or edge-only field to another target invited the model to spend
+// its output on a value the plan would drop anyway -- the truncated prod calls
+// were all semantic_node targets filling suggested_valid_to.
+const overseerToolFlagSchemaByTarget = {
+  episode: overseerToolFlagSchema.omit({ suggested_valid_to: true, by_edge_id: true }),
+  semantic_node: overseerToolFlagSchema.omit({
+    suggested_valid_to: true,
+    by_edge_id: true,
+    corrected_start_time: true,
+    corrected_end_time: true,
+  }),
+  // An edge repair is a closure suggestion (suggested_valid_to / by_edge_id)
+  // for both temporal drift and identity inconsistency; it has no misattribution
+  // shape (the plan rejects the kind unconditionally), no patch, and the strict
+  // edge refs take no patch_description or identity repair-target fields.
+  semantic_edge: overseerToolFlagSchema
+    .omit({
+      patch: true,
+      patch_description: true,
+      corrected_start_time: true,
+      corrected_end_time: true,
+      quoted_span: true,
+      cited_stream_ids: true,
+      source_assessment: true,
+      provenance_note: true,
+      repair_target_type: true,
+      repair_target_id: true,
+      repair_op: true,
+      evidence_episode_ids: true,
+    })
+    .extend({
+      kind: z.enum([
+        reviewKindSchema.enum.temporal_drift,
+        reviewKindSchema.enum.identity_inconsistency,
+      ]),
+    }),
+} as const satisfies Record<OverseerTargetType, z.ZodType<OverseerFlagPayload, unknown>>;
+
+export function overseerToolFlagSchemaForTarget(
+  targetType: OverseerTargetType,
+): z.ZodType<OverseerFlagPayload, unknown> {
+  return overseerToolFlagSchemaByTarget[targetType];
+}
+
 export const overseerAudienceMetadataSchema = z
   .object({
     entity_id: entityIdSchema,
@@ -100,6 +173,8 @@ export const suppressedFlagReasonSchema = z.enum([
   "INVALID-CITATION",
   "SOURCE-CONTRADICTS",
   "AUDIENCE-NAME-GROUNDED",
+  "PATCH-NOT-APPLICABLE",
+  "REPAIR-NOT-RESOLVABLE",
 ]);
 
 export const suppressedOverseerFlagSchema = z.object({
@@ -183,10 +258,66 @@ function gateAudienceNameGrounding(
   return null;
 }
 
+// A well-grounded flag can still be unrepairable: the model invents domain-shaped
+// patch keys ({business_owner: ...}) that no target accepts. Refs are validated at
+// RESOLVE time, so such a flag enters the queue and then throws unrecognized_keys
+// on every resolver pass forever -- a throwing apply leaves the item queued and
+// only the needs_manual path counts attempts. Gating here keeps the unrepairable
+// flag out of the queue instead of wedging the resolver with it. Validation uses
+// the resolver's own schemas so the two cannot drift.
+function gatePatchApplicability(
+  flag: OverseerFlagPayload,
+  targetType: MisattributionTargetType,
+): SuppressedOverseerFlag | null {
+  // No patch at all is just as unresolvable as a wrong-shaped one: both refs
+  // schemas REQUIRE a non-empty patch, so a patch-less flag would fail the same
+  // resolve-time parse on accept.
+  if (flag.patch === undefined) {
+    return suppressFlag(flag, "PATCH-NOT-APPLICABLE", flag.cited_stream_ids ?? []);
+  }
+
+  const schema =
+    targetType === "episode"
+      ? misattributionEpisodePatchSchema
+      : semanticNodeMisattributionPatchSchema;
+
+  return schema.safeParse(flag.patch).success
+    ? null
+    : suppressFlag(flag, "PATCH-NOT-APPLICABLE", flag.cited_stream_ids ?? []);
+}
+
+// A temporal_drift flag is only worth queueing if the refs the plan would build
+// from it satisfy the resolver's own per-target schema: a semantic_node drift
+// needs a patch_description, an episode drift needs a corrected time or a
+// patch_description. Prod 2026-09-14 lost two node flags at enqueue
+// ("expected string, received undefined") because the model flagged drift
+// without saying what to change. Gating here, with the same schema the queue
+// applies, keeps that flag out of the apply-error path and counts it as
+// rejected instead.
+export function gateTemporalDriftRepair(
+  flag: OverseerFlagPayload,
+  refs: Record<string, unknown>,
+): SuppressedOverseerFlag | null {
+  return temporalDriftReviewRefsSchema.safeParse(refs).success
+    ? null
+    : suppressFlag(flag, "REPAIR-NOT-RESOLVABLE", flag.cited_stream_ids ?? []);
+}
+
+// Target types a misattribution repair can actually be applied to. semantic_edge
+// misattribution is rejected separately at the call site.
+export type MisattributionTargetType = "episode" | "semantic_node";
+
 export function gateMisattributionFlag(
   flag: OverseerFlagPayload,
   sourceBundle: OverseerSourceBundle,
+  targetType: MisattributionTargetType,
 ): SuppressedOverseerFlag | null {
+  const patchSuppression = gatePatchApplicability(flag, targetType);
+
+  if (patchSuppression !== null) {
+    return patchSuppression;
+  }
+
   const audienceNameSuppression = gateAudienceNameGrounding(flag, sourceBundle);
 
   if (audienceNameSuppression !== null) {
@@ -475,7 +606,7 @@ export function renderSourceBundleForPrompt(bundle: OverseerSourceBundle): strin
 
     lines.push(
       [
-        `SOURCE[${index}] source_episode_ids=${formatIdList(source.source_episode_ids)} session_id=${source.entry.session_id} timestamp=${source.entry.timestamp} stream_id=${source.entry.id} kind=${source.entry.kind} disclosure=${JSON.stringify(disclosureFields.disclosure)} disclosure_label=${JSON.stringify(disclosureFields.disclosure_label)}`,
+        `SOURCE[${index}] source_episode_ids=${formatIdList(source.source_episode_ids)} session_id=${source.entry.session_id} timestamp=${source.entry.timestamp} timestamp_iso=${new Date(source.entry.timestamp).toISOString()} stream_id=${source.entry.id} kind=${source.entry.kind} disclosure=${JSON.stringify(disclosureFields.disclosure)} disclosure_label=${JSON.stringify(disclosureFields.disclosure_label)}`,
         entryContent(source.entry),
       ].join("\n"),
     );

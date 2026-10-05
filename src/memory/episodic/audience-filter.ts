@@ -64,6 +64,22 @@ export function isEpisodeAccessVisible(
   return normalized.origin_audience_entity_ids.includes(audienceEntityId);
 }
 
+export function isEpisodeAccessVisibleToAnyAudience(
+  input: EpisodeAccessLike,
+  audienceEntityIds: readonly EntityId[],
+): boolean {
+  const normalized = normalizeEpisodeAccess(input);
+
+  if (normalized.shared) {
+    return true;
+  }
+
+  const visibleAudienceEntityIds = new Set(audienceEntityIds);
+  return normalized.origin_audience_entity_ids.some((entityId) =>
+    visibleAudienceEntityIds.has(entityId),
+  );
+}
+
 function isPrivateToDifferentAudience(
   input: EpisodeAccessLike,
   audienceEntityId: EntityId | null | undefined,
@@ -82,30 +98,6 @@ function isPrivateToDifferentAudience(
 function hasAnyPrivateEpisode(input: EpisodeAccessLike): boolean {
   const normalized = normalizeEpisodeAccess(input);
   return normalized.shared !== true && normalized.origin_audience_entity_ids.length > 0;
-}
-
-export function inferSinglePrivateAudience(
-  episodes: readonly EpisodeAccessLike[],
-): EntityId | null | "multiple" {
-  const privateAudiences = new Set<EntityId>();
-
-  for (const episode of episodes) {
-    const normalized = normalizeEpisodeAccess(episode);
-
-    if (normalized.shared || normalized.origin_audience_entity_ids.length === 0) {
-      continue;
-    }
-
-    for (const audienceEntityId of normalized.origin_audience_entity_ids) {
-      privateAudiences.add(audienceEntityId);
-    }
-  }
-
-  if (privateAudiences.size > 1) {
-    return "multiple";
-  }
-
-  return [...privateAudiences][0] ?? null;
 }
 
 export function filterEpisodesByAudience(

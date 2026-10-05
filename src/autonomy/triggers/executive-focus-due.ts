@@ -1,3 +1,4 @@
+import { goalSchedulingTimes, goalBlockStateFields } from "../../memory/self/goal-blocks.js";
 import {
   DEFAULT_EXECUTIVE_GOAL_FOCUS_THRESHOLD,
   computeExecutiveContextFits,
@@ -8,6 +9,7 @@ import type { EmbeddingClient } from "../../embeddings/index.js";
 import type { EpisodicRepository } from "../../memory/episodic/index.js";
 import type { GoalRecord, GoalsRepository } from "../../memory/self/index.js";
 import { goalMemoryDisclosureLabel } from "../../memory/common/disclosure-serializers.js";
+import type { SourceStreamAudienceDisclosureResolver } from "../../memory/common/index.js";
 import { listActiveGoalsForCognition } from "../../cognition/self/active-goals.js";
 import {
   combineMemoryDisclosureLabels,
@@ -64,6 +66,9 @@ export type ExecutiveFocusDuePayload = {
     goal_id: GoalRecord["id"];
     description: string;
     priority: number;
+    status: GoalRecord["status"];
+    block_history?: GoalRecord["block_history"];
+    block?: ReturnType<typeof goalBlockStateFields>["block"];
     target_at: number | null;
     last_progress_ts: number | null;
   } & ExecutiveFocusGoalDisclosurePayload;
@@ -85,12 +90,14 @@ export type ExecutiveFocusDuePayload = {
 export type ExecutiveFocusDueTriggerOptions = {
   enabled: boolean;
   goalsRepository: GoalsRepository;
+  sourceStreamAudienceDisclosureResolver?: SourceStreamAudienceDisclosureResolver;
   executiveStepsRepository: ExecutiveStepsRepository;
   episodicRepository: EpisodicRepository;
   embeddingClient: EmbeddingClient;
   watermarkRepository: StreamWatermarkRepository;
   threshold?: number;
   stalenessMs: number;
+  progressDebtStaleMs: number;
   dueLeadMs: number;
   wakeCooldownMs: number;
   wakeCooldownBackoffMultiplier: number;
@@ -242,6 +249,8 @@ function buildScorePayload(input: {
       goal_id: input.goal.id,
       description: input.goal.description,
       priority: input.goal.priority,
+      status: input.goal.status,
+      ...goalBlockStateFields(input.goal),
       target_at: input.goal.target_at,
       last_progress_ts: input.goal.last_progress_ts,
       disclosure: input.disclosure.disclosure,
@@ -276,9 +285,8 @@ function isGoalFollowupDueMatch(input: {
   lookaheadMs: number;
   staleMs: number;
 }): boolean {
-  const baseProgressTs = input.goal.last_progress_ts ?? input.goal.created_at;
-  const deadlineDue =
-    input.goal.target_at !== null && input.goal.target_at - input.nowMs < input.lookaheadMs;
+  const { progressAnchor: baseProgressTs, targetAt } = goalSchedulingTimes(input.goal);
+  const deadlineDue = targetAt !== null && targetAt - input.nowMs < input.lookaheadMs;
   const staleDue = baseProgressTs + input.staleMs < input.nowMs;
 
   return deadlineDue || staleDue;
@@ -406,7 +414,7 @@ export function createExecutiveFocusDueTrigger(
       nowMs: input.nowMs,
       threshold,
       deadlineLookaheadMs: options.deadlineLookaheadMs,
-      staleMs: options.stalenessMs,
+      staleMs: options.progressDebtStaleMs,
       scoreContext: "wake_time_trigger_selection",
       contextFitByGoalId,
     });
@@ -423,7 +431,10 @@ export function createExecutiveFocusDueTrigger(
 
       const nowMs = clock.now();
       const actionAvailabilityKey = options.goalStaleBackoffActionAvailabilityKey?.() ?? null;
-      const goals = listActiveGoalsForCognition(options.goalsRepository);
+      const rawGoals = listActiveGoalsForCognition(options.goalsRepository);
+      const goals =
+        options.sourceStreamAudienceDisclosureResolver?.resolve({ goals: rawGoals }).goals ??
+        rawGoals;
       const goalDisclosureById = await buildGoalDisclosurePayloads({
         goals,
         episodicRepository: options.episodicRepository,
@@ -549,7 +560,7 @@ export function createExecutiveFocusDueTrigger(
       if (topEligibleCandidate !== undefined) {
         const selectedGoal =
           goalsById.get(topEligibleCandidate.goal_id) ?? topEligibleCandidate.goal;
-        const progressAnchor = selectedGoal.last_progress_ts ?? selectedGoal.created_at;
+        const progressAnchor = goalSchedulingTimes(selectedGoal).progressAnchor;
 
         // Keep staleness out of the skip predicate: a fresh top-eligible goal
         // must suppress goal_stale rather than reaching past it to a lower stale one.
@@ -640,7 +651,7 @@ export function createExecutiveFocusDueTrigger(
             score_basis: {
               score_context: "wake_time_trigger_selection",
               deadline_lookahead_ms: options.deadlineLookaheadMs,
-              progress_debt_stale_ms: options.stalenessMs,
+              progress_debt_stale_ms: options.progressDebtStaleMs,
             },
           },
         },

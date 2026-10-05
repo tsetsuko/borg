@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { operatorAttentionPromptRow } from "../../../memory/operator-attention/disclosure.js";
 import { DEFAULT_CONFIG } from "../../../config/index.js";
 import { FakeLLMClient } from "../../../llm/test-support/fake-client.js";
 import { sharedStateMigrations } from "../../../memory/shared-state/index.js";
@@ -48,9 +49,8 @@ import { summarizeSharedStateArtifactRender } from "../../shared-state/render.js
 import { SHARED_STATE_TOOL_NAME } from "../../shared-state/constants.js";
 import { SESSION_REENTRY_CONTINUITY_TAG } from "../../session-reentry-continuity.js";
 import {
-  compileSharedStateArtifactForEvidenceLedger,
   compileSharedStateArtifactForEvidenceLedgerResult,
-  buildCreatorDirectiveBriefingForTurn,
+  buildCreatorDirectiveBriefing,
   runRetrievalPhase,
 } from "./retrieval-phase.js";
 import type { TurnPhaseCoordinatorOptions } from "./types.js";
@@ -235,6 +235,50 @@ function runMinimalRetrievalPhase(options: TurnPhaseCoordinatorOptions, turnId: 
 }
 
 describe("autonomy scheduler mechanism-evidence provider", () => {
+  it.each([false, true])(
+    "carries attention metadata and keeps scheduler evidence when the index fails=%s",
+    async (fail) => {
+      const db = openDatabase(":memory:", { migrations: creatorDirectiveMigrations });
+      const repository = new CreatorDirectiveRepository({ db, clock: new FixedClock(2_000) });
+      const options = minimalRetrievalPhaseOptions(repository);
+      // Only the scheduler fields consumed by this phase matter for this fixture.
+      options.autonomySchedulerStateProvider = async () =>
+        ({ observed_at: 2_000, window_wakes: [] }) as never;
+      const index = {
+        total: 1,
+        records: [
+          operatorAttentionPromptRow({
+            record_key: "attention",
+            filed_at: 1_000,
+            filer_entity_id: createEntityId(),
+            subject: null,
+          }),
+        ],
+      };
+      options.operatorAttentionRepository = {
+        snapshot: () => {
+          if (fail) throw new Error("index unavailable");
+          return index;
+        },
+      };
+      options.tracer = { enabled: true, includePayloads: false, emit: vi.fn() };
+      try {
+        const result = await runMinimalRetrievalPhase(options, "turn-attention-index");
+        expect(result.turnMechanismEvidence.autonomySchedulerState?.observedAt).toBe(2_000);
+        expect(result.turnMechanismEvidence.autonomySchedulerState?.operatorAttentionIndex).toEqual(
+          fail ? undefined : index,
+        );
+        if (fail)
+          expect(options.tracer.emit).toHaveBeenCalledWith(
+            "retrieval.degraded",
+            expect.objectContaining({ component: "operator_attention_index" }),
+          );
+      } finally {
+        db.close();
+      }
+    },
+  );
+
   it("continues without a scheduler section when the provider is absent", async () => {
     const db = openDatabase(":memory:", { migrations: creatorDirectiveMigrations });
     const repository = new CreatorDirectiveRepository({ db, clock: new FixedClock(2_000) });
@@ -352,7 +396,7 @@ describe("creator directive retrieval briefing", () => {
         participantEntityIds: [audienceId],
         sessionRole: "participant",
       });
-      const briefing = buildCreatorDirectiveBriefingForTurn({
+      const briefing = buildCreatorDirectiveBriefing({
         applicable,
         currentUserEntryId,
         entityRepository: { get: () => null },
@@ -415,7 +459,7 @@ describe("creator directive retrieval briefing", () => {
         priority: 7,
         createdAt: 1_500,
       });
-      const operatorBriefing = buildCreatorDirectiveBriefingForTurn({
+      const operatorBriefing = buildCreatorDirectiveBriefing({
         applicable: repository.listApplicable({
           currentAudienceEntityId: audienceId,
           currentSenderBorgRole: "creator",
@@ -424,7 +468,7 @@ describe("creator directive retrieval briefing", () => {
         }),
         entityRepository: { get: () => null },
       });
-      const participantBriefing = buildCreatorDirectiveBriefingForTurn({
+      const participantBriefing = buildCreatorDirectiveBriefing({
         applicable: repository.listApplicable({
           currentAudienceEntityId: audienceId,
           participantEntityIds: [audienceId],
@@ -1348,7 +1392,7 @@ describe("creator directive retrieval briefing", () => {
         createdAt: 1_500,
       });
 
-      const briefing = buildCreatorDirectiveBriefingForTurn({
+      const briefing = buildCreatorDirectiveBriefing({
         applicable: repository.listApplicable({
           currentAudienceEntityId: audienceId,
           participantEntityIds: [audienceId],
@@ -1458,7 +1502,7 @@ describe("creator directive retrieval briefing", () => {
         createdAt: 1_500,
       });
 
-      const briefing = buildCreatorDirectiveBriefingForTurn({
+      const briefing = buildCreatorDirectiveBriefing({
         applicable: repository.listApplicable({
           currentAudienceEntityId: audienceId,
           participantEntityIds: [audienceId],
@@ -1553,7 +1597,7 @@ describe("creator directive retrieval briefing", () => {
         participantEntityIds: [aliceId],
         sessionRole: "participant",
       });
-      const briefing = buildCreatorDirectiveBriefingForTurn({
+      const briefing = buildCreatorDirectiveBriefing({
         applicable,
         entityRepository: { get: () => null },
       });
@@ -1629,7 +1673,7 @@ describe("creator directive retrieval briefing", () => {
         sessionRole: "participant",
       });
       const applicableDirective = applicable.find((item) => item.directive.id === directive.id);
-      const briefing = buildCreatorDirectiveBriefingForTurn({
+      const briefing = buildCreatorDirectiveBriefing({
         applicable,
         entityRepository: { get: () => null },
       });
@@ -1716,7 +1760,7 @@ describe("creator directive retrieval briefing", () => {
         sessionRole: "participant",
       });
       const byId = Object.fromEntries(applicable.map((item) => [item.directive.id, item]));
-      const briefing = buildCreatorDirectiveBriefingForTurn({
+      const briefing = buildCreatorDirectiveBriefing({
         applicable,
         entityRepository: { get: () => null },
       });
@@ -2990,7 +3034,7 @@ describe("creator directive retrieval briefing", () => {
   });
 });
 
-describe("compileSharedStateArtifactForEvidenceLedger", () => {
+describe("compileSharedStateArtifactForEvidenceLedgerResult", () => {
   const cleanup: Array<() => void> = [];
 
   afterEach(() => {
@@ -2999,7 +3043,7 @@ describe("compileSharedStateArtifactForEvidenceLedger", () => {
     }
   });
 
-  it("uses the global turn counter for shared-state action canonicalization", async () => {
+  it.each(["pre_answer", "post_response"] as const)("uses compiler model in %s", async (pass) => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-retrieval-phase-"));
     cleanup.push(() => rmSync(tempDir, { recursive: true, force: true }));
     const db = openDatabase(join(tempDir, "borg.db"), {
@@ -3132,6 +3176,14 @@ describe("compileSharedStateArtifactForEvidenceLedger", () => {
     const options = {
       config: {
         ...DEFAULT_CONFIG,
+        anthropic: {
+          ...DEFAULT_CONFIG.anthropic,
+          models: {
+            ...DEFAULT_CONFIG.anthropic.models,
+            recallExpansion: "test-recall-model",
+            sharedStateCompiler: "test-shared-state-compiler-model",
+          },
+        },
         dataDir: tempDir,
         generation: {
           ...DEFAULT_CONFIG.generation,
@@ -3182,8 +3234,9 @@ describe("compileSharedStateArtifactForEvidenceLedger", () => {
         }) as StreamReader,
     } as unknown as TurnPhaseCoordinatorOptions;
 
-    await compileSharedStateArtifactForEvidenceLedger({
+    await compileSharedStateArtifactForEvidenceLedgerResult({
       options,
+      compilePass: pass,
       input: {
         sessionId: DEFAULT_SESSION_ID,
         turnId: "turn-global-canonicalization",
@@ -3248,6 +3301,7 @@ describe("compileSharedStateArtifactForEvidenceLedger", () => {
       },
       promptVisibleLedger: "Action candidate: Follow up with the clinic.",
     });
+    expect(llmClient.requests[0]?.model).toBe("test-shared-state-compiler-model");
     const requestPayload = JSON.parse(
       String(llmClient.requests[0]?.messages[0]?.content ?? "{}"),
     ) as {
@@ -3421,7 +3475,7 @@ describe("compileSharedStateArtifactForEvidenceLedger", () => {
         }) as StreamReader,
     } as unknown as TurnPhaseCoordinatorOptions;
 
-    await compileSharedStateArtifactForEvidenceLedger({
+    await compileSharedStateArtifactForEvidenceLedgerResult({
       options,
       input: {
         sessionId: DEFAULT_SESSION_ID,

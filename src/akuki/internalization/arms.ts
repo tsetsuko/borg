@@ -27,6 +27,8 @@
 
 import { cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+
+import { EMBEDDING_ACCESS_FILE } from "../../embeddings/bank-profile.js";
 import type { Scaffolding } from "../seed/scaffolding.js";
 
 export type ArmName = "A" | "B" | "C" | "D";
@@ -89,8 +91,10 @@ export function prepareArmDirectory(arm: ArmSpec, liveDataDir: string): void {
 
   if (arm.inheritsMemory) {
     cpSync(liveDataDir, arm.dataDir, { recursive: true });
-    // Locks belong to whoever held them in the source directory.
+    // Locks belong to whoever held them in the source directory, and so does the
+    // bank lease, which would otherwise make the arm look already open.
     rmSync(join(arm.dataDir, "locks"), { recursive: true, force: true });
+    rmSync(join(arm.dataDir, EMBEDDING_ACCESS_FILE), { force: true });
     return;
   }
 

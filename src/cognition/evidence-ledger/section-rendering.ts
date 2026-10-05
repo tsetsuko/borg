@@ -1,4 +1,8 @@
-import type { EvidenceLedgerEntry, EvidenceLedgerSection } from "./types.js";
+import type {
+  EvidenceLedgerEntry,
+  EvidenceLedgerSection,
+  EvidenceLedgerSectionFramingCounts,
+} from "./types.js";
 
 export function renderEntry(entry: EvidenceLedgerEntry): string {
   const stateMetadata =
@@ -29,6 +33,39 @@ export function renderEntry(entry: EvidenceLedgerEntry): string {
   return [`- ${metadata.join(" ")}`, ...body].join("\n");
 }
 
+// A framing count can be misread on two independent axes, and naming one leaves the other running.
+//
+// Stage: the counts are taken when a section is assembled, upstream of both reductions the ledger
+// then applies to it -- provenance dedupe folding an entry into a higher-priority section, and
+// budget omission -- and are never recomputed against what survived. The per-entry
+// autobiographical_recall_cap.rendered_count IS recomputed, twice, so the two numbers on the same
+// section are measured at different stages and can disagree without either being wrong. Naming the
+// stage explained a shortfall without sizing it: the budget reduction announced itself as an
+// evidence_ledger_omitted entry and the dedupe half left no count anywhere, so a page could show
+// forty-eight assembled, seven printed and seventeen omitted and leave the other twenty-four
+// unaccountable in either direction. The dedupe stage now writes its own per-section drop count
+// back onto the framing, so both reductions subtract from the population to the page. What remains
+// deliberately unclaimed is that the subtraction always closes: a section can carry an omission
+// entry from a stage earlier than either -- recent_lived_experience prints the compiler's own
+// detail-omission breadcrumb -- so a residue names a third reduction rather than a lost row.
+//
+// Partition: every key counts a named subset, and until the population was printed beside them a
+// reader had no denominator. autobiographical_recall counts one kind out of the twelve it can
+// assemble, so a page carrying ten rows of other kinds prints a figure of zero above them: not a
+// shortfall at all, and unreachable by any amount of stage-naming. rows_assembled is the fix and
+// it is required by the type rather than agreed by convention, so a subset figure cannot be
+// printed without the population it was taken over.
+const FRAMING_COUNTS_SCOPE =
+  "framing_counts_scope: rows_assembled is the population this section was assembled from, and every other figure counts one named subset of that population, so the figures need not sum to it, need not cover it, and one of them can sit below the number of rows printed here without a row having gone missing. Two reductions run between that count and this page and both report themselves: folded_out_by_provenance counts rows dropped because a higher-priority section carries the same evidence or because they merged into a sibling row here, and the omitted-entries row below counts what the finalizer ledger budget then cut. That key is written by the dedupe stage itself, so a render taken before that stage carries no such key at all and its absence there is not a zero. Those two are fates rather than content classes, so they crosscut the other subsets instead of joining them, and subtracting both from rows_assembled should leave the rows printed here; a residue is a reduction neither of them names, which is what an omission row from an earlier stage counts.";
+
+function orderedFramingCounts(
+  counts: EvidenceLedgerSectionFramingCounts,
+): EvidenceLedgerSectionFramingCounts {
+  const { rows_assembled: rowsAssembled, ...subsets } = counts;
+
+  return { rows_assembled: rowsAssembled, ...subsets };
+}
+
 export function renderSection(section: EvidenceLedgerSection): string {
   const framingLines =
     section.framing === undefined
@@ -37,7 +74,12 @@ export function renderSection(section: EvidenceLedgerSection): string {
           `framing: ${section.framing.text}`,
           ...(section.framing.counts === undefined
             ? []
-            : [`framing_counts: ${JSON.stringify(section.framing.counts)}`]),
+            : [
+                // The population leads the object wherever the call site happens to put it, so the
+                // key the scope line names is never buried between the subsets it bounds.
+                `framing_counts: ${JSON.stringify(orderedFramingCounts(section.framing.counts))}`,
+                FRAMING_COUNTS_SCOPE,
+              ]),
         ];
 
   if (section.entries.length === 0) {

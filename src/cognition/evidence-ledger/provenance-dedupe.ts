@@ -191,6 +191,83 @@ function compareCanonicalRefs(left: LedgerEntryRef, right: LedgerEntryRef): numb
   );
 }
 
+type RetrievedOpenQuestionMerge = {
+  canonical: LedgerEntryRef;
+  openQuestionId: string;
+};
+
+// Retrieval and lifecycle assembly intentionally contribute different facts about one question.
+// Their shared machine handle makes this a merge even when both rows land in open_questions, where
+// ordinary provenance groups remain independent.
+function retrievedOpenQuestionId(ref: LedgerEntryRef): string | null {
+  return ref.entry.via_retrieval === true
+    ? metadataString(ref.entry.state_metadata?.["open_question_id"])
+    : null;
+}
+
+function retrievedOpenQuestionMerge(
+  group: readonly LedgerEntryRef[],
+): RetrievedOpenQuestionMerge | null {
+  for (const canonical of group) {
+    const openQuestionId = suffixAfterPrefix(canonical.entry.id, "open_question:");
+
+    if (openQuestionId === null) {
+      continue;
+    }
+
+    if (
+      group.length > 1 &&
+      group.every((ref) => ref === canonical || retrievedOpenQuestionId(ref) === openQuestionId)
+    ) {
+      return { canonical, openQuestionId };
+    }
+  }
+
+  return null;
+}
+
+function mergeRetrievedOpenQuestionEntries(
+  group: readonly LedgerEntryRef[],
+  merge: RetrievedOpenQuestionMerge,
+): EvidenceLedgerEntry {
+  const retrievedRefs = group.filter((ref) => ref !== merge.canonical);
+  const retrievedFields = retrievedRefs.reduce<Partial<EvidenceLedgerEntry>>(
+    (fields, ref) => ({ ...fields, ...ref.entry }),
+    {},
+  );
+  const states = [merge.canonical, ...retrievedRefs]
+    .map((ref) => ref.entry.state)
+    .filter((state): state is string => state !== undefined && state.length > 0);
+  const retrievalSources = [
+    ...new Set(
+      retrievedRefs
+        .map((ref) => ref.entry.value)
+        .filter((value): value is string => value !== undefined && value.length > 0),
+    ),
+  ];
+  const stateMetadata = Object.assign(
+    {},
+    ...retrievedRefs.map((ref) => ref.entry.state_metadata ?? {}),
+    merge.canonical.entry.state_metadata ?? {},
+    {
+      open_question_id: merge.openQuestionId,
+      ...(retrievalSources.length === 0 ? {} : { retrieval_sources: retrievalSources }),
+    },
+  ) as Record<string, unknown>;
+  const citations = [
+    ...new Set([...group.flatMap((ref) => ref.entry.citations ?? []), ...citationHandles(group)]),
+  ];
+
+  return {
+    ...retrievedFields,
+    ...merge.canonical.entry,
+    ...(states.length === 0 ? {} : { state: [...new Set(states)].join(" ") }),
+    state_metadata: stateMetadata,
+    citations,
+    via_retrieval: true,
+  };
+}
+
 export function dedupeEvidenceLedgerByProvenance(ledger: EvidenceLedger): {
   ledger: EvidenceLedger;
   dedupedEntryCount: number;
@@ -270,36 +347,58 @@ export function dedupeEvidenceLedgerByProvenance(ledger: EvidenceLedger): {
 
   const canonicalByRef = new Map<LedgerEntryRef, EvidenceLedgerEntry>();
   const droppedRefs = new Set<LedgerEntryRef>();
+  const droppedCountsBySectionIndex = new Map<number, number>();
   let dedupedEntryCount = 0;
 
   for (const group of groups.values()) {
     const sectionIds = new Set(group.map((ref) => ref.sectionId));
+    const openQuestionMerge = retrievedOpenQuestionMerge(group);
 
-    if (group.length <= 1 || sectionIds.size <= 1) {
+    if (group.length <= 1 || (sectionIds.size <= 1 && openQuestionMerge === null)) {
       continue;
     }
 
-    const protectedRefs = group.filter(isProvenanceDedupeProtected);
-    const canonical = [...(protectedRefs.length > 0 ? protectedRefs : group)].sort(
-      compareCanonicalRefs,
-    )[0]!;
-    const citations = citationHandles(group);
-    canonicalByRef.set(canonical, {
-      ...canonical.entry,
-      citations: [...new Set([...(canonical.entry.citations ?? []), ...citations])],
-    });
+    const canonical =
+      openQuestionMerge?.canonical ??
+      (() => {
+        const protectedRefs = group.filter(isProvenanceDedupeProtected);
+        return [...(protectedRefs.length > 0 ? protectedRefs : group)].sort(
+          compareCanonicalRefs,
+        )[0]!;
+      })();
+    canonicalByRef.set(
+      canonical,
+      openQuestionMerge === null
+        ? {
+            ...canonical.entry,
+            citations: [
+              ...new Set([...(canonical.entry.citations ?? []), ...citationHandles(group)]),
+            ],
+          }
+        : mergeRetrievedOpenQuestionEntries(group, openQuestionMerge),
+    );
 
     for (const ref of group) {
       if (ref !== canonical && !isProvenanceDedupeProtected(ref)) {
         droppedRefs.add(ref);
+        droppedCountsBySectionIndex.set(
+          ref.sectionIndex,
+          (droppedCountsBySectionIndex.get(ref.sectionIndex) ?? 0) + 1,
+        );
         dedupedEntryCount += 1;
       }
     }
   }
 
-  const sections = ledger.sections.map((section, sectionIndex) => ({
-    ...section,
-    entries: section.entries.flatMap((entry, entryIndex) => {
+  // A section's framing counts are taken at assembly, upstream of this stage, and until now this
+  // stage was the one reduction that reported nothing anywhere: the budget cut announces itself as
+  // an evidence_ledger_omitted entry, and a fold left the shortfall between the population and the
+  // page unaccountable from the page. Writing the per-section drop count back onto the framing the
+  // section already carries closes that -- the two reductions subtract from rows_assembled to the
+  // rows printed, and a residue in that subtraction is a stage neither of them names. Zero is
+  // printed rather than omitted, so "nothing was folded" is a statement rather than an absence.
+  const sections = ledger.sections.map((section, sectionIndex) => {
+    const entries = section.entries.flatMap((entry, entryIndex) => {
       const ref = refs.find(
         (candidate) =>
           candidate.sectionIndex === sectionIndex && candidate.entryIndex === entryIndex,
@@ -310,8 +409,24 @@ export function dedupeEvidenceLedgerByProvenance(ledger: EvidenceLedger): {
       }
 
       return [canonicalByRef.get(ref) ?? entry];
-    }),
-  }));
+    });
+
+    if (section.framing?.counts === undefined) {
+      return { ...section, entries };
+    }
+
+    return {
+      ...section,
+      framing: {
+        ...section.framing,
+        counts: {
+          ...section.framing.counts,
+          folded_out_by_provenance: droppedCountsBySectionIndex.get(sectionIndex) ?? 0,
+        },
+      },
+      entries,
+    };
+  });
 
   return {
     ledger: cloneLedgerWithSections(ledger, sections),

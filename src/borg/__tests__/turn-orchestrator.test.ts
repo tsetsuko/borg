@@ -1,3 +1,4 @@
+import { seedTestEmbeddingProfile } from "../../test-support/embedding-profile.js";
 import { readFileSync } from "node:fs";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -133,6 +134,7 @@ function createNoCorrectivePreferenceResponse() {
           enforcement_class: null,
           critical_domain: null,
           directive: null,
+          directive_source_stream_entry_id: null,
           directive_family: null,
           closure_pressure_relevance: null,
           priority: null,
@@ -211,6 +213,7 @@ describe("Borg", () => {
     tempDirs.push(tempDir);
 
     const clock = new ManualClock(1_000);
+    seedTestEmbeddingProfile(tempDir);
     const store = new LanceDbStore({
       uri: join(tempDir, "lancedb"),
     });
@@ -573,6 +576,7 @@ describe("Borg", () => {
     tempDirs.push(tempDir);
 
     const clock = new ManualClock(1_000);
+    seedTestEmbeddingProfile(tempDir);
     const store = new LanceDbStore({
       uri: join(tempDir, "lancedb"),
     });
@@ -715,6 +719,7 @@ describe("Borg", () => {
     tempDirs.push(tempDir);
 
     const clock = new ManualClock(1_000);
+    seedTestEmbeddingProfile(tempDir);
     const store = new LanceDbStore({
       uri: join(tempDir, "lancedb"),
     });
@@ -913,6 +918,7 @@ describe("Borg", () => {
     tempDirs.push(tempDir);
 
     const clock = new ManualClock(1_000);
+    seedTestEmbeddingProfile(tempDir);
     const store = new LanceDbStore({
       uri: join(tempDir, "lancedb"),
     });

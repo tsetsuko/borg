@@ -6,7 +6,10 @@ import {
   type GenerationGateResult,
   type GenerationGateStructuralSignals,
 } from "../generation/generation-gate.js";
-import { orderedPendingResponseUserRecords } from "../ingestion/backlog-prefix.js";
+import {
+  buildStreamBacklogResponseTo,
+  hydrateStreamBacklogBatch,
+} from "../ingestion/backlog-terminal.js";
 import { buildParticipantRosterFromRepositories } from "../perception/index.js";
 import {
   resolveActiveParticipants,
@@ -15,7 +18,6 @@ import {
   scanRecentParticipantStreamEntries,
 } from "../participants.js";
 import type {
-  StreamCursor,
   StreamEntry,
   StreamEntryIndexRecord,
   StreamResponseTo,
@@ -95,16 +97,74 @@ const ZEROED_SIGNALS: GenerationGateStructuralSignals = {
   hardCapActiveTurns: 0,
 };
 
-function priorSelfThoughtText(context: AutonomyTriggerContext | null | undefined): string | null {
+type PriorSelfThought = {
+  text: string;
+  updatedAt: number | null;
+  disclosure: string | null;
+};
+
+// The scheduler carries text, updated_at and a disclosure label on this payload field; a
+// reader that destructures only `text` drops the other two silently, and nothing fails --
+// the anchor just renders thinner. Read the whole record here so a field the producer adds
+// is a visible omission rather than an invisible one.
+function priorSelfThought(
+  context: AutonomyTriggerContext | null | undefined,
+): PriorSelfThought | null {
   const value = context?.payload.prior_self_thought;
 
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
 
-  const text = (value as { text?: unknown }).text;
+  const record = value as { text?: unknown; updated_at?: unknown; disclosure?: unknown };
 
-  return typeof text === "string" && text.trim().length > 0 ? text : null;
+  if (typeof record.text !== "string" || record.text.trim().length === 0) {
+    return null;
+  }
+
+  return {
+    text: record.text,
+    updatedAt: typeof record.updated_at === "number" ? record.updated_at : null,
+    disclosure: typeof record.disclosure === "string" ? record.disclosure : null,
+  };
+}
+
+// The anchor is a stored record, not the thought currently being had, and it is selected by
+// recency alone: `TrainOfThoughtRepository.get()` returns the single latest journal entry
+// from whichever wake wrote last, with no filter on the subject this wake fired for. Hoisted
+// bare it reads as present thought of unknown age -- so name the age, the depth, the
+// selection, and the disclosure class the producer attached. Scope the depth claim to the
+// automatic read: this one row is the whole of what the harness fetches, but
+// `tool.ownRecords.list` is registered for both the autonomous and deliberator origins, so a
+// wider journal read is available in the same turn. Saying "the only journal read in this
+// turn" unscoped reads as a capability bound and points away from the one tool that answers
+// "have I already done this".
+//
+// Scope the remedy too. The caveat raises two lanes -- what I have already done, and what I
+// have already sent -- and then names one tool, which invites reading that tool as the answer
+// to both. It is not: `OWN_RECORD_KINDS` is exactly `["thought", "journal"]`, and no read tool
+// on any turn (`LIVE_TURN_READ_FINALIZER_TOOL_NAMES`, `AUTONOMOUS_INTERIOR_FINALIZER_TOOL_NAMES`)
+// reads outbound posts or their delivery outcomes. Offering an uncovering remedy for a named
+// gap is worse than offering none: the browse comes back empty for the send lane exactly as it
+// would if nothing had been sent, so the tool manufactures the confirmation the caveat warned
+// against. Name the boundary instead, and say which way the absence does not cut.
+function priorSelfThoughtProvenance(thought: PriorSelfThought): string {
+  const written =
+    thought.updatedAt === null ? "unknown time" : new Date(thought.updatedAt).toISOString();
+
+  return [
+    `Journal anchor (written ${written}`,
+    thought.disclosure === null ? "" : `, disclosure: ${thought.disclosure}`,
+    "). This is my latest journal entry by recency alone -- the last one written from any wake, ",
+    "not one selected for this wake's subject -- and it is one row deep and the only journal read ",
+    "the harness performs for me, here or on any other turn. Anything else I have already done or ",
+    "already sent is not in it and is not implied absent by it. A wider read exists and is mine to ",
+    "make rather than the wake's: tool.ownRecords.list browses my thoughts and journal over a time ",
+    "range I choose, on this turn and on every live turn. That read covers the thinking lane only. ",
+    "It does not read what I sent: no read tool on this turn reaches my outbound posts or their ",
+    "delivery outcomes, so an empty browse is silent about sending rather than negative about it, ",
+    "and having no evidence here that I sent something is not evidence that I did not.",
+  ].join("");
 }
 
 export function cognitionInputForTurnInput(
@@ -116,7 +176,7 @@ export function cognitionInputForTurnInput(
     return turnInput.userMessage;
   }
 
-  const priorThought = priorSelfThoughtText(trigger);
+  const priorThought = priorSelfThought(trigger);
 
   if (priorThought === null) {
     return formatAutonomyTriggerContext(trigger);
@@ -128,7 +188,9 @@ export function cognitionInputForTurnInput(
   const { prior_self_thought: _hoisted, ...remainingPayload } = trigger.payload;
 
   return [
-    priorThought,
+    priorSelfThoughtProvenance(priorThought),
+    "",
+    priorThought.text,
     "",
     formatAutonomyTriggerContext({
       ...trigger,
@@ -191,13 +253,6 @@ type HydratedInboundBatch = {
   records: readonly StreamEntryIndexRecord[];
 };
 
-function batchEntryCursor(entry: HydratedInboundMessage): StreamCursor {
-  return {
-    ts: entry.timestamp,
-    entryId: entry.id,
-  };
-}
-
 function batchEntryAsStreamEntry(entry: HydratedInboundMessage): StreamEntry {
   return {
     id: entry.id,
@@ -213,6 +268,9 @@ function batchEntryAsStreamEntry(entry: HydratedInboundMessage): StreamEntry {
     ...(entry.source_message_key === undefined
       ? {}
       : { source_message_key: entry.source_message_key }),
+    ...(entry.observed_at === undefined ? {} : { observed_at: entry.observed_at }),
+    ...(entry.conversation === undefined ? {} : { conversation: entry.conversation }),
+    ...(entry.metadata === undefined ? {} : { metadata: entry.metadata }),
   };
 }
 
@@ -336,39 +394,6 @@ function validateInboundBatchRequest(input: {
   return entryIds;
 }
 
-function requiredEntryIndex(record: StreamEntryIndexRecord, code: string): number {
-  if (record.entry_index === null) {
-    throw new CognitionError("Inbound batch source entry has no durable order", {
-      code,
-    });
-  }
-
-  return record.entry_index;
-}
-
-async function readHydratedStreamEntriesById(input: {
-  options: TurnPhaseCoordinatorOptions;
-  sessionId: SessionId;
-  entryIds: readonly StreamEntryId[];
-}): Promise<Map<StreamEntryId, StreamEntry>> {
-  const wanted = new Set(input.entryIds);
-  const entries = new Map<StreamEntryId, StreamEntry>();
-
-  for await (const entry of input.options.createStreamReader(input.sessionId).iterate({
-    kinds: ["user_msg"],
-  })) {
-    if (wanted.has(entry.id)) {
-      entries.set(entry.id, entry);
-    }
-
-    if (entries.size === wanted.size) {
-      break;
-    }
-  }
-
-  return entries;
-}
-
 async function hydrateInboundBatch(input: {
   options: TurnPhaseCoordinatorOptions;
   sessionId: SessionId;
@@ -383,14 +408,16 @@ async function hydrateInboundBatch(input: {
     });
   }
 
-  const recordsById = entryIndex.lookupMany(input.entryIds);
-  const sourceEntriesById = await readHydratedStreamEntriesById({
-    options: input.options,
+  const batch = await hydrateStreamBacklogBatch({
+    dataDir: input.options.config.dataDir,
+    entryIndex,
+    createStreamReader: input.options.createStreamReader,
     sessionId: input.sessionId,
     entryIds: input.entryIds,
+    throughCursorInclusive: isInboundBatchTurnInput(input.rawTurnInput)
+      ? input.rawTurnInput.inboundBatch.throughCursorInclusive
+      : undefined,
   });
-  const records: StreamEntryIndexRecord[] = [];
-  const sourceEntries: StreamEntry[] = [];
   const hydrated: HydratedInboundMessage[] = [];
   const attachmentsByParentEntry = new Map<StreamEntryId, HydratedInboundAttachment[]>();
   const perceptionByAttachmentId = new Map(
@@ -430,266 +457,32 @@ async function hydrateInboundBatch(input: {
     );
   }
 
-  for (const entryId of input.entryIds) {
-    const record = recordsById.get(entryId);
-
-    if (record === undefined) {
-      throw new CognitionError("Inbound batch source entry is missing from the stream index", {
-        code: "INBOUND_BATCH_ENTRY_MISSING",
-      });
-    }
-
-    if (record.session_id !== input.sessionId) {
-      throw new CognitionError("Inbound batch source entry belongs to a different session", {
-        code: "INBOUND_BATCH_SESSION_MISMATCH",
-      });
-    }
-
-    if (record.kind !== "user_msg") {
-      throw new CognitionError("Inbound batch entries must be user_msg stream entries", {
-        code: "INBOUND_BATCH_ENTRY_KIND_INVALID",
-      });
-    }
-
-    const entryIndexValue = requiredEntryIndex(record, "INBOUND_BATCH_ENTRY_ORDER_MISSING");
-    const sourceEntry = sourceEntriesById.get(entryId);
-
-    if (sourceEntry === undefined) {
-      throw new CognitionError("Inbound batch source entry is missing from the stream", {
-        code: "INBOUND_BATCH_ENTRY_MISSING",
-      });
-    }
-
-    if (
-      sourceEntry.session_id !== record.session_id ||
-      sourceEntry.timestamp !== record.timestamp ||
-      sourceEntry.kind !== record.kind ||
-      (sourceEntry.sender_entity_id ?? null) !== record.sender_entity_id
-    ) {
-      throw new CognitionError("Inbound batch stream entry and index facts disagree", {
-        code: "INBOUND_BATCH_INDEX_MISMATCH",
-      });
-    }
-
-    if (typeof sourceEntry.content !== "string") {
-      throw new CognitionError("Inbound batch entries must be text-only user messages", {
-        code: "INBOUND_BATCH_CONTENT_INVALID",
-      });
-    }
-
-    records.push(record);
-    sourceEntries.push({
-      ...sourceEntry,
-      entry_index: entryIndexValue,
-      sender_entity_id: sourceEntry.sender_entity_id ?? null,
-    });
+  for (const sourceEntry of batch.sourceEntries) {
     const hydratedAttachments = attachmentsByParentEntry.get(sourceEntry.id);
 
     hydrated.push({
       id: sourceEntry.id,
       session_id: sourceEntry.session_id,
-      entry_index: entryIndexValue,
+      entry_index: sourceEntry.entry_index!,
       timestamp: sourceEntry.timestamp,
       kind: "user_msg",
-      content: sourceEntry.content,
+      content: sourceEntry.content as string,
       sender_entity_id: sourceEntry.sender_entity_id ?? null,
       ...(hydratedAttachments === undefined ? {} : { attachments: hydratedAttachments }),
       ...(sourceEntry.audience === undefined ? {} : { audience: sourceEntry.audience }),
       ...(sourceEntry.source_message_key === undefined
         ? {}
         : { source_message_key: sourceEntry.source_message_key }),
+      ...(sourceEntry.observed_at === undefined ? {} : { observed_at: sourceEntry.observed_at }),
+      ...(sourceEntry.conversation === undefined ? {} : { conversation: sourceEntry.conversation }),
+      ...(sourceEntry.metadata === undefined ? {} : { metadata: sourceEntry.metadata }),
     });
-  }
-
-  for (let index = 1; index < records.length; index += 1) {
-    const previous = requiredEntryIndex(records[index - 1]!, "INBOUND_BATCH_ENTRY_ORDER_MISSING");
-    const current = requiredEntryIndex(records[index]!, "INBOUND_BATCH_ENTRY_ORDER_MISSING");
-
-    if (current <= previous) {
-      throw new CognitionError("Inbound batch source entries must be ordered oldest-first", {
-        code: "INBOUND_BATCH_ORDER_INVALID",
-      });
-    }
-  }
-
-  const requestedThrough = isInboundBatchTurnInput(input.rawTurnInput)
-    ? input.rawTurnInput.inboundBatch.throughCursorInclusive
-    : undefined;
-  const lastEntry = hydrated[hydrated.length - 1];
-
-  if (
-    requestedThrough !== undefined &&
-    lastEntry !== undefined &&
-    (requestedThrough.entryId !== lastEntry.id || requestedThrough.ts !== lastEntry.timestamp)
-  ) {
-    throw new CognitionError(
-      "Inbound batch through cursor does not match the hydrated tail entry",
-      {
-        code: "INBOUND_BATCH_CURSOR_MISMATCH",
-      },
-    );
   }
 
   return {
     entries: orderedInboundBatchEntries(hydrated),
-    sourceEntries,
-    records,
-  };
-}
-
-function watermarkEntryIndex(input: {
-  entryIndex: NonNullable<TurnPhaseCoordinatorOptions["entryIndex"]>;
-  sessionId: SessionId;
-  watermark: StreamCursor | null;
-}): number {
-  if (input.watermark === null) {
-    return -1;
-  }
-
-  const record = input.entryIndex.lookup(input.watermark.entryId);
-
-  if (record === null) {
-    throw new CognitionError("Inbound batch watermark cursor is missing from the stream index", {
-      code: "INBOUND_BATCH_WATERMARK_NOT_INDEXED",
-    });
-  }
-
-  if (record.session_id !== input.sessionId || record.timestamp !== input.watermark.ts) {
-    throw new CognitionError("Inbound batch watermark cursor mismatches the stream index", {
-      code: "INBOUND_BATCH_WATERMARK_CURSOR_MISMATCH",
-    });
-  }
-
-  return requiredEntryIndex(record, "INBOUND_BATCH_WATERMARK_ORDER_MISSING");
-}
-
-function assertNoExistingTerminalStamp(input: {
-  coordinator: TurnPhaseCoordinatorOptions["chatResponseWatermarkCoordinator"];
-  sessionId: SessionId;
-  fromCursorExclusive: StreamCursor | null;
-  throughCursorInclusive: StreamCursor;
-  sourceUserEntryIds: readonly StreamEntryId[];
-}): void {
-  const existing = input.coordinator?.findTerminalStampForBatch({
-    sessionId: input.sessionId,
-    fromCursorExclusive: input.fromCursorExclusive,
-    throughCursorInclusive: input.throughCursorInclusive,
-    sourceEntryIds: input.sourceUserEntryIds,
-    count: input.sourceUserEntryIds.length,
-  });
-
-  if (existing !== null && existing !== undefined) {
-    throw new CognitionError("Inbound batch already has a terminal response stamp", {
-      code: "INBOUND_BATCH_ALREADY_RESPONDED",
-    });
-  }
-}
-
-function assertContiguousUnrespondedBatch(input: {
-  entryIndex: NonNullable<TurnPhaseCoordinatorOptions["entryIndex"]>;
-  sessionId: SessionId;
-  fromCursorExclusive: StreamCursor | null;
-  throughCursorInclusive: StreamCursor;
-  throughRecord: StreamEntryIndexRecord;
-  sourceUserEntryIds: readonly StreamEntryId[];
-}): void {
-  const watermarkIndex = watermarkEntryIndex({
-    entryIndex: input.entryIndex,
-    sessionId: input.sessionId,
-    watermark: input.fromCursorExclusive,
-  });
-  const throughIndex = requiredEntryIndex(input.throughRecord, "INBOUND_BATCH_ENTRY_ORDER_MISSING");
-
-  if (throughIndex <= watermarkIndex) {
-    throw new CognitionError("Inbound batch through cursor is not after the response watermark", {
-      code: "INBOUND_BATCH_STALE",
-    });
-  }
-
-  const expectedIds = orderedPendingResponseUserRecords({
-    records: input.entryIndex.lookupSessionEntriesByKind({
-      sessionId: input.sessionId,
-      kind: "user_msg",
-    }),
-    afterEntryIndex: watermarkIndex,
-    throughEntryIndexInclusive: throughIndex,
-    orderMissingCode: "INBOUND_BATCH_CONTIGUITY_ORDER_MISSING",
-  }).map((record) => record.entry_id);
-
-  if (
-    expectedIds.length !== input.sourceUserEntryIds.length ||
-    expectedIds.some((entryId, index) => entryId !== input.sourceUserEntryIds[index])
-  ) {
-    throw new CognitionError(
-      "Inbound batch must be the contiguous oldest-first unresponded user_msg prefix",
-      {
-        code: "INBOUND_BATCH_NOT_CONTIGUOUS",
-      },
-    );
-  }
-}
-
-function buildStreamBacklogResponseTo(input: {
-  coordinator: TurnPhaseCoordinatorOptions["chatResponseWatermarkCoordinator"];
-  entryIndex: TurnPhaseCoordinatorOptions["entryIndex"];
-  sessionId: SessionId;
-  entries: readonly HydratedInboundMessage[];
-  records: readonly StreamEntryIndexRecord[];
-  sourceUserEntryIds: readonly StreamEntryId[];
-}): StreamResponseTo {
-  if (input.coordinator === undefined) {
-    throw new CognitionError("Inbound batch turns require chat response watermark coordination", {
-      code: "CHAT_RESPONSE_WATERMARK_COORDINATOR_REQUIRED",
-    });
-  }
-
-  if (input.entryIndex === undefined) {
-    throw new CognitionError("Inbound batch turns require the stream entry index", {
-      code: "INBOUND_BATCH_INDEX_REQUIRED",
-    });
-  }
-
-  const throughEntry = input.entries[input.entries.length - 1];
-  const throughRecord = input.records[input.records.length - 1];
-
-  if (throughEntry === undefined || throughRecord === undefined) {
-    throw new CognitionError("Inbound batch turns require at least one source entry", {
-      code: "INBOUND_BATCH_EMPTY",
-    });
-  }
-
-  const throughCursorInclusive = batchEntryCursor(throughEntry);
-  assertNoExistingTerminalStamp({
-    coordinator: input.coordinator,
-    sessionId: input.sessionId,
-    fromCursorExclusive: input.coordinator.getWatermark(input.sessionId),
-    throughCursorInclusive,
-    sourceUserEntryIds: input.sourceUserEntryIds,
-  });
-  const reconciled = input.coordinator.reconcile(input.sessionId);
-
-  assertNoExistingTerminalStamp({
-    coordinator: input.coordinator,
-    sessionId: input.sessionId,
-    fromCursorExclusive: reconciled.watermark,
-    throughCursorInclusive,
-    sourceUserEntryIds: input.sourceUserEntryIds,
-  });
-  assertContiguousUnrespondedBatch({
-    entryIndex: input.entryIndex,
-    sessionId: input.sessionId,
-    fromCursorExclusive: reconciled.watermark,
-    throughCursorInclusive,
-    throughRecord,
-    sourceUserEntryIds: input.sourceUserEntryIds,
-  });
-
-  return {
-    kind: "stream_backlog",
-    from_cursor_exclusive: reconciled.watermark,
-    through_cursor_inclusive: throughCursorInclusive,
-    source_entry_ids: [...input.sourceUserEntryIds],
-    count: input.sourceUserEntryIds.length,
+    sourceEntries: batch.sourceEntries,
+    records: batch.records,
   };
 }
 
@@ -889,16 +682,21 @@ export class TurnPhaseCoordinator {
     const batchSourceUserEntryIds = hydratedBatch?.entries.map((entry) => entry.id) ?? [];
     const batchSingleNonNullSenderEntityId =
       batchEntries === null ? null : singleNonNullBatchSenderId(batchEntries);
+    if (hydratedBatch !== null && this.options.chatResponseWatermarkCoordinator === undefined) {
+      throw new CognitionError("Inbound batch turns require chat response watermark coordination", {
+        code: "CHAT_RESPONSE_WATERMARK_COORDINATOR_REQUIRED",
+      });
+    }
     const batchResponseTo =
       hydratedBatch === null
         ? undefined
         : buildStreamBacklogResponseTo({
-            coordinator: this.options.chatResponseWatermarkCoordinator,
-            entryIndex: this.options.entryIndex,
+            coordinator: this.options.chatResponseWatermarkCoordinator!,
+            entryIndex: this.options.entryIndex!,
             sessionId,
-            entries: hydratedBatch.entries,
+            sourceEntries: hydratedBatch.sourceEntries,
             records: hydratedBatch.records,
-            sourceUserEntryIds: batchSourceUserEntryIds,
+            sourceEntryIds: batchSourceUserEntryIds,
           });
     let currentTurnUserInput = initialCurrentTurnUserInput({
       rawTurnInput,
@@ -1341,6 +1139,7 @@ export class TurnPhaseCoordinator {
           sessionAudienceRole,
           participantRoster,
           persistedUserEntryId,
+          sourceUserEntries,
           sourceUserEntryIds,
           senderAttribution: currentTurnUserInput.senderAttribution,
           distinctSenderCount: effectiveDistinctSenderCount,
@@ -1372,6 +1171,7 @@ export class TurnPhaseCoordinator {
         turnId,
         sessionId,
         turnInput,
+        sourceUserEntries,
         isUserTurn,
         perception,
         workingMood,
@@ -1462,6 +1262,7 @@ export class TurnPhaseCoordinator {
     }
 
     const generationGate = new GenerationGate({
+      similarityConfig: this.options.config,
       llmClient,
       embeddingClient: this.options.embeddingClient,
       model: this.options.config.anthropic.models.background,
@@ -1556,6 +1357,7 @@ export class TurnPhaseCoordinator {
           audienceEntityId,
           audienceEntity,
           currentSenderBorgRole: creatorContext.currentSenderBorgRole,
+          currentSenderDisplayName: creatorContext.currentSenderDisplayName,
           operatorOnlyDirectivesAllowed: authorityAllowedForSingleSender,
           audienceProfile,
           sessionAudienceRole,
@@ -1630,6 +1432,7 @@ export class TurnPhaseCoordinator {
       llmClient,
       sessionId,
       sessionSourceType: sessionRecord?.source_type ?? null,
+      sessionAudienceRole,
       turnId,
       turnInput,
       streamWriter,

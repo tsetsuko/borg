@@ -1,3 +1,5 @@
+import type { IdentifierOnlyGuardInput } from "./cognition/generation/turn-post-generation-guard.js";
+import { similarityThresholds, type SimilarityThresholds } from "./config/similarity.js";
 // Borg public facade: exposes stable APIs while setup details live in focused modules.
 
 import type {
@@ -34,6 +36,7 @@ export type { BorgEnqueueMessageInput, BorgEnqueueMessageResult } from "./cognit
  * operational state. Repository construction and storage wiring stay internal.
  */
 export class Borg {
+  readonly similarityThresholds: SimilarityThresholds;
   readonly stream: BorgFacades["stream"];
   readonly episodic: BorgFacades["episodic"];
   readonly self: BorgFacades["self"];
@@ -47,6 +50,8 @@ export class Borg {
   readonly semantic: BorgFacades["semantic"];
   readonly relationalSlots: BorgFacades["relationalSlots"];
   readonly commitments: BorgFacades["commitments"];
+  readonly operatorAttention: BorgFacades["operatorAttention"];
+  readonly activity: BorgFacades["activity"];
   readonly creatorDirectives: BorgFacades["creatorDirectives"];
   readonly identity: BorgFacades["identity"];
   readonly correction: BorgFacades["correction"];
@@ -61,6 +66,7 @@ export class Borg {
   readonly sessions: BorgFacades["sessions"];
 
   private constructor(private readonly deps: BorgDependencies) {
+    this.similarityThresholds = similarityThresholds(deps.config);
     const facades = createBorgFacades(deps) as unknown as BorgFacades;
 
     this.stream = facades.stream;
@@ -76,6 +82,8 @@ export class Borg {
     this.semantic = facades.semantic;
     this.relationalSlots = facades.relationalSlots;
     this.commitments = facades.commitments;
+    this.operatorAttention = facades.operatorAttention;
+    this.activity = facades.activity;
     this.creatorDirectives = facades.creatorDirectives;
     this.identity = facades.identity;
     this.correction = facades.correction;
@@ -96,6 +104,15 @@ export class Borg {
    */
   turn(input: TurnInput): Promise<TurnResult> {
     return this.deps.turnOrchestrator.run(input);
+  }
+
+  /** Check an external cognition reply using the shared structural guard, without LLM work. */
+  guardReply(input: IdentifierOnlyGuardInput) {
+    return this.deps.turnOrchestrator.postGenerationGuardRunner.run({
+      ...input,
+      executionMode: "identifiers-only",
+      closureLoop: null,
+    });
   }
 
   /**

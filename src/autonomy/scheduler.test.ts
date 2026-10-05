@@ -17,20 +17,27 @@ import { SelfDecisionRepository } from "../memory/self-decisions/index.js";
 import { selectSelfDecisionIntrospection } from "../memory/self-decisions/projection.js";
 import { TrainOfThoughtRepository } from "../memory/train-of-thought/index.js";
 import type { TurnResult } from "../cognition/index.js";
+import { associateTurnExecutionMetricsWithError } from "../cognition/turn-execution-metrics.js";
 
 import {
   createCommitmentExpiringTrigger,
   createGoalFollowupDueTrigger,
   createScheduledReflectionTrigger,
+  createScheduledWakeTrigger,
 } from "./index.js";
+import { ScheduledWakesRepository } from "./scheduled-wakes-repository.js";
 import {
   AutonomyScheduler,
   goalConcernPayload,
+  silentWakeOutcomeDetail,
   turnEmittedHeadway,
   type AutonomySchedulerOptions,
 } from "./scheduler.js";
 import type { AutonomyWakeSource } from "./types.js";
-import { AutonomyWakesRepository } from "./wakes-repository.js";
+import {
+  AUTONOMY_WAKE_OUTCOME_DETAIL_MAX_LENGTH,
+  AutonomyWakesRepository,
+} from "./wakes-repository.js";
 import {
   getExecutiveFocusGoalStaleBackoffProcessName,
   goalStaleBackoffState,
@@ -39,6 +46,7 @@ import {
   DEFAULT_FLEET_BRAKE_OPTIONS,
   FLEET_BRAKE_PROCESS_NAME,
   readFleetBrakeMetadata,
+  type FleetBrakeMetadata,
   type FleetBrakeOptions,
 } from "./fleet-brake.js";
 
@@ -118,6 +126,7 @@ function createExecutiveFocusGoalStaleSource(goalId: string): AutonomyWakeSource
             selected_goal_id: goalId,
             selected_goal: {
               last_progress_ts: 500,
+              status: "active",
             },
           },
         },
@@ -148,6 +157,13 @@ const TEST_FLEET_BRAKE: FleetBrakeOptions = {
 function createStructuralTurnResult(input: {
   emissionKind: "message" | "continue_thought" | "suppressed";
   deliveredOutbound?: boolean;
+  undeliveredOutboundState?: string;
+  outboundCallOk?: boolean;
+  retiredGoalToolId?: string;
+  reflectionRetiredGoalIds?: TurnResult["reflectionRetiredGoalIds"];
+  suppressionReason?: Extract<TurnResult["emission"], { kind: "suppressed" }>["reason"];
+  finalizerRounds?: number;
+  stallRetries?: number;
 }): TurnResult {
   const emission: TurnResult["emission"] =
     input.emissionKind === "message"
@@ -158,7 +174,7 @@ function createStructuralTurnResult(input: {
         }
       : input.emissionKind === "continue_thought"
         ? { kind: "continue_thought" }
-        : { kind: "suppressed", reason: "finalizer_no_output" };
+        : { kind: "suppressed", reason: input.suppressionReason ?? "finalizer_no_output" };
 
   return {
     turn_id: "turn_autonomy_test",
@@ -176,8 +192,8 @@ function createStructuralTurnResult(input: {
     retrievedEpisodeIds: [],
     referencedEpisodeIds: [],
     intents: [],
-    toolCalls:
-      input.deliveredOutbound === true
+    toolCalls: [
+      ...(input.deliveredOutbound === true || input.undeliveredOutboundState !== undefined
         ? [
             {
               callId: "toolu_outbound",
@@ -185,18 +201,42 @@ function createStructuralTurnResult(input: {
               input: {},
               output: {
                 outbound: {
-                  emitted: true,
-                  delivery_outcome: {
-                    state: "delivered",
-                    agent_message_id: "strm_delivered",
-                  },
+                  emitted: input.deliveredOutbound === true,
+                  delivery_outcome:
+                    input.undeliveredOutboundState === undefined
+                      ? {
+                          state: "delivered",
+                          agent_message_id: "strm_delivered",
+                        }
+                      : { state: input.undeliveredOutboundState },
                 },
+              },
+              ok: input.outboundCallOk ?? true,
+              durationMs: 1,
+            },
+          ]
+        : []),
+      ...(input.retiredGoalToolId === undefined
+        ? []
+        : [
+            {
+              callId: "toolu_goal_retire",
+              name: "tool.goals.retire",
+              input: { goal_id: input.retiredGoalToolId, reason: "Superseded." },
+              output: {
+                status: "applied",
+                goal: { id: input.retiredGoalToolId, status: "abandoned" },
               },
               ok: true,
               durationMs: 1,
             },
-          ]
-        : [],
+          ]),
+    ],
+    finalizer_rounds: input.finalizerRounds ?? 1,
+    stall_retries: input.stallRetries ?? 0,
+    ...(input.reflectionRetiredGoalIds === undefined
+      ? {}
+      : { reflectionRetiredGoalIds: input.reflectionRetiredGoalIds }),
     agentMessageId: "strm_autonomy_test" as never,
   };
 }
@@ -306,6 +346,7 @@ function createBatchedGoalDueSource(input: {
           goal_id: goal.goalId,
           description: goal.description,
           priority: goal.priority,
+          status: "active" as const,
           target_at: goal.targetAt,
           last_progress_ts: goal.lastProgressTs,
           ...TEST_SELF_PRIVATE_DISCLOSURE,
@@ -319,6 +360,7 @@ function createBatchedGoalDueSource(input: {
                 priority: goal.priority,
                 target_at: goal.targetAt,
                 last_progress_ts: goal.lastProgressTs,
+                selected_goal: selectedGoal,
                 days_stale: 10,
                 reason: goal.reason,
                 ...TEST_SELF_PRIVATE_DISCLOSURE,
@@ -412,6 +454,7 @@ describe("AutonomyScheduler", () => {
     ).toEqual({
       goalId: "goal_aaaaaaaaaaaaaaaa",
       lastProgressTs: null,
+      status: null,
     });
     expect(
       goalConcernPayload({
@@ -426,6 +469,7 @@ describe("AutonomyScheduler", () => {
     ).toEqual({
       goalId: "goal_bbbbbbbbbbbbbbbb",
       lastProgressTs: 900,
+      status: null,
     });
     expect(
       goalConcernPayload({
@@ -460,6 +504,101 @@ describe("AutonomyScheduler", () => {
     expect(turnEmittedHeadway(createStructuralTurnResult({ emissionKind: "suppressed" }))).toBe(
       false,
     );
+  });
+
+  it("labels the complement of headway with the class that produced it", () => {
+    // The predicate above answers "did anything come out"; every no lands in
+    // `silent`, but a guard block now holds the streak while the other endings
+    // advance it. The same class keeps the diagnostic and policy aligned.
+    expect(
+      silentWakeOutcomeDetail(createStructuralTurnResult({ emissionKind: "suppressed" })),
+    ).toBe("deliberate-silence: finalizer_no_output");
+    expect(
+      silentWakeOutcomeDetail(
+        createStructuralTurnResult({
+          emissionKind: "suppressed",
+          suppressionReason: "commitment_violation_after_regenerate",
+        }),
+      ),
+    ).toBe("guard-blocked: commitment_violation_after_regenerate");
+    expect(
+      silentWakeOutcomeDetail(
+        createStructuralTurnResult({
+          emissionKind: "suppressed",
+          suppressionReason: "closure_pressure_only",
+        }),
+      ),
+    ).toBe("guard-blocked: closure_pressure_only");
+    expect(
+      silentWakeOutcomeDetail(
+        createStructuralTurnResult({
+          emissionKind: "suppressed",
+          suppressionReason: "empty_finalizer",
+        }),
+      ),
+    ).toBe("emission-failed: empty_finalizer");
+    // Never throws on a shape it did not expect: this runs inside the block that
+    // persists the wake's outcome, so a throw would recast a completed wake as a
+    // bookkeeping failure.
+    expect(
+      silentWakeOutcomeDetail({
+        ...createStructuralTurnResult({ emissionKind: "suppressed" }),
+        emission: undefined as never,
+      }),
+    ).toBe("no emission recorded");
+  });
+
+  it("names a reach that did not land rather than the closure its emission looks like", () => {
+    // A wake whose only act was an outbound post closes with
+    // `finalizer_no_output` whatever the post did, so the emission label reads
+    // as a silence the entity chose. `turnEmittedHeadway` already reads the
+    // delivery state to decide headway; these keep it as far as the reason.
+    for (const state of [
+      "target_busy",
+      "transport_failed",
+      "not_transportable",
+      "not_emitted",
+      "suppressed",
+    ]) {
+      expect(
+        silentWakeOutcomeDetail(
+          createStructuralTurnResult({
+            emissionKind: "suppressed",
+            undeliveredOutboundState: state,
+          }),
+        ),
+      ).toBe(`outbound-undelivered: ${state}`);
+    }
+
+    // An unrecognised state widens the tally by one bucket, not one per value,
+    // so a new state cannot fragment the counter it is summarised into.
+    expect(
+      silentWakeOutcomeDetail(
+        createStructuralTurnResult({
+          emissionKind: "suppressed",
+          undeliveredOutboundState: "some_future_state",
+        }),
+      ),
+    ).toBe("outbound-undelivered: unknown_state");
+
+    // A call the dispatcher failed is still a reach that did not land.
+    expect(
+      silentWakeOutcomeDetail(
+        createStructuralTurnResult({
+          emissionKind: "suppressed",
+          undeliveredOutboundState: "transport_failed",
+          outboundCallOk: false,
+        }),
+      ),
+    ).toBe("outbound-undelivered: call_failed");
+
+    // A delivered post is headway, so it never reaches this label, and a turn
+    // that posted nothing keeps the emission-derived reason unchanged.
+    expect(
+      silentWakeOutcomeDetail(
+        createStructuralTurnResult({ emissionKind: "suppressed", deliveredOutbound: true }),
+      ),
+    ).toBe("deliberate-silence: finalizer_no_output");
   });
 
   it("batches due goals into one budgeted wake while firing every per-goal event", async () => {
@@ -504,6 +643,7 @@ describe("AutonomyScheduler", () => {
     };
     const scheduler = createScheduler({
       db: harness.db,
+      wakeRepository,
       enabled: true,
       intervalMs: 1_000,
       maxWakesPerWindow: 1,
@@ -512,7 +652,6 @@ describe("AutonomyScheduler", () => {
       createStreamWriter: (sessionId) =>
         new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
       watermarkRepository,
-      wakeRepository,
       goalsRepository: harness.goalsRepository,
       turnOrchestrator: turnRunner,
       toolDispatcher: new ToolDispatcher({
@@ -566,6 +705,7 @@ describe("AutonomyScheduler", () => {
       const harness = await createOfflineTestHarness({ clock });
       cleanup = harness.cleanup;
       const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+      const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
       const actionAvailabilityKey = "outbound_action_surface_v1:atomic-batch";
       const goals = Array.from({ length: 3 }, (_, index) =>
         harness.goalsRepository.add({
@@ -610,6 +750,7 @@ describe("AutonomyScheduler", () => {
 
       const scheduler = createScheduler({
         db: harness.db,
+        wakeRepository,
         enabled: true,
         intervalMs: 1_000,
         maxWakesPerWindow: 6,
@@ -663,6 +804,12 @@ describe("AutonomyScheduler", () => {
       expect(writePosition).toBe(failurePosition);
       expect(failed).toMatchObject({ firedEvents: 1, bookkeepingErrorCount: 1 });
       expect(failed.events.every((event) => event.status === "bookkeeping_error")).toBe(true);
+      const expectedHeadwayBasis = `progress recorded on ${goals[1]!.id}`;
+      expect(wakeRepository.listSince(0, 1)[0]).toMatchObject({
+        outcome: "headway",
+        outcome_detail: expectedHeadwayBasis,
+        headway_bases: [expectedHeadwayBasis],
+      });
       for (const [index, goal] of goals.entries()) {
         const processName = getExecutiveFocusGoalStaleBackoffProcessName(goal.id);
         expect(watermarkRepository.get(processName, DEFAULT_SESSION_ID)).toEqual(
@@ -1010,6 +1157,7 @@ describe("AutonomyScheduler", () => {
     const harness = await createOfflineTestHarness({ clock });
     cleanup = harness.cleanup;
     const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+    const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
     const goal = harness.goalsRepository.add({
       description: "Only due goal",
       priority: 8,
@@ -1041,6 +1189,7 @@ describe("AutonomyScheduler", () => {
       intervalMs: 1_000,
       maxWakesPerWindow: 1,
       goalWakeBatchMax: 5,
+      wakeRepository,
       clock,
       createStreamWriter: (sessionId) =>
         new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
@@ -1060,6 +1209,7 @@ describe("AutonomyScheduler", () => {
     expect(JSON.stringify(turnRunner.run.mock.calls[0]?.[0].autonomyTrigger?.payload)).toBe(
       JSON.stringify(originalPayload),
     );
+    expect(wakeRepository.listSince(0, 1)[0]?.selected_goal_id).toBe(goal.id);
   });
 
   it("accounts for an untouched batched goal exactly like a silent single-goal wake", async () => {
@@ -1202,6 +1352,336 @@ describe("AutonomyScheduler", () => {
       expect(batched.acted).toBeNull();
     } finally {
       await Promise.all(harnesses.map((harness) => harness.cleanup()));
+    }
+  });
+
+  it("records ordered headway bases and credits only structurally attributable closure", async () => {
+    const runCase = async (input: {
+      mutation: "progress_and_tool_retire" | "reflection_retire" | "external_retire" | "none";
+      emissionKind: "message" | "continue_thought" | "suppressed";
+      deliveredOutbound?: boolean;
+    }) => {
+      const clock = new ManualClock(1_450_000);
+      const harness = await createOfflineTestHarness({ clock });
+      const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+      const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
+      const goal = harness.goalsRepository.add({
+        description: "Attribution target",
+        priority: 8,
+        provenance: { kind: "manual" },
+      });
+      const backoffProcessName = getExecutiveFocusGoalStaleBackoffProcessName(goal.id);
+      watermarkRepository.set(backoffProcessName, DEFAULT_SESSION_ID, {
+        lastTs: 500,
+        lastEntryId: "prior-empty-wake",
+        metadata: { empty_count: 2 },
+      });
+      const source = createBatchedGoalDueSource({
+        watermarkRepository,
+        sourceName: "goal_followup_due",
+        goals: [
+          {
+            eventId: `attribution-${input.mutation}`,
+            goalId: goal.id,
+            description: goal.description,
+            priority: goal.priority,
+            targetAt: null,
+            lastProgressTs: null,
+            reason: "stale",
+            rank: 0,
+          },
+        ],
+      });
+      const turnRunner = {
+        run: vi.fn(async () => {
+          if (input.mutation === "progress_and_tool_retire") {
+            harness.goalsRepository.updateProgress(goal.id, "Concrete result produced", {
+              kind: "manual",
+            });
+            harness.goalsRepository.retire(goal.id, "Goal superseded", { kind: "manual" });
+          } else if (input.mutation === "reflection_retire") {
+            harness.goalsRepository.updateStatus(goal.id, "abandoned", { kind: "manual" });
+          } else if (input.mutation === "external_retire") {
+            harness.goalsRepository.updateStatus(goal.id, "done", { kind: "manual" });
+          }
+
+          return createStructuralTurnResult({
+            emissionKind: input.emissionKind,
+            deliveredOutbound: input.deliveredOutbound,
+            ...(input.mutation === "progress_and_tool_retire"
+              ? { retiredGoalToolId: goal.id }
+              : {}),
+            ...(input.mutation === "reflection_retire"
+              ? { reflectionRetiredGoalIds: [goal.id] }
+              : {}),
+          });
+        }),
+      };
+      const scheduler = createScheduler({
+        db: harness.db,
+        wakeRepository,
+        enabled: true,
+        intervalMs: 1_000,
+        maxWakesPerWindow: 6,
+        clock,
+        createStreamWriter: (sessionId) =>
+          new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+        watermarkRepository,
+        goalsRepository: harness.goalsRepository,
+        turnOrchestrator: turnRunner,
+        toolDispatcher: new ToolDispatcher({
+          createStreamWriter: (sessionId) =>
+            new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+          clock,
+        }),
+        sources: [source],
+      });
+
+      try {
+        await scheduler.tick();
+        return {
+          goalId: goal.id,
+          wake: wakeRepository.listSince(0, 1)[0],
+          backoff: watermarkRepository.get(backoffProcessName, DEFAULT_SESSION_ID),
+        };
+      } finally {
+        await harness.cleanup();
+      }
+    };
+
+    const toolClosure = await runCase({
+      mutation: "progress_and_tool_retire",
+      emissionKind: "message",
+      deliveredOutbound: true,
+    });
+    expect(toolClosure.wake).toMatchObject({
+      selected_goal_id: toolClosure.goalId,
+      outcome: "headway",
+      outcome_detail: `emitted message; delivered outbound post; progress recorded on ${toolClosure.goalId}; goal ${toolClosure.goalId} retired by this turn`,
+    });
+    expect(toolClosure.backoff).toBeNull();
+
+    const reflectionClosure = await runCase({
+      mutation: "reflection_retire",
+      emissionKind: "suppressed",
+    });
+    expect(reflectionClosure.wake).toMatchObject({
+      outcome: "headway",
+      outcome_detail: `goal ${reflectionClosure.goalId} retired by this turn`,
+    });
+    expect(reflectionClosure.backoff).toBeNull();
+
+    const externalClosure = await runCase({
+      mutation: "external_retire",
+      emissionKind: "suppressed",
+    });
+    expect(externalClosure.wake).toMatchObject({
+      outcome: "silent",
+      outcome_detail: "deliberate-silence: finalizer_no_output",
+    });
+    expect(externalClosure.backoff).toMatchObject({ metadata: { empty_count: 3 } });
+
+    const continuedThought = await runCase({
+      mutation: "none",
+      emissionKind: "continue_thought",
+    });
+    expect(continuedThought.wake).toMatchObject({
+      outcome: "headway",
+      outcome_detail: "continue_thought",
+    });
+    expect(continuedThought.backoff).toMatchObject({ metadata: { empty_count: 3 } });
+  });
+
+  it.each([
+    { mutation: "progress" },
+    { mutation: "tool_closure" },
+    { mutation: "reflection_closure" },
+  ] as const)(
+    "attributes $mutation headway to the named goal on an executive step_due wake",
+    async ({ mutation }) => {
+      const clock = new ManualClock(1_475_000);
+      const harness = await createOfflineTestHarness({ clock });
+      const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+      const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
+      const goal = harness.goalsRepository.add({
+        description: "Complete the due executive step",
+        priority: 9,
+        provenance: { kind: "manual" },
+      });
+      const backoffProcessName = getExecutiveFocusGoalStaleBackoffProcessName(goal.id);
+      watermarkRepository.set(backoffProcessName, DEFAULT_SESSION_ID, {
+        lastTs: 500,
+        lastEntryId: "stale-lane-backoff",
+        metadata: { empty_count: 2 },
+      });
+      const source = createPersistentDueSource({
+        watermarkRepository,
+        sourceName: "executive_focus_due",
+        eventIds: [`step:${mutation}`],
+        payload: () => ({
+          reason: "step_due",
+          selected_goal_id: goal.id,
+          selected_goal: {
+            status: "active",
+            last_progress_ts: null,
+          },
+        }),
+      });
+      const turnRunner = {
+        run: vi.fn(async () => {
+          if (mutation === "progress") {
+            harness.goalsRepository.updateProgress(goal.id, "Completed a concrete step", {
+              kind: "manual",
+            });
+          } else if (mutation === "tool_closure") {
+            harness.goalsRepository.retire(goal.id, "Completed by the autonomous turn", {
+              kind: "manual",
+            });
+          } else {
+            harness.goalsRepository.updateStatus(goal.id, "abandoned", { kind: "manual" });
+          }
+
+          return createStructuralTurnResult({
+            emissionKind: "suppressed",
+            ...(mutation === "tool_closure" ? { retiredGoalToolId: goal.id } : {}),
+            ...(mutation === "reflection_closure" ? { reflectionRetiredGoalIds: [goal.id] } : {}),
+          });
+        }),
+      };
+      const scheduler = createScheduler({
+        db: harness.db,
+        wakeRepository,
+        enabled: true,
+        intervalMs: 1_000,
+        maxWakesPerWindow: 6,
+        clock,
+        createStreamWriter: (sessionId) =>
+          new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+        watermarkRepository,
+        goalsRepository: harness.goalsRepository,
+        turnOrchestrator: turnRunner,
+        toolDispatcher: new ToolDispatcher({
+          createStreamWriter: (sessionId) =>
+            new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+          clock,
+        }),
+        sources: [source],
+      });
+
+      try {
+        await scheduler.tick();
+        const progressBasis = `progress recorded on ${goal.id}`;
+        const closureBasis = `goal ${goal.id} retired by this turn`;
+        const expectedBases =
+          mutation === "progress"
+            ? [progressBasis]
+            : mutation === "tool_closure"
+              ? [progressBasis, closureBasis]
+              : [closureBasis];
+
+        expect(wakeRepository.listSince(0, 1)[0]).toMatchObject({
+          trigger_name: "executive_focus_due",
+          selected_goal_id: goal.id,
+          outcome: "headway",
+          outcome_detail: expectedBases.join("; "),
+          headway_bases: expectedBases,
+        });
+        // step_due is attributed to its goal, but remains outside the stale-lane
+        // empty-wake dampener exactly as it was before attribution was added.
+        expect(watermarkRepository.get(backoffProcessName, DEFAULT_SESSION_ID)).toMatchObject({
+          lastTs: 500,
+          lastEntryId: "stale-lane-backoff",
+          metadata: { empty_count: 2 },
+        });
+      } finally {
+        await harness.cleanup();
+      }
+    },
+  );
+
+  it("preserves every goal id in the structural detail for a maximum goal batch", async () => {
+    const clock = new ManualClock(1_490_000);
+    const harness = await createOfflineTestHarness({ clock });
+    const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+    const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
+    const goals = Array.from({ length: 5 }, (_, index) =>
+      harness.goalsRepository.add({
+        description: `Maximum batch goal ${index + 1}`,
+        priority: 10 - index,
+        provenance: { kind: "manual" },
+      }),
+    );
+    const source = createBatchedGoalDueSource({
+      watermarkRepository,
+      sourceName: "goal_followup_due",
+      goals: goals.map((goal, index) => ({
+        eventId: `maximum-batch-${index}`,
+        goalId: goal.id,
+        description: goal.description,
+        priority: goal.priority,
+        targetAt: null,
+        lastProgressTs: null,
+        reason: "stale",
+        rank: index,
+      })),
+    });
+    const turnRunner = {
+      run: vi.fn(async () => {
+        for (const goal of goals) {
+          harness.goalsRepository.updateProgress(goal.id, "Produced a concrete batch result", {
+            kind: "manual",
+          });
+          harness.goalsRepository.updateStatus(goal.id, "abandoned", { kind: "manual" });
+        }
+
+        return createStructuralTurnResult({
+          emissionKind: "suppressed",
+          reflectionRetiredGoalIds: goals.map((goal) => goal.id),
+        });
+      }),
+    };
+    const scheduler = createScheduler({
+      db: harness.db,
+      wakeRepository,
+      enabled: true,
+      intervalMs: 1_000,
+      maxWakesPerWindow: 6,
+      goalWakeBatchMax: 5,
+      clock,
+      createStreamWriter: (sessionId) =>
+        new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+      watermarkRepository,
+      goalsRepository: harness.goalsRepository,
+      turnOrchestrator: turnRunner,
+      toolDispatcher: new ToolDispatcher({
+        createStreamWriter: (sessionId) =>
+          new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+        clock,
+      }),
+      sources: [source],
+    });
+
+    try {
+      await scheduler.tick();
+      const wake = wakeRepository.listSince(0, 1)[0];
+      const renderedDetail = (await scheduler.describe()).fleet_brake.window_headway_reasons
+        .reasons[0]?.detail;
+
+      expect(wake?.headway_bases).toHaveLength(10);
+      expect(wake?.outcome_detail?.length).toBeGreaterThan(AUTONOMY_WAKE_OUTCOME_DETAIL_MAX_LENGTH);
+      expect(wake?.outcome_detail).toBe(wake?.headway_bases?.join("; "));
+      expect(renderedDetail).toBe(wake?.outcome_detail);
+      for (const goal of goals) {
+        expect(wake?.headway_bases).toEqual(
+          expect.arrayContaining([
+            `progress recorded on ${goal.id}`,
+            `goal ${goal.id} retired by this turn`,
+          ]),
+        );
+        expect(renderedDetail).toContain(goal.id);
+      }
+    } finally {
+      await harness.cleanup();
     }
   });
 
@@ -1358,6 +1838,7 @@ describe("AutonomyScheduler", () => {
       db: harness.db,
       clock,
     });
+    const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
     const dispatcher = new ToolDispatcher({
       createStreamWriter: (sessionId) =>
         new StreamWriter({
@@ -1380,9 +1861,16 @@ describe("AutonomyScheduler", () => {
     });
     const turnRunner = {
       run: vi.fn().mockResolvedValue({
+        turn_id: "turn_scheduler_execution_counts",
         mode: "idle",
         path: "system_1",
         response: "Reflected on recent changes.",
+        emitted: true,
+        emission: {
+          kind: "message",
+          content: "Reflected on recent changes.",
+          agentMessageId: "strm_agent_result",
+        },
         thoughts: [],
         usage: {
           input_tokens: 1,
@@ -1393,6 +1881,8 @@ describe("AutonomyScheduler", () => {
         referencedEpisodeIds: [],
         intents: [],
         toolCalls: [],
+        finalizer_rounds: 3,
+        stall_retries: 2,
         agentMessageId: "strm_agent_result",
       }),
     };
@@ -1409,6 +1899,7 @@ describe("AutonomyScheduler", () => {
           clock,
         }),
       watermarkRepository,
+      wakeRepository,
       turnOrchestrator: turnRunner,
       toolDispatcher: dispatcher,
       sources: [trigger],
@@ -1417,6 +1908,17 @@ describe("AutonomyScheduler", () => {
     const firstTick = await scheduler.tick();
     expect(firstTick.firedEvents).toBe(1);
     expect(turnRunner.run).toHaveBeenCalledTimes(1);
+    expect(wakeRepository.listSince(0, 1)[0]).toMatchObject({
+      outcome: "headway",
+      finalizer_rounds: 3,
+      stall_retries: 2,
+    });
+    expect((await scheduler.describe()).window_wakes[0]).toMatchObject({
+      trigger_name: "scheduled_reflection",
+      outcome: "headway",
+      finalizer_rounds: 3,
+      stall_retries: 2,
+    });
     expect(
       watermarkRepository.get("autonomy:scheduled-reflection", DEFAULT_SESSION_ID),
     ).toMatchObject({
@@ -1493,6 +1995,8 @@ describe("AutonomyScheduler", () => {
         referencedEpisodeIds: [],
         intents: [],
         toolCalls: [],
+        finalizer_rounds: 1,
+        stall_retries: 0,
         agentMessageId: "strm_agent_prior_thought",
       }),
     };
@@ -1644,6 +2148,8 @@ describe("AutonomyScheduler", () => {
         referencedEpisodeIds: [],
         intents: [],
         toolCalls: [],
+        finalizer_rounds: 1,
+        stall_retries: 0,
         agentMessageId: "strm_agent_decision",
       }),
     };
@@ -1721,6 +2227,8 @@ describe("AutonomyScheduler", () => {
         referencedEpisodeIds: [],
         intents: [],
         toolCalls: [],
+        finalizer_rounds: 1,
+        stall_retries: 0,
         agentMessageId: "strm_agent_same_due_event",
       }),
     };
@@ -1792,6 +2300,8 @@ describe("AutonomyScheduler", () => {
         referencedEpisodeIds: [],
         intents: [],
         toolCalls: [],
+        finalizer_rounds: 1,
+        stall_retries: 0,
         agentMessageId: "strm_agent_suppressed",
       }),
     };
@@ -1835,7 +2345,7 @@ describe("AutonomyScheduler", () => {
     expect(recallRows[0]?.text).toContain(`because ${decisionRationale}`);
   });
 
-  it("resets stale-goal wake backoff only for delivered outbound outcomes", async () => {
+  it("does not reset stale-goal wake backoff for outbound emission alone", async () => {
     const runCase = async (input: {
       deliveryOutcome: Record<string, unknown>;
       emitted: boolean;
@@ -1914,6 +2424,8 @@ describe("AutonomyScheduler", () => {
                 durationMs: 1,
               },
             ],
+            finalizer_rounds: 1,
+            stall_retries: 0,
             agentMessageId: "strm_stale_goal",
           }),
         },
@@ -1950,8 +2462,14 @@ describe("AutonomyScheduler", () => {
         },
         emitted: true,
       }),
-    ).resolves.toEqual({
-      progressedGoal: null,
+    ).resolves.toMatchObject({
+      progressedGoal: {
+        lastTs: 1_000,
+        lastEntryId: "goal_aaaaaaaaaaaaaaaa:stale:1000",
+        metadata: {
+          empty_count: 3,
+        },
+      },
       otherGoal: expect.objectContaining({
         lastEntryId: "other-goal-stale-wake",
         metadata: { empty_count: 3 },
@@ -2007,7 +2525,7 @@ describe("AutonomyScheduler", () => {
     });
   });
 
-  it("stamps the shared per-goal brake for empty followup wakes and resets only its headway goal", async () => {
+  it("stamps the per-goal brake when a followup wake only emits outbound", async () => {
     const clock = new ManualClock(1_100_000);
     const harness = await createOfflineTestHarness({ clock });
     cleanup = harness.cleanup;
@@ -2085,7 +2603,12 @@ describe("AutonomyScheduler", () => {
         getExecutiveFocusGoalStaleBackoffProcessName(headwayGoalId),
         DEFAULT_SESSION_ID,
       ),
-    ).toBeNull();
+    ).toMatchObject({
+      metadata: {
+        empty_count: 3,
+        action_availability_key: "outbound_action_surface_v1:test",
+      },
+    });
     expect(
       watermarkRepository.get(
         getExecutiveFocusGoalStaleBackoffProcessName(untouchedGoalId),
@@ -2208,6 +2731,10 @@ describe("AutonomyScheduler", () => {
       db: harness.db,
       clock,
     });
+    const wakeRepository = new AutonomyWakesRepository({
+      db: harness.db,
+      clock,
+    });
     const throwingWatermarkRepository = {
       set: vi.fn(() => {
         throw new Error("watermark unavailable");
@@ -2215,6 +2742,7 @@ describe("AutonomyScheduler", () => {
     } as unknown as StreamWatermarkRepository;
     const scheduler = createScheduler({
       db: harness.db,
+      wakeRepository,
       enabled: true,
       intervalMs: 1_000,
       maxWakesPerWindow: 6,
@@ -2241,6 +2769,8 @@ describe("AutonomyScheduler", () => {
           referencedEpisodeIds: [],
           intents: [],
           toolCalls: [],
+          finalizer_rounds: 1,
+          stall_retries: 0,
           agentMessageId: "strm_agent_watermark_failure",
         }),
       },
@@ -2271,6 +2801,154 @@ describe("AutonomyScheduler", () => {
         limit: 10,
       }),
     ).toEqual([]);
+    expect(wakeRepository.listSince(0, 1)[0]?.outcome).not.toBe("interrupted");
+    expect(wakeRepository.listSince(0, 1)[0]?.outcome).not.toBeNull();
+  });
+
+  it("preserves the original bookkeeping failure when recording interrupted also fails", async () => {
+    const clock = new ManualClock(1_000_000);
+    const harness = await createOfflineTestHarness({ clock });
+    cleanup = harness.cleanup;
+    const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+    const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
+    const originalError = new Error("primary terminal outcome write failed");
+    const interruptionError = new Error("interrupted outcome write failed");
+    vi.spyOn(wakeRepository, "recordOutcome")
+      .mockImplementationOnce(() => {
+        throw originalError;
+      })
+      .mockImplementationOnce(() => {
+        throw interruptionError;
+      });
+    const onError = vi.fn();
+    const scheduler = createScheduler({
+      db: harness.db,
+      wakeRepository,
+      enabled: true,
+      intervalMs: 1_000,
+      maxWakesPerWindow: 6,
+      clock,
+      createStreamWriter: (sessionId) =>
+        new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+      watermarkRepository,
+      turnOrchestrator: {
+        run: vi.fn().mockResolvedValue(createStructuralTurnResult({ emissionKind: "suppressed" })),
+      },
+      toolDispatcher: new ToolDispatcher({
+        createStreamWriter: (sessionId) =>
+          new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+        clock,
+      }),
+      sources: [createTestDueSource("double-outcome-write-failure")],
+    });
+    scheduler.setObserver({ onError });
+
+    const result = await scheduler.tick();
+
+    expect(result).toMatchObject({
+      firedEvents: 1,
+      bookkeepingErrorCount: 1,
+      events: [
+        expect.objectContaining({
+          status: "bookkeeping_error",
+          outcomeSummary: expect.stringContaining(originalError.message),
+        }),
+      ],
+    });
+    expect(onError).toHaveBeenCalledTimes(2);
+    expect(onError.mock.calls[0]?.[0]).toMatchObject({ cause: originalError });
+    expect(onError.mock.calls[1]?.[0]).toMatchObject({ cause: interruptionError });
+  });
+
+  it.each([true, false])(
+    "preserves error execution counts or null when recorded=%s",
+    async (recorded) => {
+      const clock = new ManualClock(1_000_000);
+      const harness = await createOfflineTestHarness({ clock });
+      cleanup = harness.cleanup;
+      const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
+      const failure = new Error("Turn failed at its outer rejection boundary");
+      if (recorded) {
+        associateTurnExecutionMetricsWithError(failure, { finalizer_rounds: 2, stall_retries: 3 });
+      }
+      const createStreamWriter = (sessionId: typeof DEFAULT_SESSION_ID) =>
+        new StreamWriter({ dataDir: harness.tempDir, sessionId, clock });
+      const scheduler = createScheduler({
+        db: harness.db,
+        wakeRepository,
+        enabled: true,
+        intervalMs: 1_000,
+        maxWakesPerWindow: 6,
+        clock,
+        createStreamWriter,
+        watermarkRepository: new StreamWatermarkRepository({ db: harness.db, clock }),
+        turnOrchestrator: { run: vi.fn().mockRejectedValue(failure) },
+        toolDispatcher: new ToolDispatcher({ createStreamWriter, clock }),
+        sources: [createTestDueSource("error-execution-counts")],
+      });
+      expect(await scheduler.tick()).toMatchObject({ errorCount: 1 });
+      expect(wakeRepository.listSince(0, 1)[0]).toMatchObject({
+        outcome: "error",
+        finalizer_rounds: recorded ? 2 : null,
+        stall_retries: recorded ? 3 : null,
+      });
+    },
+  );
+
+  it("records interrupted with executed counts when completed-turn outcome bookkeeping fails", async () => {
+    const clock = new ManualClock(1_000_000);
+    const harness = await createOfflineTestHarness({ clock });
+    cleanup = harness.cleanup;
+    const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+    const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
+    const originalRecordOutcome = wakeRepository.recordOutcome.bind(wakeRepository);
+    const originalError = new Error("terminal outcome write failed");
+    vi.spyOn(wakeRepository, "recordOutcome")
+      .mockImplementationOnce(() => {
+        throw originalError;
+      })
+      .mockImplementation(originalRecordOutcome);
+    const scheduler = createScheduler({
+      db: harness.db,
+      wakeRepository,
+      enabled: true,
+      intervalMs: 1_000,
+      maxWakesPerWindow: 6,
+      clock,
+      createStreamWriter: (sessionId) =>
+        new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+      watermarkRepository,
+      turnOrchestrator: {
+        run: vi
+          .fn()
+          .mockResolvedValue(
+            createStructuralTurnResult({
+              emissionKind: "suppressed",
+              finalizerRounds: 2,
+              stallRetries: 3,
+            }),
+          ),
+      },
+      toolDispatcher: new ToolDispatcher({
+        createStreamWriter: (sessionId) =>
+          new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+        clock,
+      }),
+      sources: [createTestDueSource("interrupted-outcome")],
+    });
+
+    const result = await scheduler.tick();
+
+    expect(result.events[0]).toMatchObject({
+      status: "bookkeeping_error",
+      outcomeSummary: expect.stringContaining(originalError.message),
+    });
+    expect(wakeRepository.listSince(0, 1)[0]).toMatchObject({
+      outcome: "interrupted",
+      outcome_detail: expect.stringContaining(originalError.message),
+      finalizer_rounds: 2,
+      stall_retries: 3,
+    });
   });
 
   it("does not record self decisions for budget skips, preparation errors, busy skips, or turn errors", async () => {
@@ -2361,6 +3039,8 @@ describe("AutonomyScheduler", () => {
           referencedEpisodeIds: [],
           intents: [],
           toolCalls: [],
+          finalizer_rounds: 1,
+          stall_retries: 0,
           agentMessageId: "strm_agent_budget_skip",
         },
       }),
@@ -2379,6 +3059,8 @@ describe("AutonomyScheduler", () => {
           referencedEpisodeIds: [],
           intents: [],
           toolCalls: [],
+          finalizer_rounds: 1,
+          stall_retries: 0,
           agentMessageId: "strm_agent_preparation_error",
         },
       }),
@@ -2397,6 +3079,42 @@ describe("AutonomyScheduler", () => {
         turnResult: new Error("turn failed"),
       }),
     ).resolves.toMatchObject({ errorCount: 1 });
+  });
+
+  it("passes the configured preparation-tool timeout to the dispatcher", async () => {
+    const clock = new ManualClock(1_000_000);
+    const harness = await createOfflineTestHarness({ clock });
+    cleanup = harness.cleanup;
+    const dispatcher = new ToolDispatcher({
+      createStreamWriter: (sessionId) =>
+        new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+      clock,
+    });
+    dispatcher.register(
+      createCommitmentsListTool({
+        listCommitments: () => [],
+      }),
+    );
+    const dispatch = vi.spyOn(dispatcher, "dispatch");
+    const scheduler = createScheduler({
+      db: harness.db,
+      enabled: true,
+      intervalMs: 1_000,
+      prepToolTimeoutMs: 45_000,
+      maxWakesPerWindow: 6,
+      clock,
+      createStreamWriter: (sessionId) =>
+        new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+      watermarkRepository: new StreamWatermarkRepository({ db: harness.db, clock }),
+      turnOrchestrator: {
+        run: vi.fn().mockResolvedValue(createStructuralTurnResult({ emissionKind: "suppressed" })),
+      },
+      toolDispatcher: dispatcher,
+      sources: [createTestDueSource("prep-timeout-event", "commitment_expiring")],
+    });
+
+    expect((await scheduler.tick()).firedEvents).toBe(1);
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 45_000 }));
   });
 
   it("respects maxWakesPerWindow", async () => {
@@ -2477,6 +3195,8 @@ describe("AutonomyScheduler", () => {
           referencedEpisodeIds: [],
           intents: [],
           toolCalls: [],
+          finalizer_rounds: 1,
+          stall_retries: 0,
           agentMessageId: "strm_agent_budget",
         }),
       },
@@ -2510,6 +3230,8 @@ describe("AutonomyScheduler", () => {
         referencedEpisodeIds: [],
         intents: [],
         toolCalls: [],
+        finalizer_rounds: 1,
+        stall_retries: 0,
         agentMessageId: "strm_reserved_budget",
       }),
     };
@@ -2559,6 +3281,253 @@ describe("AutonomyScheduler", () => {
     expect(turnRunner.run).toHaveBeenCalledTimes(2);
   });
 
+  it.each([false, true])(
+    "admits a due scheduled wake into the first freed slot with fleet brake enabled=%s",
+    async (fleetBrakeEnabled) => {
+      const clock = new ManualClock(1_000_000);
+      const harness = await createOfflineTestHarness({ clock });
+      cleanup = harness.cleanup;
+      const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+      const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
+      const scheduledWakesRepository = new ScheduledWakesRepository({ db: harness.db, clock });
+      const wake = scheduledWakesRepository.schedule({ delaySeconds: 1, note: "check in" });
+      wakeRepository.record({
+        trigger_name: "goal_followup_due",
+        wake_source_type: "trigger",
+        source_category: "operational",
+      });
+      clock.advance(1_000);
+      // The rolling window is full, and reflection already spent the reservation.
+      wakeRepository.record({
+        trigger_name: "scheduled_reflection",
+        wake_source_type: "trigger",
+        source_category: "contemplative",
+      });
+      const turnRunner = {
+        run: vi.fn().mockResolvedValue(createStructuralTurnResult({ emissionKind: "suppressed" })),
+      };
+      const createStreamWriter = (sessionId: typeof DEFAULT_SESSION_ID) =>
+        new StreamWriter({ dataDir: harness.tempDir, sessionId, clock });
+      const scheduler = createScheduler({
+        db: harness.db,
+        wakeRepository,
+        enabled: true,
+        intervalMs: 1_000,
+        maxWakesPerWindow: 2,
+        budgetWindowMs: 60_000,
+        reservedContemplativeWakesPerWindow: 1,
+        fleetBrake: { ...TEST_FLEET_BRAKE, enabled: fleetBrakeEnabled },
+        clock,
+        createStreamWriter,
+        watermarkRepository,
+        turnOrchestrator: turnRunner,
+        toolDispatcher: new ToolDispatcher({ createStreamWriter, clock }),
+        sources: [
+          createPersistentDueSource({
+            watermarkRepository,
+            eventIds: ["operational-event"],
+            sortTs: () => 1,
+          }),
+          createScheduledWakeTrigger({ scheduledWakesRepository, watermarkRepository, clock }),
+        ],
+      });
+
+      await expect(scheduler.tick()).resolves.toMatchObject({ firedEvents: 0, budgetSkipped: 2 });
+      clock.advance(59_000);
+      // Wakes at the cutoff still count; priority cannot bypass the full cap.
+      await expect(scheduler.tick()).resolves.toMatchObject({ firedEvents: 0, budgetSkipped: 2 });
+      expect(scheduledWakesRepository.get(wake.id)?.status).toBe("pending");
+      expect(turnRunner.run).not.toHaveBeenCalled();
+
+      clock.advance(1);
+      const cutoff = clock.now() - 60_000;
+      expect(wakeRepository.countSince(cutoff)).toBe(1);
+      expect(wakeRepository.countSince(cutoff, { sourceCategory: "contemplative" })).toBe(1);
+      const result = await scheduler.tick();
+
+      expect(result).toMatchObject({ firedEvents: 1, budgetSkipped: 1, errorCount: 0 });
+      expect(result.events.map((event) => [event.id, event.status])).toEqual([
+        [wake.id, "fired"],
+        ["operational-event", "budget_skipped"],
+      ]);
+      expect(scheduledWakesRepository.get(wake.id)?.status).toBe("fired");
+      expect(wakeRepository.countSince(cutoff)).toBe(2);
+      expect(turnRunner.run).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          autonomyTrigger: expect.objectContaining({ event_id: wake.id }),
+        }),
+      );
+    },
+  );
+
+  it.each([false, true])(
+    "admits scheduled wakes oldest fire_at first ahead of all other sources with recovery=%s",
+    async (recovering) => {
+      const clock = new ManualClock(1_000_000);
+      const harness = await createOfflineTestHarness({ clock });
+      cleanup = harness.cleanup;
+      const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+      if (recovering) {
+        setFleetBrakeState(watermarkRepository, clock, {
+          error_streak: TEST_FLEET_BRAKE.errorStreakThreshold,
+          last_error_ts: clock.now() - TEST_FLEET_BRAKE.errorBasePauseMs,
+        });
+      }
+      const turnRunner = {
+        run: vi.fn().mockResolvedValue(createStructuralTurnResult({ emissionKind: "suppressed" })),
+      };
+      const createStreamWriter = (sessionId: typeof DEFAULT_SESSION_ID) =>
+        new StreamWriter({ dataDir: harness.tempDir, sessionId, clock });
+      const dispatcher = new ToolDispatcher({ createStreamWriter, clock });
+      dispatcher.register(
+        createIdentityEventsListForCognitionTool({
+          listEvents: (options) => harness.identityService.listEvents(options),
+        }),
+      );
+      const latestFireAt = clock.now() + 1_000;
+      const scheduledSource = createPersistentDueSource({
+        watermarkRepository,
+        eventIds: ["a-newer-wake", "z-older-wake"],
+        sourceName: "scheduled_wake",
+        sourceCategory: "contemplative",
+        // Admission must use fire_at even when scan/sortTs order disagrees.
+        sortTs: (_id, index) => 10 + index,
+        payload: (_id, index) => ({ fire_at: latestFireAt - index * 2_000 }),
+      });
+      const scheduler = createScheduler({
+        db: harness.db,
+        enabled: true,
+        intervalMs: 1_000,
+        maxWakesPerWindow: 2,
+        fleetBrake: TEST_FLEET_BRAKE,
+        clock,
+        createStreamWriter,
+        watermarkRepository,
+        turnOrchestrator: turnRunner,
+        toolDispatcher: dispatcher,
+        sources: [
+          createPersistentDueSource({
+            watermarkRepository,
+            eventIds: ["operational-event"],
+            sortTs: () => 1,
+          }),
+          createPersistentDueSource({
+            watermarkRepository,
+            eventIds: ["reflection-event"],
+            sourceName: "scheduled_reflection",
+            sourceCategory: "contemplative",
+            sortTs: () => 2,
+          }),
+          {
+            ...scheduledSource,
+            async scan() {
+              // The newer wake becomes due while source scans are in flight.
+              clock.advance(1_000);
+              return scheduledSource.scan();
+            },
+          },
+        ],
+      });
+
+      const result = await scheduler.tick();
+
+      expect(result).toMatchObject({ firedEvents: 2, budgetSkipped: 2, errorCount: 0 });
+      expect(result.events.map((event) => [event.id, event.status])).toEqual([
+        ["z-older-wake", "fired"],
+        ["a-newer-wake", "fired"],
+        ...(recovering
+          ? [
+              ["reflection-event", "budget_skipped"],
+              ["operational-event", "budget_skipped"],
+            ]
+          : [
+              ["operational-event", "budget_skipped"],
+              ["reflection-event", "budget_skipped"],
+            ]),
+      ]);
+      expect(turnRunner.run).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each([false, true])(
+    "preserves existing admission order when no scheduled wake is due with recovery=%s",
+    async (recovering) => {
+      const clock = new ManualClock(1_000_000);
+      const harness = await createOfflineTestHarness({ clock });
+      cleanup = harness.cleanup;
+      const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+      const scheduledWakesRepository = new ScheduledWakesRepository({ db: harness.db, clock });
+      const futureWake = scheduledWakesRepository.schedule({ delaySeconds: 60, note: "later" });
+      if (recovering) {
+        setFleetBrakeState(watermarkRepository, clock, {
+          error_streak: TEST_FLEET_BRAKE.errorStreakThreshold,
+          last_error_ts: clock.now() - TEST_FLEET_BRAKE.errorBasePauseMs,
+        });
+      }
+      const turnRunner = {
+        run: vi.fn().mockResolvedValue(createStructuralTurnResult({ emissionKind: "suppressed" })),
+      };
+      const createStreamWriter = (sessionId: typeof DEFAULT_SESSION_ID) =>
+        new StreamWriter({ dataDir: harness.tempDir, sessionId, clock });
+      const dispatcher = new ToolDispatcher({ createStreamWriter, clock });
+      dispatcher.register(
+        createIdentityEventsListForCognitionTool({
+          listEvents: (options) => harness.identityService.listEvents(options),
+        }),
+      );
+      const scheduler = createScheduler({
+        db: harness.db,
+        enabled: true,
+        intervalMs: 1_000,
+        maxWakesPerWindow: 1,
+        fleetBrake: TEST_FLEET_BRAKE,
+        clock,
+        createStreamWriter,
+        watermarkRepository,
+        turnOrchestrator: turnRunner,
+        toolDispatcher: dispatcher,
+        sources: [
+          createScheduledWakeTrigger({ scheduledWakesRepository, watermarkRepository, clock }),
+          createPersistentDueSource({
+            watermarkRepository,
+            eventIds: ["reflection-event"],
+            sourceName: "scheduled_reflection",
+            sourceCategory: "contemplative",
+            sortTs: () => 15,
+          }),
+          createPersistentDueSource({
+            watermarkRepository,
+            eventIds: ["z-earlier", "b-tied", "a-tied", "c-later"],
+            sortTs: (_id, index) => [5, 10, 10, 20][index]!,
+          }),
+        ],
+      });
+
+      const result = await scheduler.tick();
+
+      expect(result).toMatchObject({ firedEvents: 1, budgetSkipped: 4, errorCount: 0 });
+      expect(result.events.map((event) => [event.id, event.status])).toEqual(
+        recovering
+          ? [
+              ["reflection-event", "fired"],
+              ["z-earlier", "budget_skipped"],
+              ["a-tied", "budget_skipped"],
+              ["b-tied", "budget_skipped"],
+              ["c-later", "budget_skipped"],
+            ]
+          : [
+              ["z-earlier", "fired"],
+              ["a-tied", "budget_skipped"],
+              ["b-tied", "budget_skipped"],
+              ["reflection-event", "budget_skipped"],
+              ["c-later", "budget_skipped"],
+            ],
+      );
+      expect(scheduledWakesRepository.get(futureWake.id)?.status).toBe("pending");
+      expect(turnRunner.run).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it("checks persisted wake history when a fresh scheduler enforces budget", async () => {
     const clock = new ManualClock(1_000_000);
     const harness = await createOfflineTestHarness({
@@ -2590,6 +3559,8 @@ describe("AutonomyScheduler", () => {
         referencedEpisodeIds: [],
         intents: [],
         toolCalls: [],
+        finalizer_rounds: 1,
+        stall_retries: 0,
         agentMessageId: "strm_should_not_run",
       }),
     };
@@ -2687,6 +3658,8 @@ describe("AutonomyScheduler", () => {
           referencedEpisodeIds: [],
           intents: [],
           toolCalls: [],
+          finalizer_rounds: 1,
+          stall_retries: 0,
           agentMessageId: "strm_process_a",
         }),
       };
@@ -3053,7 +4026,7 @@ describe("AutonomyScheduler", () => {
     expect(turnRunner.run).toHaveBeenCalledTimes(2);
   });
 
-  it("leaves trigger watermarks untouched when an autonomous turn throws", async () => {
+  it("leaves an aborted watermark unlatched while trigger backoff spans new due windows", async () => {
     const clock = new ManualClock(1_000_000);
     const harness = await createOfflineTestHarness({
       clock,
@@ -3108,16 +4081,277 @@ describe("AutonomyScheduler", () => {
     expect(result.events[0]?.status).toBe("error");
     expect(watermarkRepository.get("autonomy:scheduled-reflection", DEFAULT_SESSION_ID)).toBeNull();
 
+    clock.advance(10_000);
     const secondResult = await scheduler.tick();
     expect(secondResult.errorCount).toBe(0);
     expect(secondResult.events).toEqual([]);
     expect(turnRunner.run).toHaveBeenCalledTimes(1);
+    expect(watermarkRepository.get("autonomy:scheduled-reflection", DEFAULT_SESSION_ID)).toBeNull();
+
+    clock.advance(19_999);
+    const thirdResult = await scheduler.tick();
+    expect(thirdResult.events).toEqual([]);
+    expect(turnRunner.run).toHaveBeenCalledTimes(1);
+
+    clock.advance(1);
+    const fourthResult = await scheduler.tick();
+    expect(fourthResult.errorCount).toBe(1);
+    expect(fourthResult.events[0]).toMatchObject({
+      id: "scheduled-reflection:1030000",
+      status: "error",
+    });
+    expect(turnRunner.run).toHaveBeenCalledTimes(2);
+    expect(watermarkRepository.get("autonomy:scheduled-reflection", DEFAULT_SESSION_ID)).toBeNull();
+  });
+
+  it.each(["recordOutcome", "action log"])(
+    "installs failed-turn backoff before a throwing %s write",
+    async (failureSite) => {
+      const clock = new ManualClock(1_000_000);
+      const harness = await createOfflineTestHarness({ clock });
+      cleanup = harness.cleanup;
+      const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+      const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
+      const source = createTestDueSource("failed-turn-bookkeeping", "scheduled_wake");
+      const [event] = await source.scan();
+      source.scan = vi.fn(async () => [{ ...event!, id: `changing-event:${clock.now()}` }]);
+      const bookkeepingError = new Error(`${failureSite} failed`);
+      if (failureSite === "recordOutcome") {
+        vi.spyOn(wakeRepository, "recordOutcome").mockImplementation(() => {
+          throw bookkeepingError;
+        });
+      }
+      const turnRunner = { run: vi.fn().mockRejectedValue(new Error("turn failed")) };
+      const scheduler = createScheduler({
+        db: harness.db,
+        wakeRepository,
+        enabled: true,
+        intervalMs: 1_000,
+        maxWakesPerWindow: 20,
+        clock,
+        createStreamWriter: (sessionId) => {
+          const writer = new StreamWriter({ dataDir: harness.tempDir, sessionId, clock });
+          if (failureSite === "action log") {
+            const append = writer.append.bind(writer);
+            vi.spyOn(writer, "append").mockImplementation(async (entry) => {
+              if (
+                typeof entry.content === "object" &&
+                entry.content !== null &&
+                "kind" in entry.content &&
+                entry.content.kind === "autonomous_action"
+              ) {
+                throw bookkeepingError;
+              }
+              return await append(entry);
+            });
+          }
+          return writer;
+        },
+        watermarkRepository,
+        turnOrchestrator: turnRunner,
+        toolDispatcher: new ToolDispatcher({
+          createStreamWriter: (sessionId) =>
+            new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+          clock,
+        }),
+        sources: [source],
+      });
+
+      await expect(scheduler.tick()).rejects.toThrow(bookkeepingError);
+      expect(wakeRepository.countSince(0)).toBe(1);
+
+      for (const elapsed of [1_000, 28_999]) {
+        clock.advance(elapsed);
+        expect((await scheduler.tick()).events).toEqual([]);
+        expect(turnRunner.run).toHaveBeenCalledTimes(1);
+        expect(wakeRepository.countSince(0)).toBe(1);
+      }
+      expect(source.scan).toHaveBeenCalledTimes(1);
+
+      clock.advance(1);
+      await expect(scheduler.tick()).rejects.toThrow(bookkeepingError);
+      expect(turnRunner.run).toHaveBeenCalledTimes(2);
+      expect(wakeRepository.countSince(0)).toBe(2);
+      expect(watermarkRepository.get(event!.watermarkProcessName, DEFAULT_SESSION_ID)).toBeNull();
+    },
+  );
+
+  it.each([false, true])(
+    "backs off rejected event preparation when outcome bookkeeping throws=%s",
+    async (bookkeepingThrows) => {
+      const clock = new ManualClock(1_000_000);
+      const harness = await createOfflineTestHarness({ clock });
+      cleanup = harness.cleanup;
+      const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+      const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
+      const trainOfThoughtRepository = new TrainOfThoughtRepository({ db: harness.db, clock });
+      const preparationError = new Error("prior thought read failed");
+      vi.spyOn(trainOfThoughtRepository, "get").mockImplementation(() => {
+        throw preparationError;
+      });
+      if (bookkeepingThrows) {
+        vi.spyOn(wakeRepository, "recordOutcome").mockImplementation(() => {
+          throw new Error("outcome write failed");
+        });
+      }
+      const source = createTestDueSource("rejected-preparation", "scheduled_wake");
+      const turnRunner = { run: vi.fn() };
+      const onError = vi.fn();
+      const scheduler = createScheduler({
+        db: harness.db,
+        wakeRepository,
+        enabled: true,
+        intervalMs: 1_000,
+        maxWakesPerWindow: 20,
+        clock,
+        createStreamWriter: (sessionId) =>
+          new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+        watermarkRepository,
+        trainOfThoughtRepository,
+        turnOrchestrator: turnRunner,
+        toolDispatcher: new ToolDispatcher({
+          createStreamWriter: (sessionId) =>
+            new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+          clock,
+        }),
+        sources: [source],
+      });
+      scheduler.setObserver({ onError });
+
+      if (bookkeepingThrows) {
+        await expect(scheduler.tick()).rejects.toThrow("outcome write failed");
+      } else {
+        expect(await scheduler.tick()).toMatchObject({ errorCount: 1, sourceErrorCount: 1 });
+        expect(onError).toHaveBeenCalledWith(expect.objectContaining({ cause: preparationError }));
+      }
+
+      for (const elapsed of [1_000, 28_999]) {
+        clock.advance(elapsed);
+        expect((await scheduler.tick()).events).toEqual([]);
+        expect(trainOfThoughtRepository.get).toHaveBeenCalledTimes(1);
+        expect(wakeRepository.countSince(0)).toBe(1);
+      }
+
+      clock.advance(1);
+      if (bookkeepingThrows) {
+        await expect(scheduler.tick()).rejects.toThrow("outcome write failed");
+      } else {
+        expect((await scheduler.tick()).sourceErrorCount).toBe(1);
+      }
+      expect(trainOfThoughtRepository.get).toHaveBeenCalledTimes(2);
+      expect(turnRunner.run).not.toHaveBeenCalled();
+      expect(wakeRepository.countSince(0)).toBe(2);
+    },
+  );
+
+  it("backs off a failing trigger across event ids, admits healthy work, and resets on success", async () => {
+    const clock = new ManualClock(1_000_000);
+    const harness = await createOfflineTestHarness({ clock });
+    cleanup = harness.cleanup;
+    const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+    const failingWatermarkProcessName = "autonomy:test:trigger-error-backoff";
+    const failingSource: AutonomyWakeSource = {
+      name: "goal_followup_due",
+      type: "trigger",
+      sourceCategory: "operational",
+      async scan() {
+        if (watermarkRepository.get(failingWatermarkProcessName, DEFAULT_SESSION_ID) !== null) {
+          return [];
+        }
+
+        return [
+          {
+            id: `changing-error-event:${clock.now()}`,
+            sourceName: "goal_followup_due",
+            sourceType: "trigger",
+            watermarkProcessName: failingWatermarkProcessName,
+            sortTs: 1,
+            payload: {},
+          },
+        ];
+      },
+      buildTurn() {
+        return {
+          audience: "self",
+          stakes: "low",
+          userMessage: "Retry changing trigger event.",
+        };
+      },
+    };
+    const healthySource = createPersistentDueSource({
+      watermarkRepository,
+      eventIds: ["healthy-during-trigger-backoff"],
+      sourceName: "scheduled_wake",
+      sourceCategory: "contemplative",
+      sortTs: () => 2,
+    });
+    const successfulTurn = createStructuralTurnResult({ emissionKind: "suppressed" });
+    const turnRunner = {
+      run: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("first changing-id failure"))
+        .mockResolvedValueOnce(successfulTurn)
+        .mockRejectedValueOnce(new Error("second changing-id failure"))
+        .mockResolvedValueOnce(successfulTurn)
+        .mockRejectedValueOnce(new Error("failure after success"))
+        .mockResolvedValue(successfulTurn),
+    };
+    const scheduler = createScheduler({
+      db: harness.db,
+      enabled: true,
+      intervalMs: 1_000,
+      maxWakesPerWindow: 20,
+      clock,
+      createStreamWriter: (sessionId) =>
+        new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+      watermarkRepository,
+      turnOrchestrator: turnRunner,
+      toolDispatcher: new ToolDispatcher({
+        createStreamWriter: (sessionId) =>
+          new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+        clock,
+      }),
+      sources: [failingSource, healthySource],
+    });
+
+    const first = await scheduler.tick();
+    expect(first.events.map((event) => [event.sourceName, event.status])).toEqual([
+      ["goal_followup_due", "error"],
+      ["scheduled_wake", "fired"],
+    ]);
+    expect(turnRunner.run).toHaveBeenCalledTimes(2);
+
+    clock.advance(10_000);
+    expect((await scheduler.tick()).events).toEqual([]);
+    expect(turnRunner.run).toHaveBeenCalledTimes(2);
+
+    clock.advance(20_000);
+    const secondFailure = await scheduler.tick();
+    expect(secondFailure.events[0]).toMatchObject({
+      id: "changing-error-event:1030000",
+      status: "error",
+    });
+    expect(turnRunner.run).toHaveBeenCalledTimes(3);
 
     clock.advance(30_000);
-    const thirdResult = await scheduler.tick();
-    expect(thirdResult.errorCount).toBe(1);
-    expect(thirdResult.events[0]?.status).toBe("error");
-    expect(turnRunner.run).toHaveBeenCalledTimes(2);
+    expect((await scheduler.tick()).events).toEqual([]);
+    expect(turnRunner.run).toHaveBeenCalledTimes(3);
+
+    clock.advance(30_000);
+    expect((await scheduler.tick()).firedEvents).toBe(1);
+    expect(turnRunner.run).toHaveBeenCalledTimes(4);
+
+    watermarkRepository.reset(failingWatermarkProcessName, DEFAULT_SESSION_ID);
+    expect((await scheduler.tick()).errorCount).toBe(1);
+    expect(turnRunner.run).toHaveBeenCalledTimes(5);
+
+    clock.advance(29_999);
+    expect((await scheduler.tick()).events).toEqual([]);
+    expect(turnRunner.run).toHaveBeenCalledTimes(5);
+
+    clock.advance(1);
+    expect((await scheduler.tick()).firedEvents).toBe(1);
+    expect(turnRunner.run).toHaveBeenCalledTimes(6);
   });
 
   it("engages the fleet cooldown after five operational silences and escalates durably", async () => {
@@ -3159,6 +4393,19 @@ describe("AutonomyScheduler", () => {
     expect(first.firedEvents).toBe(5);
     expect(first.fleetCooldownSkipped).toBe(2);
     expect(wakeRepository.countSince(0, { outcome: "silent" })).toBe(5);
+    // The rows driving the streak carry what ended them, so the count above can
+    // be read as a composition rather than as one behaviour repeated five times.
+    expect(wakeRepository.summarizeOutcomeDetailsSince(0, "silent")).toEqual({
+      total: 5,
+      without_detail: 0,
+      reasons: [
+        {
+          detail: "deliberate-silence: finalizer_no_output",
+          count: 5,
+          triggers: [{ trigger: "goal_followup_due", count: 5 }],
+        },
+      ],
+    });
     expect(
       readFleetBrakeMetadata(watermarkRepository.get(FLEET_BRAKE_PROCESS_NAME, DEFAULT_SESSION_ID)),
     ).toMatchObject({
@@ -3216,6 +4463,90 @@ describe("AutonomyScheduler", () => {
           silent: 7,
           error: 0,
           busy: 0,
+          interrupted: 0,
+        },
+      },
+    });
+  });
+
+  it("holds guard-blocked wakes out of the empty streak while preserving its other outcomes", async () => {
+    const clock = new ManualClock(2_025_000);
+    const harness = await createOfflineTestHarness({ clock });
+    cleanup = harness.cleanup;
+    const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+    const wakeRepository = new AutonomyWakesRepository({ db: harness.db, clock });
+    setFleetBrakeState(watermarkRepository, clock, {
+      empty_streak: 2,
+      streak_anchor_ts: clock.now() - 1_000,
+      last_wake_ts: clock.now() - 100,
+    });
+    const fleetUpdates: FleetBrakeMetadata[] = [];
+    const originalSet = watermarkRepository.set.bind(watermarkRepository);
+    vi.spyOn(watermarkRepository, "set").mockImplementation((processName, sessionId, input) => {
+      const result = originalSet(processName, sessionId, input);
+
+      if (processName === FLEET_BRAKE_PROCESS_NAME) {
+        fleetUpdates.push(readFleetBrakeMetadata(watermarkRepository.get(processName, sessionId)));
+      }
+
+      return result;
+    });
+    const source = createPersistentDueSource({
+      watermarkRepository,
+      eventIds: ["guard-blocked", "chosen-silence", "transport-failure", "headway"],
+    });
+    const turnRunner = {
+      run: vi
+        .fn()
+        .mockResolvedValueOnce(
+          createStructuralTurnResult({
+            emissionKind: "suppressed",
+            suppressionReason: "commitment_violation_after_regenerate",
+          }),
+        )
+        .mockResolvedValueOnce(createStructuralTurnResult({ emissionKind: "suppressed" }))
+        .mockResolvedValueOnce(
+          createStructuralTurnResult({
+            emissionKind: "suppressed",
+            undeliveredOutboundState: "transport_failed",
+          }),
+        )
+        .mockResolvedValueOnce(createStructuralTurnResult({ emissionKind: "message" })),
+    };
+    const scheduler = createScheduler({
+      db: harness.db,
+      wakeRepository,
+      enabled: true,
+      intervalMs: 1_000,
+      maxWakesPerWindow: 20,
+      budgetWindowMs: 60_000,
+      fleetBrake: TEST_FLEET_BRAKE,
+      clock,
+      createStreamWriter: (sessionId) =>
+        new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+      watermarkRepository,
+      turnOrchestrator: turnRunner,
+      toolDispatcher: new ToolDispatcher({
+        createStreamWriter: (sessionId) =>
+          new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+        clock,
+      }),
+      sources: [source],
+    });
+
+    expect((await scheduler.tick()).firedEvents).toBe(4);
+    expect(fleetUpdates.map((metadata) => metadata.empty_streak)).toEqual([2, 3, 4, 0]);
+    await expect(scheduler.describe()).resolves.toMatchObject({
+      fleet_brake: {
+        empty_streak: 0,
+        window_silent_reasons: {
+          total: 3,
+          without_detail: 0,
+          reasons: [
+            { detail: "deliberate-silence: finalizer_no_output", count: 1 },
+            { detail: "guard-blocked: commitment_violation_after_regenerate", count: 1 },
+            { detail: "outbound-undelivered: transport_failed", count: 1 },
+          ],
         },
       },
     });
@@ -3498,11 +4829,16 @@ describe("AutonomyScheduler", () => {
         .mockRejectedValueOnce(new LLMError("outage-3"))
         .mockResolvedValue(createStructuralTurnResult({ emissionKind: "suppressed" })),
     };
-    const operationalSource = createPersistentDueSource({
-      watermarkRepository,
-      eventIds: ["error-1", "error-2", "error-3"],
-      sortTs: (_eventId, index) => index + 1,
-    });
+    const operationalSources = (
+      ["goal_followup_due", "executive_focus_due", "commitment_revoked"] as const
+    ).map((sourceName, index) =>
+      createPersistentDueSource({
+        watermarkRepository,
+        eventIds: [`error-${index + 1}`],
+        sourceName,
+        sortTs: () => index + 1,
+      }),
+    );
     const reflectionSource = createPersistentDueSource({
       watermarkRepository,
       eventIds: ["reflection-after-errors"],
@@ -3527,7 +4863,7 @@ describe("AutonomyScheduler", () => {
       watermarkRepository,
       turnOrchestrator: turnRunner,
       toolDispatcher: dispatcher,
-      sources: [operationalSource, reflectionSource],
+      sources: [...operationalSources, reflectionSource],
     });
 
     const first = await scheduler.tick();
@@ -3963,7 +5299,7 @@ describe("AutonomyScheduler", () => {
       wake_source_type: "trigger",
       source_category: "contemplative",
     });
-    wakeRepository.recordOutcome(headwayWake.id, "headway");
+    wakeRepository.recordOutcome(headwayWake.id, "headway", "emitted message");
     clock.set(980_000);
     const silentWake = wakeRepository.record({
       trigger_name: "scheduled_wake",
@@ -4087,6 +5423,7 @@ describe("AutonomyScheduler", () => {
               silent: 1,
               error: 0,
               busy: 0,
+              interrupted: 0,
             },
           },
           {
@@ -4103,6 +5440,7 @@ describe("AutonomyScheduler", () => {
               silent: 0,
               error: 1,
               busy: 1,
+              interrupted: 0,
             },
           },
         ],
@@ -4130,6 +5468,13 @@ describe("AutonomyScheduler", () => {
           enabled: true,
         },
       ]),
+      fleet_brake: {
+        window_headway_reasons: {
+          total: 1,
+          without_detail: 0,
+          reasons: [{ detail: "emitted message", count: 1 }],
+        },
+      },
     });
 
     const condition = (await scheduler.describe()).sources.find(
@@ -4389,6 +5734,8 @@ describe("AutonomyScheduler", () => {
           referencedEpisodeIds: [];
           intents: [];
           toolCalls: [];
+          finalizer_rounds: number;
+          stall_retries: number;
           agentMessageId: string;
         }) => void)
       | undefined;
@@ -4406,6 +5753,8 @@ describe("AutonomyScheduler", () => {
       referencedEpisodeIds: [];
       intents: [];
       toolCalls: [];
+      finalizer_rounds: number;
+      stall_retries: number;
       agentMessageId: string;
     }>((resolve) => {
       resolveTurn = resolve;
@@ -4463,12 +5812,152 @@ describe("AutonomyScheduler", () => {
       referencedEpisodeIds: [],
       intents: [],
       toolCalls: [],
+      finalizer_rounds: 1,
+      stall_retries: 0,
       agentMessageId: "strm_stop_wait",
     });
 
     await stopPromise;
     expect(stopped).toBe(true);
     expect(clearIntervalFn).toHaveBeenCalledTimes(1);
+  });
+
+  // The early return that refuses a fire while a tick runs is the one path in
+  // the scheduler that writes nothing at all: no wake row, no outcome, no error.
+  // So a stretch in which every fire was refused and a stretch in which nothing
+  // was due are the same (empty) evidence in the budget and outcome tallies --
+  // which is what this asserts alongside the counter, because the counter is
+  // only worth having if the surfaces beside it genuinely cannot supply it.
+  it("counts interval fires refused while a tick runs, which leave no other trace", async () => {
+    const clock = new ManualClock(1_000_000);
+    const harness = await createOfflineTestHarness({
+      clock,
+    });
+    cleanup = harness.cleanup;
+    const watermarkRepository = new StreamWatermarkRepository({
+      db: harness.db,
+      clock,
+    });
+    const dispatcher = new ToolDispatcher({
+      createStreamWriter: (sessionId) =>
+        new StreamWriter({
+          dataDir: harness.tempDir,
+          sessionId,
+          clock,
+        }),
+      clock,
+    });
+    dispatcher.register(
+      createIdentityEventsListForCognitionTool({
+        listEvents: (options) => harness.identityService.listEvents(options),
+      }),
+    );
+
+    const trigger = createScheduledReflectionTrigger({
+      watermarkRepository,
+      intervalMs: 10_000,
+      clock,
+    });
+
+    let intervalCallback: (() => void) | undefined;
+    const setIntervalFn = vi.fn((callback: () => void) => {
+      intervalCallback = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    });
+    let resolveTurn: ((value: unknown) => void) | undefined;
+    const turnCompletion = new Promise((resolve) => {
+      resolveTurn = resolve;
+    });
+    const turnRunner = {
+      run: vi.fn().mockReturnValue(turnCompletion),
+    };
+
+    const scheduler = createScheduler({
+      db: harness.db,
+      enabled: true,
+      intervalMs: 1_000,
+      maxWakesPerWindow: 6,
+      clock,
+      createStreamWriter: (sessionId) =>
+        new StreamWriter({
+          dataDir: harness.tempDir,
+          sessionId,
+          clock,
+        }),
+      watermarkRepository,
+      turnOrchestrator: turnRunner,
+      toolDispatcher: dispatcher,
+      sources: [trigger],
+      setIntervalFn: setIntervalFn as unknown as typeof setInterval,
+      clearIntervalFn: vi.fn(),
+    });
+
+    scheduler.start();
+    await expect(scheduler.describe()).resolves.toMatchObject({
+      interval_ms: 1_000,
+      dropped_interval_fires: { since_interval_armed: 0, current_tick: null },
+    });
+
+    intervalCallback?.();
+    await vi.waitFor(() => {
+      expect(turnRunner.run).toHaveBeenCalledTimes(1);
+    });
+
+    for (let fire = 0; fire < 3; fire += 1) {
+      clock.advance(1_000);
+      intervalCallback?.();
+    }
+
+    const duringFreeze = await scheduler.describe();
+    expect(duringFreeze.tick_in_flight).toBe(true);
+    expect(duringFreeze.dropped_interval_fires).toEqual({
+      since_interval_armed: 3,
+      current_tick: 3,
+    });
+    // Four fires, one wake: the other three are absent from every count on the
+    // page rather than represented in any of them.
+    expect(turnRunner.run).toHaveBeenCalledTimes(1);
+    expect(duringFreeze.budget.used_in_current_window).toBe(1);
+    expect(duringFreeze.fleet_brake.window_outcomes).toEqual({
+      headway: 0,
+      silent: 0,
+      error: 0,
+      busy: 0,
+      interrupted: 0,
+    });
+
+    resolveTurn?.({
+      mode: "idle",
+      path: "system_1",
+      response: "Finished reflective work.",
+      thoughts: [],
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        stop_reason: "end_turn",
+      },
+      retrievedEpisodeIds: [],
+      referencedEpisodeIds: [],
+      intents: [],
+      toolCalls: [],
+      finalizer_rounds: 1,
+      stall_retries: 0,
+      agentMessageId: "strm_dropped_fires",
+    });
+    await vi.waitFor(async () => {
+      expect((await scheduler.describe()).tick_in_flight).toBe(false);
+    });
+
+    // The running total survives the tick that earned it; the per-tick count
+    // goes null rather than holding a figure that would read as a live cost.
+    await expect(scheduler.describe()).resolves.toMatchObject({
+      dropped_interval_fires: { since_interval_armed: 3, current_tick: null },
+    });
+
+    await scheduler.stop();
+    await expect(scheduler.describe()).resolves.toMatchObject({
+      dropped_interval_fires: { since_interval_armed: 0, current_tick: null },
+    });
   });
 
   it("waits for a direct tick to finish during graceful stop", async () => {
@@ -4517,6 +6006,8 @@ describe("AutonomyScheduler", () => {
           referencedEpisodeIds: [];
           intents: [];
           toolCalls: [];
+          finalizer_rounds: number;
+          stall_retries: number;
           agentMessageId: string;
         }) => void)
       | undefined;
@@ -4534,6 +6025,8 @@ describe("AutonomyScheduler", () => {
       referencedEpisodeIds: [];
       intents: [];
       toolCalls: [];
+      finalizer_rounds: number;
+      stall_retries: number;
       agentMessageId: string;
     }>((resolve) => {
       resolveTurn = resolve;
@@ -4588,6 +6081,8 @@ describe("AutonomyScheduler", () => {
       referencedEpisodeIds: [],
       intents: [],
       toolCalls: [],
+      finalizer_rounds: 1,
+      stall_retries: 0,
       agentMessageId: "strm_direct_stop_wait",
     });
 
@@ -4640,6 +6135,8 @@ describe("AutonomyScheduler", () => {
         referencedEpisodeIds: [],
         intents: [],
         toolCalls: [],
+        finalizer_rounds: 1,
+        stall_retries: 0,
         agentMessageId: "strm_agent_result",
       }),
     };
@@ -4743,6 +6240,8 @@ describe("AutonomyScheduler", () => {
           referencedEpisodeIds: [],
           intents: [],
           toolCalls: [],
+          finalizer_rounds: 1,
+          stall_retries: 0,
           agentMessageId: "strm_event_a",
         })
         .mockRejectedValueOnce(new Error("event B failed"))
@@ -4760,6 +6259,8 @@ describe("AutonomyScheduler", () => {
           referencedEpisodeIds: [],
           intents: [],
           toolCalls: [],
+          finalizer_rounds: 1,
+          stall_retries: 0,
           agentMessageId: "strm_event_b",
         }),
     };
@@ -4878,6 +6379,8 @@ describe("AutonomyScheduler", () => {
           referencedEpisodeIds: [],
           intents: [],
           toolCalls: [],
+          finalizer_rounds: 1,
+          stall_retries: 0,
           agentMessageId: "strm_mixed_sources",
         }),
       },
@@ -4970,6 +6473,135 @@ describe("AutonomyScheduler", () => {
       trigger_type: "condition",
       source_name: "commitment_revoked",
     });
+  });
+
+  it.each(["scan", "prepare"])(
+    "resets recovered %s failure history after an empty scan",
+    async (failureStage) => {
+      const clock = new ManualClock(1_000_000);
+      const harness = await createOfflineTestHarness({ clock });
+      cleanup = harness.cleanup;
+      const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+      const trainOfThoughtRepository = new TrainOfThoughtRepository({ db: harness.db, clock });
+      let phase: "error" | "empty" | "due" = "error";
+      const source = createTestDueSource("recovered-preparation", "scheduled_wake");
+      const [event] = await source.scan();
+      source.scan = vi.fn(async () => {
+        if (phase === "empty") return [];
+        if (phase === "error" && failureStage === "scan") throw new Error("scan failed");
+        return [{ ...event!, id: `recovered:${clock.now()}` }];
+      });
+      vi.spyOn(trainOfThoughtRepository, "get").mockImplementation(() => {
+        if (phase === "error" && failureStage === "prepare") throw new Error("prepare failed");
+        return null;
+      });
+      const turnRunner = {
+        run: vi.fn().mockResolvedValue(createStructuralTurnResult({ emissionKind: "suppressed" })),
+      };
+      const scheduler = createScheduler({
+        db: harness.db,
+        enabled: true,
+        intervalMs: 1_000,
+        maxWakesPerWindow: 20,
+        clock,
+        createStreamWriter: (sessionId) =>
+          new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+        watermarkRepository,
+        trainOfThoughtRepository,
+        turnOrchestrator: turnRunner,
+        toolDispatcher: new ToolDispatcher({
+          createStreamWriter: (sessionId) =>
+            new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+          clock,
+        }),
+        sources: [source],
+      });
+
+      expect((await scheduler.tick()).sourceErrorCount).toBe(1);
+      clock.advance(30_000);
+      phase = "empty";
+      expect(await scheduler.tick()).toMatchObject({ events: [], sourceErrorCount: 0 });
+      expect(source.scan).toHaveBeenCalledTimes(2);
+
+      clock.advance(1_000);
+      phase = "error";
+      expect((await scheduler.tick()).sourceErrorCount).toBe(1);
+      phase = "due";
+      clock.advance(29_999);
+      expect((await scheduler.tick()).events).toEqual([]);
+      expect(source.scan).toHaveBeenCalledTimes(3);
+      expect(turnRunner.run).not.toHaveBeenCalled();
+
+      clock.advance(1);
+      expect((await scheduler.tick()).firedEvents).toBe(1);
+      expect(source.scan).toHaveBeenCalledTimes(4);
+      expect(turnRunner.run).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("preserves failed-turn escalation across preparation recovery and empty scans", async () => {
+    const clock = new ManualClock(1_000_000);
+    const harness = await createOfflineTestHarness({ clock });
+    cleanup = harness.cleanup;
+    const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+    const trainOfThoughtRepository = new TrainOfThoughtRepository({ db: harness.db, clock });
+    const getThought = vi.spyOn(trainOfThoughtRepository, "get");
+    let empty = false;
+    const source = createTestDueSource("outstanding-failed-turn", "scheduled_wake");
+    const [event] = await source.scan();
+    source.scan = vi.fn(async () =>
+      empty ? [] : [{ ...event!, id: `outstanding:${clock.now()}` }],
+    );
+    const turnRunner = {
+      run: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("first turn failure"))
+        .mockRejectedValueOnce(new Error("second turn failure"))
+        .mockResolvedValue(createStructuralTurnResult({ emissionKind: "suppressed" })),
+    };
+    const scheduler = createScheduler({
+      db: harness.db,
+      enabled: true,
+      intervalMs: 1_000,
+      maxWakesPerWindow: 20,
+      clock,
+      createStreamWriter: (sessionId) =>
+        new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+      watermarkRepository,
+      trainOfThoughtRepository,
+      turnOrchestrator: turnRunner,
+      toolDispatcher: new ToolDispatcher({
+        createStreamWriter: (sessionId) =>
+          new StreamWriter({ dataDir: harness.tempDir, sessionId, clock }),
+        clock,
+      }),
+      sources: [source],
+    });
+
+    expect((await scheduler.tick()).errorCount).toBe(1);
+    clock.advance(30_000);
+    getThought.mockImplementationOnce(() => {
+      throw new Error("temporary preparation failure");
+    });
+    expect((await scheduler.tick()).sourceErrorCount).toBe(1);
+
+    clock.advance(30_000);
+    empty = true;
+    expect((await scheduler.tick()).events).toEqual([]);
+    expect(source.scan).toHaveBeenCalledTimes(3);
+    clock.advance(1_000);
+    empty = false;
+    expect((await scheduler.tick()).errorCount).toBe(1);
+    expect(turnRunner.run).toHaveBeenCalledTimes(2);
+
+    clock.advance(30_000);
+    expect((await scheduler.tick()).events).toEqual([]);
+    expect(turnRunner.run).toHaveBeenCalledTimes(2);
+    clock.advance(29_999);
+    expect((await scheduler.tick()).events).toEqual([]);
+    clock.advance(1);
+    expect((await scheduler.tick()).firedEvents).toBe(1);
+    expect(turnRunner.run).toHaveBeenCalledTimes(3);
   });
 
   it("reports source scan errors and retries only after bounded source backoff", async () => {

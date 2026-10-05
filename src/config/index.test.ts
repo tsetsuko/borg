@@ -8,7 +8,13 @@ import { DEFAULT_PLAN_REQUESTED_VERIFICATION_MEMBERSHIP_TOKEN_BUDGET } from "../
 import { OFFLINE_PROCESS_NAMES } from "../contracts/offline-process.js";
 import { writeJsonFileAtomic } from "../util/atomic-write.js";
 import { ConfigError } from "../util/errors.js";
-import { DEFAULT_CONFIG, configSchema, loadConfig, redactConfig } from "./index.js";
+import {
+  DEFAULT_CONFIG,
+  configSchema,
+  loadConfig,
+  redactConfig,
+  similarityThresholds,
+} from "./index.js";
 
 describe("config", () => {
   const tempDirs: string[] = [];
@@ -38,6 +44,8 @@ describe("config", () => {
       background: "claude-opus-5",
       extraction: "claude-opus-5",
       recallExpansion: "claude-haiku-4-5-20251001",
+      correctivePreference: "claude-sonnet-5",
+      sharedStateCompiler: "claude-sonnet-5",
       creatorDirective: "claude-sonnet-4-6",
       imagePerception: "claude-haiku-4-5-20251001",
     });
@@ -58,6 +66,7 @@ describe("config", () => {
     expect(config.affective.llmEnabled).toBe(true);
     expect(config.episodic.salienceGateEnabled).toBe(true);
     expect(config.offline.curator.episodeDecayIntervalMs).toBe(24 * 60 * 60 * 1_000);
+    expect(config.offline.curator.traitDecayIntervalMs).toBe(24 * 60 * 60 * 1_000);
     expect(config.offline.curator.episodeSalienceHalfLifeDays).toBe(30);
     expect(config.offline.curator.episodeHeatHalfLifeDays).toBe(7);
     expect(config.offline.curator.traitHalfLifeDays).toBe(30);
@@ -124,6 +133,7 @@ describe("config", () => {
     ).toBe(OFFLINE_PROCESS_NAMES.length);
     expect(config.executive.goalFocusThreshold).toBe(0.45);
     expect(config.autonomy.maxWakesPerWindow).toBe(6);
+    expect(config.autonomy.prepToolTimeoutMs).toBe(30_000);
     expect(config.autonomy.goalWakeBatchMax).toBe(5);
     expect(config.autonomy.budgetWindowMs).toBe(24 * 60 * 60 * 1_000);
     expect(config.autonomy.reservedContemplativeWakesPerWindow).toBe(1);
@@ -170,10 +180,14 @@ describe("config", () => {
       DEFAULT_PLAN_REQUESTED_VERIFICATION_MEMBERSHIP_TOKEN_BUDGET,
     );
     expect(config.deliberation.finalizerDynamicPromptCacheEnabled).toBe(true);
+    expect(config.deliberation.finalizerTransport).toBe("unary");
     expect(config.deliberation.finalizerSurfaceVariant).toBe("legacy");
     expect(config.deliberation.finalizerContextCaptureSampleRate).toBe(0);
+    expect(config.deliberation.finalizerContextCaptureMaxFileBytes).toBe(1024 * 1024 * 1024);
     expect(config.deliberation.plannerSurfaceVariant).toBe("compact");
     expect(config.deliberation.plannerContextCaptureSampleRate).toBe(0);
+    expect(config.deliberation.plannerContextCaptureMaxFileBytes).toBe(512 * 1024 * 1024);
+    expect(config.deliberation.contextCaptureRotationKeep).toBe(2);
     expect(config.commitments).toEqual({
       enforce: {
         regenerateBeforeSuppress: true,
@@ -184,7 +198,6 @@ describe("config", () => {
       enabled: true,
       currentSessionTranscriptTokenBudget: 2_500,
       actionThreadRenderLimit: 12,
-      actionThreadSimilarityThreshold: 0.85,
       actionThreadSourceRecordLimit: 256,
       actionThreadSalienceClassReservedSlots: 1,
       actionThreadAudienceReservedSlots: 1,
@@ -274,6 +287,25 @@ describe("config", () => {
     });
 
     expect(config.deliberation.finalizerDynamicPromptCacheEnabled).toBe(false);
+  });
+
+  it("lets the finalizer transport environment override take precedence", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    writeJsonFileAtomic(join(tempDir, "config.json"), {
+      deliberation: {
+        finalizerTransport: "unary",
+      },
+    });
+
+    const config = loadConfig({
+      dataDir: tempDir,
+      env: {
+        BORG_DELIBERATION_FINALIZER_TRANSPORT: "streaming",
+      },
+    });
+
+    expect(config.deliberation.finalizerTransport).toBe("streaming");
   });
 
   it("honors the plan-requested verification membership budget environment override", () => {
@@ -433,6 +465,50 @@ describe("config", () => {
     expect(config.deliberation.plannerContextCaptureSampleRate).toBe(0.75);
   });
 
+  it("loads context capture rotation limits from config.json and lets env override them", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    writeJsonFileAtomic(join(tempDir, "config.json"), {
+      deliberation: {
+        contextCaptureRotationKeep: 3,
+        plannerContextCaptureMaxFileBytes: 1_024,
+        finalizerContextCaptureMaxFileBytes: 2_048,
+      },
+    });
+
+    const fromFile = loadConfig({ dataDir: tempDir, env: {} });
+    expect(fromFile.deliberation).toMatchObject({
+      contextCaptureRotationKeep: 3,
+      plannerContextCaptureMaxFileBytes: 1_024,
+      finalizerContextCaptureMaxFileBytes: 2_048,
+    });
+
+    const fromEnv = loadConfig({
+      dataDir: tempDir,
+      env: {
+        BORG_DELIBERATION_CONTEXT_CAPTURE_ROTATION_KEEP: "4",
+        BORG_DELIBERATION_PLANNER_CONTEXT_CAPTURE_MAX_FILE_BYTES: "4096",
+        BORG_DELIBERATION_FINALIZER_CONTEXT_CAPTURE_MAX_FILE_BYTES: "8192",
+      },
+    });
+    expect(fromEnv.deliberation).toMatchObject({
+      contextCaptureRotationKeep: 4,
+      plannerContextCaptureMaxFileBytes: 4_096,
+      finalizerContextCaptureMaxFileBytes: 8_192,
+    });
+  });
+
+  it.each([
+    ["BORG_DELIBERATION_CONTEXT_CAPTURE_ROTATION_KEEP", "-1"],
+    ["BORG_DELIBERATION_PLANNER_CONTEXT_CAPTURE_MAX_FILE_BYTES", "0"],
+    ["BORG_DELIBERATION_FINALIZER_CONTEXT_CAPTURE_MAX_FILE_BYTES", "1.5"],
+  ])("rejects invalid context capture rotation override %s", (name, value) => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+
+    expect(() => loadConfig({ dataDir: tempDir, env: { [name]: value } })).toThrow(ConfigError);
+  });
+
   it.each(["-0.01", "1.01", "not-a-number"])(
     "rejects invalid planner context capture sample rate %s",
     (sampleRate) => {
@@ -502,6 +578,58 @@ describe("config", () => {
           semanticOverfetchMultiplier: 11,
         },
       }),
+    ).toThrow();
+  });
+
+  it("loads the recall-expansion timeout from the environment and defaults it to 2000ms", () => {
+    const overrideDir = mkdtempSync(join(tmpdir(), "borg-"));
+    const disabledDir = mkdtempSync(join(tmpdir(), "borg-"));
+    const defaultDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(overrideDir, disabledDir, defaultDir);
+
+    expect(
+      loadConfig({
+        dataDir: overrideDir,
+        env: { BORG_RETRIEVAL_RECALL_EXPANSION_TIMEOUT_MS: "4500" },
+      }).retrieval.recallExpansionTimeoutMs,
+    ).toBe(4500);
+    expect(
+      loadConfig({
+        dataDir: disabledDir,
+        env: { BORG_RETRIEVAL_RECALL_EXPANSION_TIMEOUT_MS: "0" },
+      }).retrieval.recallExpansionTimeoutMs,
+    ).toBe(0);
+    expect(loadConfig({ dataDir: defaultDir, env: {} }).retrieval.recallExpansionTimeoutMs).toBe(
+      2000,
+    );
+    expect(() =>
+      configSchema.parse({
+        retrieval: {
+          recallExpansionTimeoutMs: -1,
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("loads the recall planner variant count from the environment and defaults it to three", () => {
+    const overrideDir = mkdtempSync(join(tmpdir(), "borg-"));
+    const defaultDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(overrideDir, defaultDir);
+
+    expect(
+      loadConfig({
+        dataDir: overrideDir,
+        env: { BORG_RETRIEVAL_RECALL_EXPANSION_SEMANTIC_VARIANT_COUNT: "7" },
+      }).retrieval.recallExpansionSemanticVariantCount,
+    ).toBe(7);
+    expect(
+      loadConfig({ dataDir: defaultDir, env: {} }).retrieval.recallExpansionSemanticVariantCount,
+    ).toBe(3);
+    expect(() =>
+      configSchema.parse({ retrieval: { recallExpansionSemanticVariantCount: 0 } }),
+    ).toThrow();
+    expect(() =>
+      configSchema.parse({ retrieval: { recallExpansionSemanticVariantCount: 9 } }),
     ).toThrow();
   });
 
@@ -584,6 +712,84 @@ describe("config", () => {
     expect(config.maintenance).toEqual(DEFAULT_CONFIG.maintenance);
   });
 
+  it("loads ruminator revisit periods from defaults and environment", () => {
+    const defaultDir = mkdtempSync(join(tmpdir(), "borg-"));
+    const overrideDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(defaultDir, overrideDir);
+
+    expect(loadConfig({ dataDir: defaultDir, env: {} }).offline.ruminator).toMatchObject({
+      revisitPeriodMinDays: 2,
+      revisitPeriodMaxDays: 30,
+    });
+    expect(
+      loadConfig({
+        dataDir: overrideDir,
+        env: {
+          BORG_OFFLINE_RUMINATOR_REVISIT_PERIOD_MIN_DAYS: "1.5",
+          BORG_OFFLINE_RUMINATOR_REVISIT_PERIOD_MAX_DAYS: "45",
+        },
+      }).offline.ruminator,
+    ).toMatchObject({
+      revisitPeriodMinDays: 1.5,
+      revisitPeriodMaxDays: 45,
+    });
+    expect(() =>
+      configSchema.parse({
+        offline: {
+          ruminator: {
+            revisitPeriodMinDays: 31,
+            revisitPeriodMaxDays: 30,
+          },
+        },
+      }),
+    ).toThrow(/minimum revisit period/);
+  });
+
+  it("loads ruminator duplicate-judgment bounds from defaults and environment", () => {
+    const defaultDir = mkdtempSync(join(tmpdir(), "borg-"));
+    const overrideDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(defaultDir, overrideDir);
+
+    expect(loadConfig({ dataDir: defaultDir, env: {} }).offline.ruminator).toMatchObject({
+      duplicateJudgmentMaxPairs: 24,
+      duplicateJudgmentMinRemainingBudgetFraction: 0.25,
+    });
+    expect(
+      loadConfig({
+        dataDir: overrideDir,
+        env: {
+          BORG_OFFLINE_RUMINATOR_DUPLICATE_JUDGMENT_MAX_PAIRS: "7",
+          BORG_OFFLINE_RUMINATOR_DUPLICATE_JUDGMENT_MIN_REMAINING_BUDGET_FRACTION: "0.4",
+        },
+      }).offline.ruminator,
+    ).toMatchObject({
+      duplicateJudgmentMaxPairs: 7,
+      duplicateJudgmentMinRemainingBudgetFraction: 0.4,
+    });
+  });
+
+  it.each([
+    ["BORG_OFFLINE_RUMINATOR_DUPLICATE_JUDGMENT_MAX_PAIRS", "0"],
+    ["BORG_OFFLINE_RUMINATOR_DUPLICATE_JUDGMENT_MIN_REMAINING_BUDGET_FRACTION", "1.1"],
+  ])("rejects an invalid ruminator duplicate-judgment bound %s=%s", (name, value) => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+
+    expect(() => loadConfig({ dataDir: tempDir, env: { [name]: value } })).toThrow(ConfigError);
+  });
+
+  it("loads the trait decay interval from the environment", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+
+    expect(
+      loadConfig({
+        dataDir: tempDir,
+        env: { BORG_OFFLINE_CURATOR_TRAIT_DECAY_INTERVAL_MS: "43200000" },
+      }).offline.curator.traitDecayIntervalMs,
+    ).toBe(12 * 60 * 60 * 1_000);
+  });
+
   it("accepts deprecated llm fallback env aliases", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
     tempDirs.push(tempDir);
@@ -610,6 +816,7 @@ describe("config", () => {
         BORG_AUTONOMY_MAX_WAKES_PER_WINDOW: "9",
         BORG_AUTONOMY_GOAL_WAKE_BATCH_MAX: "4",
         BORG_AUTONOMY_BUDGET_WINDOW_MS: "7200000",
+        BORG_AUTONOMY_PREP_TOOL_TIMEOUT_MS: "45000",
         BORG_AUTONOMY_RESERVED_CONTEMPLATIVE_WAKES_PER_WINDOW: "2",
       },
     });
@@ -617,6 +824,7 @@ describe("config", () => {
     expect(config.autonomy.maxWakesPerWindow).toBe(9);
     expect(config.autonomy.goalWakeBatchMax).toBe(4);
     expect(config.autonomy.budgetWindowMs).toBe(7_200_000);
+    expect(config.autonomy.prepToolTimeoutMs).toBe(45_000);
     expect(config.autonomy.reservedContemplativeWakesPerWindow).toBe(2);
   });
 
@@ -753,6 +961,8 @@ describe("config", () => {
         models: {
           cognition: "file-cognition",
           recallExpansion: "file-recall",
+          correctivePreference: "file-corrective-preference",
+          sharedStateCompiler: "file-shared-state-compiler",
         },
       },
       offline: {
@@ -829,11 +1039,12 @@ describe("config", () => {
         BORG_OFFLINE_SEMANTIC_EXTRACTOR_MAX_INPUT_TOKENS_PER_RUN: "90000",
         BORG_OFFLINE_SEMANTIC_EXTRACTOR_BUDGET: "12000",
         BORG_OFFLINE_LIVED_EXPERIENCE_DAY_SUMMARIZER_BUDGET: "123000",
+        BORG_OFFLINE_OVERSEER_MAX_OUTPUT_TOKENS: "6000",
         BORG_EXECUTIVE_GOAL_FOCUS_THRESHOLD: "0.6",
         BORG_STREAM_INGESTION_PRE_TURN_CATCHUP_MAX_ENTRIES: "8",
         BORG_GENERATION_EVIDENCE_LEDGER_CURRENT_SESSION_TRANSCRIPT_TOKEN_BUDGET: "16000",
         BORG_GENERATION_EVIDENCE_LEDGER_ACTION_THREAD_RENDER_LIMIT: "8",
-        BORG_GENERATION_EVIDENCE_LEDGER_ACTION_THREAD_SIMILARITY_THRESHOLD: "0.9",
+        BORG_SIMILARITY_OVERRIDES: JSON.stringify({ actionThread: 0.9 }),
         BORG_GENERATION_EVIDENCE_LEDGER_ACTION_THREAD_SOURCE_RECORD_LIMIT: "128",
         BORG_GENERATION_EVIDENCE_LEDGER_ACTION_THREAD_SALIENCE_CLASS_RESERVED_SLOTS: "2",
         BORG_GENERATION_EVIDENCE_LEDGER_ACTION_THREAD_AUDIENCE_RESERVED_SLOTS: "3",
@@ -856,6 +1067,8 @@ describe("config", () => {
         BORG_MAINTENANCE_BUSY_RETRY_BASE_MS: "2345",
         BORG_MAINTENANCE_BUSY_RETRY_MAX_MS: "3456",
         BORG_MODEL_RECALL_EXPANSION: "env-recall",
+        BORG_MODEL_CORRECTIVE_PREFERENCE: "env-corrective-preference",
+        BORG_MODEL_SHARED_STATE_COMPILER: "env-shared-state-compiler",
         BORG_ANTHROPIC_OAUTH_SSE_INACTIVITY_TIMEOUT_MS: "111",
         BORG_ANTHROPIC_OAUTH_SSE_FIRST_MESSAGE_EVENT_TIMEOUT_MS: "222",
         BORG_ANTHROPIC_OAUTH_SSE_MESSAGE_EVENT_GAP_TIMEOUT_MS: "333",
@@ -875,6 +1088,8 @@ describe("config", () => {
     expect(config.anthropic.apiKey).toBe("secret");
     expect(config.anthropic.models.cognition).toBe("file-cognition");
     expect(config.anthropic.models.recallExpansion).toBe("env-recall");
+    expect(config.anthropic.models.correctivePreference).toBe("env-corrective-preference");
+    expect(config.anthropic.models.sharedStateCompiler).toBe("env-shared-state-compiler");
     expect(config.anthropic.oauthSseInactivityTimeoutMs).toBe(111);
     expect(config.anthropic.oauthSseFirstMessageEventTimeoutMs).toBe(222);
     expect(config.anthropic.oauthSseMessageEventGapTimeoutMs).toBe(333);
@@ -901,7 +1116,7 @@ describe("config", () => {
     expect(config.generation.evidenceLedger.enabled).toBe(true);
     expect(config.generation.evidenceLedger.currentSessionTranscriptTokenBudget).toBe(16_000);
     expect(config.generation.evidenceLedger.actionThreadRenderLimit).toBe(8);
-    expect(config.generation.evidenceLedger.actionThreadSimilarityThreshold).toBe(0.9);
+    expect(similarityThresholds(config).actionThread).toBe(0.9);
     expect(config.generation.evidenceLedger.actionThreadSourceRecordLimit).toBe(128);
     expect(config.generation.evidenceLedger.actionThreadSalienceClassReservedSlots).toBe(2);
     expect(config.generation.evidenceLedger.actionThreadAudienceReservedSlots).toBe(3);
@@ -949,6 +1164,7 @@ describe("config", () => {
     expect(config.offline.semanticExtractor.maxInputTokensPerRun).toBe(90_000);
     expect(config.offline.semanticExtractor.budget).toBe(12_000);
     expect(config.offline.livedExperienceDaySummarizer.budget).toBe(123_000);
+    expect(config.offline.overseer.maxOutputTokens).toBe(6_000);
   });
 
   it("accepts post-generation guard simple modes", () => {
@@ -1006,9 +1222,50 @@ describe("config", () => {
       background: "claude-opus-5",
       extraction: "claude-opus-5",
       recallExpansion: "claude-haiku-4-5-20251001",
+      correctivePreference: "claude-sonnet-5",
+      sharedStateCompiler: "claude-sonnet-5",
       creatorDirective: "claude-sonnet-4-6",
       imagePerception: "claude-haiku-4-5-20251001",
     });
+  });
+
+  it("defaults corrective preferences to Sonnet independently of recall expansion overrides", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+
+    const config = loadConfig({
+      dataDir: tempDir,
+      env: { BORG_MODEL_RECALL_EXPANSION: "custom-recall" },
+    });
+
+    expect(config.anthropic.models.correctivePreference).toBe("claude-sonnet-5");
+    expect(config.anthropic.models.recallExpansion).toBe("custom-recall");
+  });
+
+  it("defaults shared-state compilation to Sonnet independently of recall expansion overrides", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+
+    const config = loadConfig({
+      dataDir: tempDir,
+      env: { BORG_MODEL_RECALL_EXPANSION: "custom-recall" },
+    });
+
+    expect(config.anthropic.models.sharedStateCompiler).toBe("claude-sonnet-5");
+    expect(config.anthropic.models.recallExpansion).toBe("custom-recall");
+  });
+
+  it("loads the shared-state compiler model from the config file", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    writeJsonFileAtomic(join(tempDir, "config.json"), {
+      anthropic: { models: { sharedStateCompiler: "file-shared-state-compiler" } },
+    });
+
+    const config = loadConfig({ dataDir: tempDir, env: {} });
+
+    expect(config.anthropic.models.sharedStateCompiler).toBe("file-shared-state-compiler");
+    expect(config.anthropic.models.recallExpansion).toBe("claude-haiku-4-5-20251001");
   });
 
   it("requires an api key when anthropic auth mode is api-key", () => {

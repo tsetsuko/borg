@@ -1,3 +1,4 @@
+import { goalBlockStateFields } from "../memory/self/goal-blocks.js";
 import {
   actionMemoryDisclosureLabel,
   openQuestionMemoryDisclosureLabel,
@@ -23,6 +24,7 @@ import type {
   OpenQuestionsRepository,
   GoalsRepository,
 } from "../memory/self/index.js";
+import type { SourceStreamAudienceDisclosureResolver } from "../memory/common/index.js";
 import type { Provenance } from "../memory/common/provenance.js";
 import {
   memoryDisclosureLabelFromEpisodeAccess,
@@ -130,6 +132,7 @@ export type AutobiographicalRecallServiceOptions = {
   episodicRepository?: Partial<Pick<EpisodicRepository, "listRecentForCognition">>;
   actionRepository?: Pick<ActionRepository, "list">;
   goalsRepository?: Pick<GoalsRepository, "list">;
+  sourceStreamAudienceDisclosureResolver?: SourceStreamAudienceDisclosureResolver;
   openQuestionsRepository?: Pick<OpenQuestionsRepository, "list">;
   autobiographicalRepository?: Pick<AutobiographicalRepository, "listPeriods">;
   sessionsRepository?: Pick<SessionsRepository, "list">;
@@ -434,8 +437,8 @@ function actionTimestamp(action: ActionRecord): number {
   );
 }
 
-function flattenGoals(goals: readonly GoalTreeNode[]): GoalRecord[] {
-  return goals.flatMap((goal) => [goal, ...flattenGoals(goal.children)]);
+function flattenGoalsPreorder(goals: readonly GoalTreeNode[]): GoalRecord[] {
+  return goals.flatMap(({ children, ...goal }) => [goal, ...flattenGoalsPreorder(children)]);
 }
 
 type StreamEventCandidate = {
@@ -601,6 +604,12 @@ export class AutobiographicalRecallService {
         relativeAge: formatRelativeAge(item.occurredAt, nowMs),
       });
     };
+    const rawGoalTrees = this.options.goalsRepository?.list({}) ?? [];
+    const goals = flattenGoalsPreorder(
+      this.options.sourceStreamAudienceDisclosureResolver?.resolve({
+        goalTrees: rawGoalTrees,
+      }).goalTrees ?? rawGoalTrees,
+    );
 
     await this.collectActivity({ window, sourceCap, addItem, recordGroupSelection });
     this.collectSelfDecisions({ window, sourceCap, addItem, recordGroupSelection });
@@ -608,7 +617,7 @@ export class AutobiographicalRecallService {
     await this.collectEpisodes({ window, sourceCap, addItem, recordGroupSelection });
     this.collectObservedEvents({ window, sourceCap, addItem, recordGroupSelection });
     this.collectOpenQuestions({ window, sourceCap, addItem, recordGroupSelection });
-    this.collectGoals({ window, sourceCap, addItem, recordGroupSelection });
+    this.collectGoals({ window, sourceCap, addItem, recordGroupSelection, goals });
     this.collectAutobiographicalPeriods({ window, sourceCap, addItem, recordGroupSelection });
     this.collectActions({ window, sourceCap, addItem, recordGroupSelection });
 
@@ -1107,9 +1116,16 @@ export class AutobiographicalRecallService {
     sourceCap: number;
     addItem: (item: AddItemInput) => void;
     recordGroupSelection: RecordGroupSelection;
+    goals: readonly GoalRecord[];
   }): void {
-    const goals = flattenGoals(this.options.goalsRepository?.list({}) ?? []).filter((goal) =>
-      withinWindow(goal.last_progress_ts ?? goal.created_at, input.window),
+    const goals = input.goals.filter((goal) =>
+      withinWindow(
+        Math.max(
+          goal.last_progress_ts ?? goal.created_at,
+          goal.block_history?.at(-1)?.unblocked_at ?? goal.block_history?.at(-1)?.blocked_at ?? 0,
+        ),
+        input.window,
+      ),
     );
     const selected = selectWindowEligibleCandidatesWithinSourceCap(goals, input.sourceCap);
 
@@ -1122,7 +1138,10 @@ export class AutobiographicalRecallService {
     });
 
     for (const goal of selected) {
-      const occurredAt = goal.last_progress_ts ?? goal.created_at;
+      const occurredAt = Math.max(
+        goal.last_progress_ts ?? goal.created_at,
+        goal.block_history?.at(-1)?.unblocked_at ?? goal.block_history?.at(-1)?.blocked_at ?? 0,
+      );
       input.addItem({
         id: `goal:${goal.id}`,
         kind: "goal",
@@ -1132,7 +1151,11 @@ export class AutobiographicalRecallService {
         score: 0.5 + goal.priority * 0.16 + recencyScore(occurredAt, input.window) * 0.16,
         text: [
           `status=${goal.status}`,
+          ...((goal.block_history ?? []).length === 0
+            ? []
+            : [`block_state=${sanitizePromptText(JSON.stringify(goalBlockStateFields(goal)))}`]),
           `priority=${goal.priority.toFixed(2)}`,
+          `counterparty_entity_id=${goal.counterparty_entity_id ?? "none"}`,
           `description=${sanitizePromptText(goal.description)}`,
           goal.terminal_condition === null
             ? null
@@ -1148,8 +1171,12 @@ export class AutobiographicalRecallService {
         sourceEpisodeIds: provenanceEpisodeIds(goal.provenance),
         metadata: {
           goal_id: goal.id,
+          ...goalBlockStateFields(goal),
           status: goal.status,
           priority: goal.priority,
+          counterparty_entity_id: goal.counterparty_entity_id ?? null,
+          counterparty_semantics:
+            "participant the responsibility runs toward; not owner or audience",
         },
       });
     }

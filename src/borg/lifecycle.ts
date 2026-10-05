@@ -83,6 +83,12 @@ export async function closeBorgDependencies(deps: BorgDependencies): Promise<voi
       collectCloseError("review queue enqueue hooks", error);
     }
 
+    await Promise.allSettled(deps.pendingStartupTasks ?? []);
+    await Promise.allSettled([
+      deps.actionRepository?.waitForPendingEmbeddings(),
+      deps.openQuestionsRepository?.waitForPendingEmbeddings(),
+      deps.observedEventRepository?.waitForPendingEmbeddings(),
+    ]);
     try {
       deps.sqlite.close();
     } catch (error) {
@@ -95,6 +101,8 @@ export async function closeBorgDependencies(deps: BorgDependencies): Promise<voi
       collectCloseError("LanceDB store", error);
     }
   }
+
+  if (errors.length === 0) await deps.releaseEmbeddingBankAccess?.();
 
   if (errors.length > 0) {
     throw new AggregateError(errors, "One or more Borg dependencies failed to close");

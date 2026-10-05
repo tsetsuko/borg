@@ -23,6 +23,7 @@ import type {
 } from "../attachments/index.js";
 import type { BorgDependencies } from "../borg/types.js";
 import type { ExecutiveStepsRepository } from "../executive/index.js";
+import { LIVE_TURN_READ_FINALIZER_TOOL_NAMES } from "./deliberation/autonomous-finalizer-tools.js";
 import { Deliberator, type SelfSnapshot } from "./deliberation/deliberator.js";
 import { ActionStateExtractor } from "./actions/action-state-extractor.js";
 import { CREATOR_DIRECTIVE_TOOL_NAME } from "./creator-directives/extractor.js";
@@ -61,6 +62,8 @@ import {
 import { CognitionError, SessionBusyError } from "../util/errors.js";
 import type { SessionLock } from "./session-lock.js";
 import type { IntentRecord } from "./types.js";
+import { turnExecutionMetricsFromError } from "./turn-execution-metrics.js";
+import { TurnPhaseCoordinator } from "./lifecycle/turn-phase-coordinator.js";
 
 type TraceEvent = {
   event: string;
@@ -133,6 +136,7 @@ async function openTestBorg(
           background: "test-background",
           extraction: "test-extraction",
           recallExpansion: "test-recall",
+          correctivePreference: "test-corrective-preference",
           ...configOverrides.anthropic?.models,
         },
       },
@@ -363,10 +367,16 @@ function createRecallExpansionResponse() {
     tool_calls: [
       {
         id: "toolu_recall_expansion",
-        name: "EmitRecallExpansion",
+        name: "EmitRecallQueryPlan",
         input: {
-          facets: [],
+          resolved_query: "Recall the current focus",
+          semantic_variants: [
+            { strategy: "verbatim_preserving", query: "Recall the current focus" },
+            { strategy: "memory_owner_voice", query: "I remember the current focus" },
+            { strategy: "aspect_focused", query: "The current focus's key aspect" },
+          ],
           named_terms: [],
+          typed_queries: [],
         },
       },
     ],
@@ -743,6 +753,7 @@ function createCorrectivePreferenceResponse(input: {
     | "internal_tool_hygiene"
     | null;
   directive?: string | null;
+  directive_source_stream_entry_id?: string | null;
   directive_family?: string | null;
   closure_pressure_relevance?: "no_closure" | "neutral" | "closure_seeking" | null;
   priority?: number | null;
@@ -772,6 +783,7 @@ function createCorrectivePreferenceResponse(input: {
             (input.classification === "corrective_preference" ? "advisory" : null),
           critical_domain: input.critical_domain ?? null,
           directive: input.directive ?? null,
+          directive_source_stream_entry_id: input.directive_source_stream_entry_id ?? null,
           directive_family:
             input.directive_family ??
             (input.classification === "corrective_preference" ? "test_directive_family" : null),
@@ -794,6 +806,7 @@ function createGoalPromotionResponse(
   promotions: Array<{
     description: string;
     priority?: number;
+    counterparty_entity_id?: string | null;
     terminal_condition: string | null;
     target_at?: string | null;
     reason?: string;
@@ -823,6 +836,7 @@ function createGoalPromotionResponse(
             classification: "durable_borg_goal",
             description: promotion.description,
             priority: promotion.priority ?? 8,
+            counterparty_entity_id: promotion.counterparty_entity_id ?? null,
             terminal_condition: promotion.terminal_condition,
             target_at: promotion.target_at ?? null,
             reason: promotion.reason ?? "The user asked Borg to carry this as an ongoing goal.",
@@ -2390,6 +2404,14 @@ describe("TurnOrchestrator inbound batch catch-up", () => {
           confidence: 0.98,
           rationale: "The classifier flagged a frame assignment.",
         }),
+        createFinalizerToolResponse({
+          id: "toolu_blocked_outbound_multi_sender",
+          name: "tool.outbound.post",
+          input: {
+            target_session_id: otherSessionId,
+            instruction: "This mixed-sender attempt must be rejected.",
+          },
+        }),
         createEmitAnswerResponse("Handled without privileged authority."),
         createIntentUpdateReflectionResponse("Track the multi-sender batch"),
       ],
@@ -2538,13 +2560,26 @@ describe("TurnOrchestrator inbound batch catch-up", () => {
           current_sender_borg_role: null,
         }),
       );
+      expect(traceEvents).toContainEqual(
+        expect.objectContaining({
+          event: "tool_call.completed",
+          toolName: "tool.outbound.post",
+          success: false,
+        }),
+      );
       expect(finalizerSystem).not.toContain("operator-only diagnostic directive");
       expect(finalizerSystem).not.toContain("<borg_session_status_snapshot");
       expect(finalizerSystem).not.toContain("Cross-Session Self Activity");
       expect(finalizerSystem).toContain("contacted Borg");
       expect(finalizerSystem).toContain("disclosure_class=self_private");
       expect(finalizerSystem).toContain("source_stream_ids");
-      expect(finalizerRequest?.tools?.map((tool) => tool.name)).not.toContain("tool.outbound.post");
+      expect(finalizerSystem).toContain(
+        '<borg_finalizer_tool_availability turn_origin="user" participation_policy="active" outbound_post="unavailable"',
+      );
+      // Finalizer schemas are now origin-static for prompt-cache stability. The
+      // mixed-sender security contract is the unavailable dispatch gate above;
+      // the advertised outbound schema must not imply or grant authority.
+      expect(finalizerRequest?.tools?.map((tool) => tool.name)).toContain("tool.outbound.post");
     } finally {
       await borg.close();
     }
@@ -2563,6 +2598,14 @@ describe("TurnOrchestrator inbound batch catch-up", () => {
           kind: "roleplay_inversion",
           confidence: 0.98,
           rationale: "The classifier flagged a frame assignment.",
+        }),
+        createFinalizerToolResponse({
+          id: "toolu_blocked_outbound_null_sender",
+          name: "tool.outbound.post",
+          input: {
+            target_session_id: otherSessionId,
+            instruction: "This null-sender batch attempt must be rejected.",
+          },
         }),
         createEmitAnswerResponse("Handled without privileged authority."),
         createIntentUpdateReflectionResponse("Track the null-sender batch"),
@@ -2687,6 +2730,13 @@ describe("TurnOrchestrator inbound batch catch-up", () => {
           current_sender_borg_role: null,
         }),
       );
+      expect(traceEvents).toContainEqual(
+        expect.objectContaining({
+          event: "tool_call.completed",
+          toolName: "tool.outbound.post",
+          success: false,
+        }),
+      );
       expect(finalizerSystem).not.toContain("operator-only null-sender directive");
       expect(finalizerSystem).not.toContain('mode="private_operation"');
       expect(finalizerSystem).not.toContain("<operational_directive>");
@@ -2695,7 +2745,12 @@ describe("TurnOrchestrator inbound batch catch-up", () => {
       expect(finalizerSystem).toContain("contacted Borg");
       expect(finalizerSystem).toContain("disclosure_class=self_private");
       expect(finalizerSystem).toContain("source_stream_ids");
-      expect(finalizerRequest?.tools?.map((tool) => tool.name)).not.toContain("tool.outbound.post");
+      expect(finalizerSystem).toContain(
+        '<borg_finalizer_tool_availability turn_origin="user" participation_policy="active" outbound_post="unavailable"',
+      );
+      // A null sender still removes creator authority. Origin-static schema
+      // advertisement is harmless because this turn's dispatch gate rejects it.
+      expect(finalizerRequest?.tools?.map((tool) => tool.name)).toContain("tool.outbound.post");
     } finally {
       await borg.close();
     }
@@ -3179,6 +3234,145 @@ describe("TurnOrchestrator evidence ledger", () => {
     ];
   }
 
+  it("counts recall-expansion stall retries on the shared client in the owning turn", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-recall-metrics-"));
+    tempDirs.push(tempDir);
+    const llm = new FakeLLMClient({
+      responses: [...ledgerTurnResponses("First answer."), ...ledgerTurnResponses("Next answer.")],
+    });
+    const complete = llm.complete.bind(llm);
+    let recallCalls = 0;
+    vi.spyOn(llm, "complete").mockImplementation((options) => {
+      if (options.budget === "recall-expansion") {
+        recallCalls += 1;
+        if (recallCalls === 1) {
+          options.onTransportRetry?.({
+            attempt: 2,
+            kind: "stall",
+            code: "LLM_STREAM_STALLED",
+            retry_transport: "unary",
+          });
+        }
+        return Promise.resolve(createRecallExpansionResponse());
+      }
+      return complete(options);
+    });
+    const borg = await openTestBorg(tempDir, llm, new ManualClock(1_800_000_180_000));
+    try {
+      const first = await borg.turn({ userMessage: "Recall our current focus.", stakes: "low" });
+      expect(recallCalls).toBe(1);
+      expect(first).toMatchObject({ finalizer_rounds: 1, stall_retries: 1 });
+      const next = await borg.turn({ userMessage: "Continue with that focus.", stakes: "low" });
+      expect(recallCalls).toBe(2);
+      expect(next).toMatchObject({ finalizer_rounds: 1, stall_retries: 0 });
+    } finally {
+      await borg.close();
+    }
+  });
+
+  it.each(["terminal tracing", "lease release"])(
+    "associates executed counts with a rejection from %s",
+    async (failurePoint) => {
+      const tempDir = mkdtempSync(join(tmpdir(), "borg-terminal-metrics-"));
+      tempDirs.push(tempDir);
+      const failure = new Error(`${failurePoint} failed`);
+      const llm = new FakeLLMClient({ responses: ledgerTurnResponses("Completed answer.") });
+      const converse = llm.converse.bind(llm);
+      vi.spyOn(llm, "converse").mockImplementation((options) => {
+        options.onTransportRetry?.({ attempt: 2, kind: "stall", retry_transport: "unary" });
+        options.onTransportRetry?.({ attempt: 3, kind: "stall", retry_transport: "unary" });
+        return converse(options);
+      });
+      const borg = await openTestBorg(tempDir, llm, new ManualClock(1_800_000_180_000), undefined, {
+        tracerPath: join(tempDir, "trace.jsonl"),
+      });
+      const deps = (borg as unknown as { deps: BorgDependencies }).deps;
+      if (failurePoint === "terminal tracing") {
+        const emit = deps.tracer.emit.bind(deps.tracer);
+        vi.spyOn(deps.tracer, "emit").mockImplementation((event, data) => {
+          if (event === "turn.terminal") throw failure;
+          emit(event, data);
+        });
+      } else {
+        const lock = getSessionLock(borg);
+        const acquire = lock.acquire.bind(lock);
+        vi.spyOn(lock, "acquire").mockImplementation(async (...args) => {
+          const lease = await acquire(...args);
+          return lease === null
+            ? null
+            : {
+                async release() {
+                  await lease.release();
+                  throw failure;
+                },
+              };
+        });
+      }
+      try {
+        await expect(borg.turn({ userMessage: "Continue our work.", stakes: "low" })).rejects.toBe(
+          failure,
+        );
+        expect(turnExecutionMetricsFromError(failure)).toEqual({
+          finalizer_rounds: 1,
+          stall_retries: 2,
+        });
+      } finally {
+        await borg.close();
+      }
+    },
+  );
+
+  it("emits turn.terminal before a concurrent trace after the coordinator resolves", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-terminal-order-"));
+    tempDirs.push(tempDir);
+    const tracePath = join(tempDir, "trace.jsonl");
+    const borg = await openTestBorg(
+      tempDir,
+      new FakeLLMClient(),
+      new ManualClock(1_800_000_180_000),
+      undefined,
+      {
+        tracerPath: tracePath,
+      },
+    );
+    const deps = (borg as unknown as { deps: BorgDependencies }).deps;
+    const coordinator = vi
+      .spyOn(TurnPhaseCoordinator.prototype, "run")
+      .mockImplementation(({ turnId }) => {
+        // The concurrent producer has one more continuation to run. An extra
+        // async wrapper must not let it overtake the already completed turn.
+        queueMicrotask(() =>
+          queueMicrotask(() => {
+            deps.tracer.emit("llm_call.completed", { turnId: "concurrent-turn" });
+          }),
+        );
+        return Promise.resolve({
+          turn_id: turnId,
+          mode: "idle",
+          path: "suppressed",
+          response: "",
+          emitted: false,
+          emission: { kind: "suppressed", reason: "finalizer_no_output" },
+          thoughts: [],
+          usage: { input_tokens: 0, output_tokens: 0, stop_reason: null },
+          retrievedEpisodeIds: [],
+          referencedEpisodeIds: [],
+          intents: [],
+          toolCalls: [],
+        });
+      });
+    try {
+      await borg.turn({ userMessage: "Continue our work.", stakes: "low" });
+      const events = readTraceEvents(tracePath).filter(
+        (event) => event.event === "turn.terminal" || event.turnId === "concurrent-turn",
+      );
+      expect(events.map((event) => event.event)).toEqual(["turn.terminal", "llm_call.completed"]);
+    } finally {
+      coordinator.mockRestore();
+      await borg.close();
+    }
+  });
+
   it("does not include the evidence ledger prompt block when the flag is disabled", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
     tempDirs.push(tempDir);
@@ -3328,6 +3522,10 @@ describe("TurnOrchestrator evidence ledger", () => {
       const agentEntry = borg.stream.tail(20).find((entry) => entry.kind === "agent_msg");
 
       expect(result.response).toBe(finalText);
+      expect(result).toMatchObject({
+        finalizer_rounds: 1,
+        stall_retries: 0,
+      });
       expect(result.emitted).toBe(true);
       expect(agentEntry?.content).toBe(finalText);
       expect(finalizerRequest?.tool_choice).toEqual({ type: "any" });
@@ -3337,8 +3535,14 @@ describe("TurnOrchestrator evidence ledger", () => {
         "EmitObserve",
         "EmitNoOutput",
         "EmitSelfReport",
-        "tool.ownRecords.list",
+        ...LIVE_TURN_READ_FINALIZER_TOOL_NAMES,
+        // User-origin finalizer schemas are cache-stable; live availability is
+        // carried by the overlay and enforced by the tool loop.
+        "tool.outbound.post",
       ]);
+      expect(finalizerSystem).toContain(
+        '<borg_finalizer_tool_availability turn_origin="user" participation_policy="active" outbound_post="unavailable"',
+      );
       expect(finalizerRequest?.tools?.map((tool) => tool.name)).not.toContain(
         "tool.journal.append",
       );
@@ -6787,6 +6991,16 @@ describe("TurnOrchestrator self snapshot audience visibility", () => {
       expect(budgets).toContain("corrective-preference-extractor");
       expect(budgets).toContain("action-state-extractor");
       expect(budgets).toContain("goal-promotion-extractor");
+      expect(llm.requests).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            budget: "corrective-preference-extractor",
+            model: "test-corrective-preference",
+          }),
+          expect.objectContaining({ budget: "action-state-extractor", model: "test-recall" }),
+          expect.objectContaining({ budget: "goal-promotion-extractor", model: "test-recall" }),
+        ]),
+      );
       expect(extractSpy).toHaveBeenCalled();
       expect(anomalyEvent).toBeUndefined();
       expect(quarantineEvent).toBeUndefined();

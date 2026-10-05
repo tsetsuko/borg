@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -11,10 +12,21 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { operatorAttentionPromptRow } from "../../memory/operator-attention/disclosure.js";
+import { unknownMemoryDisclosureLabel } from "../../memory/common/disclosure-label.js";
 import type { LLMCompleteResult } from "../../llm/index.js";
-import { DEFAULT_SESSION_ID, createCreatorDirectiveId, createEntityId } from "../../util/ids.js";
+import { goalSchema } from "../../memory/self/types.js";
+import { FixedClock } from "../../util/clock.js";
+import {
+  DEFAULT_SESSION_ID,
+  createCreatorDirectiveId,
+  createEntityId,
+  createExecutiveStepId,
+  createGoalId,
+} from "../../util/ids.js";
 import { FakeLLMClient } from "../../llm/test-support/fake-client.js";
 import type { DeliberationContext } from "./types.js";
 import {
@@ -35,11 +47,13 @@ import {
 } from "./planner-context-capture.js";
 import { replayPlannerContextCapture } from "./planner-ab-replay.js";
 import { createS2PlannerRequestSnapshot } from "./s2-planner.js";
+import { waitForContextCaptureMaintenance } from "./context-capture-storage.js";
 
 const NOW_MS = Date.UTC(2026, 7, 13, 20, 0, 0);
 const tempDirs: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  await waitForContextCaptureMaintenance();
   vi.restoreAllMocks();
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
@@ -161,6 +175,21 @@ describe("planner context capture", () => {
   it("round-trips the rendering closure through JSON with byte-identical paired surfaces", () => {
     const repositoryGet = vi.fn();
     const reRetrieve = vi.fn();
+    const attentionRows = [
+      operatorAttentionPromptRow({
+        record_key: "cclink:capture",
+        filed_at: NOW_MS,
+        filer_entity_id: createEntityId(),
+        subject: "Capture subject",
+      }),
+      operatorAttentionPromptRow({
+        record_key: "cclink:unknown",
+        filed_at: NOW_MS - 1,
+        filer_entity_id: createEntityId(),
+        subject: null,
+        disclosure_label: unknownMemoryDisclosureLabel(),
+      }),
+    ];
     const input = renderInput(
       context({
         entityRepository: {
@@ -171,9 +200,34 @@ describe("planner context capture", () => {
           recentSuppressions: [],
           recentRegenerations: [],
           autonomySchedulerState: {
+            operatorAttentionIndex: {
+              total: 125,
+              records: attentionRows,
+            },
             observedAt: NOW_MS,
             enabled: true,
             tickInFlight: false,
+            intervalMs: 60_000,
+            droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+            intervalArmedAt: NOW_MS - 3_600_000,
+            // Non-empty on purpose: an empty list round-trips through a
+            // projector that drops the field just as well as through one that
+            // carries it, and this pair is the only guard on that boundary.
+            sources: [
+              {
+                name: "executive_focus_due",
+                type: "trigger",
+                category: "operational",
+                enabled: true,
+                next_due_at: NOW_MS + 120_000,
+              },
+              {
+                name: "mood_valence_drop",
+                type: "condition",
+                category: "operational",
+                enabled: true,
+              },
+            ],
             nextTickAt: NOW_MS + 60_000,
             scheduledTickAt: NOW_MS + 60_000,
             fleetBrake: {
@@ -187,8 +241,18 @@ describe("planner context capture", () => {
               error_paused_until: null,
               bypass_count: 0,
               freshness_bypass_cap: 3,
-              window_outcomes: { headway: 0, silent: 0, error: 0, busy: 0 },
+              window_outcomes: {
+                headway: 0,
+                silent: 0,
+                error: 0,
+                busy: 0,
+                interrupted: 0,
+              },
+              window_headway_reasons: { total: 0, without_detail: 0, reasons: [] },
               window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+              window_error_span: null,
+              window_silent_span: null,
+              window_silent_reasons: { total: 0, without_detail: 0, reasons: [] },
             },
             budget: {
               max_wakes_per_window: 6,
@@ -208,6 +272,7 @@ describe("planner context capture", () => {
                     silent: 0,
                     error: 0,
                     busy: 0,
+                    interrupted: 0,
                   },
                 },
               ],
@@ -229,6 +294,19 @@ describe("planner context capture", () => {
     );
     expect(plannerSurfaceText(replayPair.compact.rendered.system)).toContain("in_flight=1");
     expect(replayPair.legacy.rendered.system).toContain("Harness scheduler state");
+    expect(replayPair.legacy.rendered.system).toContain("Operator attention records: total=125");
+    expect(plannerSurfaceText(replayPair.compact.rendered.system)).toContain("Capture subject");
+    const capturedRows =
+      parsed.render_input.compactContext.turnMechanismEvidence?.autonomySchedulerState
+        ?.operatorAttentionIndex?.records;
+    expect(capturedRows).toEqual(attentionRows);
+    expect(capturedRows?.[0]?.disclosure_label).not.toBe(attentionRows[0]?.disclosure_label);
+    const replayRows = plannerSurfaceText(replayPair.compact.rendered.system)
+      .split("\n")
+      .filter((line) => line.includes("| subject="));
+    expect(replayRows).toHaveLength(2);
+    expect(replayRows[0]).toContain("disclosure_class=operator_private");
+    expect(replayRows[1]).toContain("disclosure_class=unknown");
     expect(replayPair.compact.fingerprint).toEqual(livePair.compact.fingerprint);
     expect(replayPair.legacy.fingerprint).toEqual(livePair.legacy.fingerprint);
     expect(parsed.expected_surfaces).toEqual({
@@ -239,6 +317,75 @@ describe("planner context capture", () => {
     expect(parsed.render_input.compactContext).not.toHaveProperty("reRetrieve");
     expect(repositoryGet).not.toHaveBeenCalled();
     expect(reRetrieve).not.toHaveBeenCalled();
+  });
+
+  it("preserves block history and answered-edge basis across planner capture and replay", () => {
+    const goal = goalSchema.parse({
+      id: createGoalId(),
+      description: "等待資料",
+      priority: 3,
+      parent_goal_id: null,
+      status: "blocked",
+      progress_notes: null,
+      last_progress_ts: null,
+      created_at: NOW_MS - 60_000,
+      target_at: null,
+      provenance: { kind: "manual" },
+      block_history: [
+        {
+          blocker: { kind: "until", until: NOW_MS + 60_000 },
+          attempt_status: "attempted_unavailable",
+          reason: "試しましたが、まだ利用できません。",
+          blocked_at: NOW_MS - 30_000,
+          unblocked_at: null,
+          unblock_reason: null,
+        },
+      ],
+    });
+    const source = context({
+      selfSnapshot: { values: [], goals: [goal], traits: [] },
+      turnMechanismEvidence: {
+        recentSuppressions: [],
+        recentRegenerations: [],
+        answeredWindow: {
+          session_id: DEFAULT_SESSION_ID,
+          observed_at: NOW_MS,
+          state: "recorded",
+          basis: {
+            turn_id: "turn_answered",
+            response_entry_id: "stream_response",
+            response_at: NOW_MS - 5_000,
+            response_kind: "agent_msg",
+            last_answered_entry_id: "stream_answered",
+            last_answered_at: NOW_MS - 10_000,
+            answered_entry_count: 1,
+          },
+          outside: {
+            state: "arrived_after_edge",
+            arrived_after_edge: 2,
+            unselected_within_window: 0,
+            before_window: 0,
+            without_edge: null,
+          },
+        },
+      },
+    });
+    const input = renderInput(source);
+    const parsed = parsePlannerContextCaptureRecord(JSON.parse(JSON.stringify(record(input))));
+    expect(parsed.render_input.compactContext.selfSnapshot.goals[0]?.block_history).toEqual(
+      goal.block_history,
+    );
+    expect(parsed.render_input.compactContext.turnMechanismEvidence?.answeredWindow).toEqual(
+      source.turnMechanismEvidence?.answeredWindow,
+    );
+    const replay = renderCapturedPlannerSurfacePair(parsed.render_input);
+    const live = renderCapturedPlannerSurfacePair(input);
+    expect(replay.compact.rendered.system).toEqual(live.compact.rendered.system);
+    expect(replay.legacy.rendered.system).toEqual(live.legacy.rendered.system);
+    expect(plannerSurfaceText(replay.compact.rendered.system)).toContain("stream_answered");
+    expect(plannerSurfaceText(replay.compact.rendered.system)).toContain(
+      goal.block_history![0]!.reason,
+    );
   });
 
   it("reads a pre-projection capture and safely fidelity-gates live replay", async () => {
@@ -350,32 +497,53 @@ describe("planner context capture", () => {
     expect(existsSync(plannerContextCapturePath(dataDir))).toBe(false);
   });
 
-  it("caps append-only file growth and counts records skipped at the cap", async () => {
+  it("rotates at the file cap and captures the triggering record", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "borg-planner-capture-cap-"));
     tempDirs.push(dataDir);
-    const captureRecord = record();
-    const lineBytes = Buffer.byteLength(`${JSON.stringify(captureRecord)}\n`);
+    const firstRecord = { ...record(), capture_id: "capture_a" };
+    const triggeringRecord = { ...record(), capture_id: "capture_b" };
+    const lineBytes = Buffer.byteLength(`${JSON.stringify(firstRecord)}\n`);
+    const emit = vi.fn();
+    const logger = { info: vi.fn(), error: vi.fn() };
     const capture = new PlannerContextCapture({
       dataDir,
       sampleRate: 1,
       maxRecordBytes: lineBytes,
       maxFileBytes: lineBytes,
+      clock: new FixedClock(NOW_MS),
+      tracer: { enabled: true, includePayloads: false, emit },
+      logger,
     });
 
-    await expect(capture.write(captureRecord)).resolves.toMatchObject({ status: "captured" });
-    await expect(capture.write(captureRecord)).resolves.toMatchObject({
-      status: "skipped",
-      reason: "file_full",
-    });
+    await expect(capture.write(firstRecord)).resolves.toMatchObject({ status: "captured" });
+    await expect(capture.write(triggeringRecord)).resolves.toMatchObject({ status: "captured" });
 
     const path = plannerContextCapturePath(dataDir);
+    await waitForContextCaptureMaintenance(path);
     expect(readFileSync(path, "utf8").trim().split("\n")).toHaveLength(1);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ capture_id: "capture_b" });
+    const [rotatedName] = readdirSync(join(dataDir, "captures")).filter((name) =>
+      name.startsWith("planner-contexts.jsonl.rotated-"),
+    );
+    expect(rotatedName).toBe("planner-contexts.jsonl.rotated-20260813T200000.000Z.gz");
+    expect(
+      JSON.parse(gunzipSync(readFileSync(join(dataDir, "captures", rotatedName!))).toString()),
+    ).toMatchObject({ capture_id: "capture_a" });
     expect(capture.snapshotStats()).toEqual({
-      captured: 1,
+      captured: 2,
       oversizedSkipped: 0,
-      fileFullSkipped: 1,
+      fileFullSkipped: 0,
       failed: 0,
     });
+    expect(emit).toHaveBeenCalledWith(
+      "deliberation.planner_context_capture.captured",
+      expect.objectContaining({ reason: "rotated" }),
+    );
+    expect(logger.info).toHaveBeenCalledWith(
+      "Rotated deliberation context capture",
+      expect.objectContaining({ capturePath: path }),
+    );
+    expect(logger.error).not.toHaveBeenCalled();
   });
 
   it("repairs pre-existing capture directory and file permissions under umask 0022", async () => {
@@ -426,6 +594,59 @@ describe("planner context capture", () => {
     expect(captured).not.toHaveProperty("retrievalResult");
     expect(captured).not.toHaveProperty("recencyMessages");
     expect(captured).not.toHaveProperty("currentUserContent");
+  });
+
+  it("round-trips expanded-candidate step data for planner replay", () => {
+    const goalId = createGoalId();
+    const topStep = {
+      id: createExecutiveStepId(),
+      goal_id: goalId,
+      description: "Preserve the expanded candidate's top step",
+      status: "doing" as const,
+      kind: "think" as const,
+      due_at: NOW_MS + 60_000,
+      last_attempt_ts: NOW_MS - 60_000,
+      created_at: NOW_MS - 120_000,
+      updated_at: NOW_MS,
+      provenance: { kind: "manual" as const },
+    };
+    const input = renderInput(
+      context({
+        executiveFocus: {
+          selected_goal: null,
+          selected_score: null,
+          next_step: null,
+          candidate_steps: {
+            top_open_steps: [topStep],
+            omitted_open_step_count: 2,
+          },
+          candidates: [],
+          threshold: 0,
+          score_basis: {
+            score_context: "turn_selection",
+            deadline_lookahead_ms: 0,
+            progress_debt_stale_ms: 0,
+          },
+        },
+      }),
+    );
+    const parsed = parsePlannerContextCaptureRecord(
+      JSON.parse(JSON.stringify(record(input))) as unknown,
+    );
+
+    expect(parsed.render_input.compactContext.executiveFocus?.candidateSteps).toMatchObject({
+      topOpenSteps: [
+        {
+          id: topStep.id,
+          goal_id: goalId,
+          description: topStep.description,
+        },
+      ],
+      omittedOpenStepCount: 2,
+    });
+    expect(renderCapturedPlannerSurfacePair(parsed.render_input).compact.fingerprint).toEqual(
+      renderCapturedPlannerSurfacePair(input).compact.fingerprint,
+    );
   });
 
   it("omits unused nested sensitive payloads while preserving disclosure labels", () => {

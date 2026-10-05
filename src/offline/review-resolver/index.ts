@@ -106,10 +106,19 @@ const reviewResolverVerdictValueSchema = z.enum([
   "needs_manual",
 ]);
 
+export const REVIEW_RESOLVER_REASON_SENTINEL = "(no reason supplied by model)";
+const reviewResolverAuditReasonSchema = z
+  .string()
+  .min(1)
+  .max(4_000)
+  .describe("Optional audit rationale for the model's verdict; it never controls disposition.")
+  .optional()
+  .default(REVIEW_RESOLVER_REASON_SENTINEL);
+
 const reviewResolverVerdictSchema = z
   .object({
     verdict: reviewResolverVerdictValueSchema,
-    reason: z.string().min(1).max(4_000),
+    reason: reviewResolverAuditReasonSchema,
     cited_stream_ids: z.array(streamEntryIdSchema).default([]),
     support_basis: z
       .enum([
@@ -130,14 +139,14 @@ export type ReviewResolverVerdict = z.infer<typeof reviewResolverVerdictSchema>;
 const vectorDuplicateReviewResolverVerdictSchema = z
   .object({
     verdict: reviewResolverVerdictValueSchema,
-    reason: z.string().min(1).max(4_000),
+    reason: reviewResolverAuditReasonSchema,
   })
   .strip();
 
 const identityReviewResolverVerdictSchema = z
   .object({
     verdict: reviewResolverVerdictValueSchema,
-    reason: z.string().min(1).max(4_000),
+    reason: reviewResolverAuditReasonSchema,
   })
   .strip();
 
@@ -151,7 +160,7 @@ const newInsightReviewResolverVerdictSchema = z
   .object({
     verdict: z.enum(["accept", "dismiss", "needs_manual"]),
     confidence: z.enum(["high", "medium", "low"]),
-    reason: z.string().min(1).max(4_000),
+    reason: reviewResolverAuditReasonSchema,
   })
   .strict();
 
@@ -161,7 +170,7 @@ const semanticPairReviewResolverVerdictSchema = z
   .object({
     verdict: z.enum(["keep_both", "supersede", "invalidate", "dismiss", "needs_manual"]),
     winner_node_id: z.string().min(1).optional(),
-    reason: z.string().min(1).max(4_000),
+    reason: reviewResolverAuditReasonSchema,
     confidence: z.enum(["high", "medium", "low"]),
   })
   .strict();
@@ -736,10 +745,16 @@ function newInsightPromptPayload(input: {
         needs_manual:
           "Use only for genuine ambiguity or broken context that prevents a responsible decision. Bias toward accept or dismiss when the evidence supports a clear disposition.",
       },
+      output_fields: {
+        verdict: "One allowed decision from allowed_decisions.",
+        confidence: "The model's confidence in that decision: high, medium, or low.",
+        reason:
+          "Optional audit rationale for the output verdict. This field is recorded for audit and never controls the disposition.",
+      },
       review: {
         id: input.item.id,
         kind: input.item.kind,
-        reason: input.item.reason,
+        queue_reason: input.item.reason,
         created_at: input.item.created_at,
         ...sourceDisclosureFields,
       },
@@ -2185,6 +2200,62 @@ function markNeedsManual(input: {
   });
 }
 
+// A throwing apply used to leave the item open with nothing recorded, so a
+// persistently failing repair was re-picked and re-thrown on every pass forever
+// (the ai-prod edge-closure wedge: 5 items x every 4-hourly run). Apply failures
+// share the needs_manual attempt counter -- any mix of the two drains one bounded
+// budget -- and in autonomous mode the cap terminally dismisses the item instead
+// of letting the queue rot.
+function recordApplyFailure(input: {
+  db: SqliteDatabase;
+  ctx: OfflineContext;
+  item: ReviewQueueItem;
+  reason: string;
+}): void {
+  // Re-read the row: the failed apply may have stamped applying-state onto refs,
+  // and both update paths CAS on the refs snapshot.
+  const current = input.ctx.reviewQueueRepository.get(input.item.id);
+
+  if (current === null || current.resolved_at !== null) {
+    return;
+  }
+
+  const resolverConfig = input.ctx.config.offline.reviewResolver;
+  const attempts = needsManualAttempts(current) + 1;
+
+  try {
+    if (resolverConfig.autonomous && attempts >= resolverConfig.maxNeedsManualAttempts) {
+      markResolvedWithoutHandler({
+        db: input.db,
+        ctx: input.ctx,
+        item: current,
+        resolution: "dismiss",
+        reason: `autonomous: apply attempts exhausted (${attempts}): ${input.reason}`,
+        bypassHandlerReason: "autonomous_apply_failure_exhausted",
+      });
+      return;
+    }
+
+    updateOpenReviewRefs({
+      db: input.db,
+      item: current,
+      refs: {
+        ...current.refs,
+        [REVIEW_RESOLVER_DIAGNOSTIC_REF_KEY]: {
+          verdict: "apply_failed",
+          reason: input.reason,
+          process: "review-resolver",
+          at: input.ctx.clock.now(),
+          attempts,
+        },
+      },
+    });
+  } catch {
+    // Bookkeeping must never mask the original failure; a lost race means
+    // another writer moved the item and the retry accounting restarts there.
+  }
+}
+
 async function markSemanticNodeSuperseded(input: {
   ctx: OfflineContext;
   item: ReviewQueueItem;
@@ -2658,6 +2729,7 @@ export class ReviewResolverProcess implements OfflineProcess<ReviewResolverPlan>
               item: current,
               reason,
             });
+            recordApplyFailure({ db: this.options.db, ctx, item: current, reason });
           }
         }
       });

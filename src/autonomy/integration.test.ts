@@ -78,6 +78,8 @@ function structuralAutonomyResult(deliveredOutbound = false): TurnResult {
           },
         ]
       : [],
+    finalizer_rounds: 1,
+    stall_retries: 0,
     agentMessageId: "strm_autonomy_simulation" as never,
   };
 }
@@ -444,30 +446,60 @@ describe("autonomy integration", () => {
         createdAt: clock.now() - 10_000 - index,
       }),
     );
-    vi.spyOn(dependencies.turnOrchestrator, "run").mockRejectedValue(
-      new LLMError("simulated cognition outage"),
-    );
+    const run = vi
+      .spyOn(dependencies.turnOrchestrator, "run")
+      .mockRejectedValue(new LLMError("simulated cognition outage"));
 
     try {
-      let totalErrors = 0;
       const firstTick = await borg.autonomy.scheduler.tick();
-      totalErrors += firstTick.errorCount;
-      expect(firstTick.errorCount).toBe(3);
-      expect(firstTick.errorCircuitSkipped).toBe(15);
+      let totalErrors = firstTick.errorCount;
+      expect(firstTick.errorCount).toBe(1);
+      expect(firstTick.errorCircuitSkipped).toBe(0);
 
-      while (true) {
-        const pausedUntil = (await borg.autonomy.scheduler.describe()).fleet_brake
-          .error_paused_until;
+      while (clock.now() < horizon) {
+        const lastProbeAt = clock.now();
+        const triggerRetryAt = lastProbeAt + Math.min(30_000 * 2 ** (totalErrors - 1), 3_600_000);
+        const fleetBrake = (await borg.autonomy.scheduler.describe()).fleet_brake;
+        const pausedUntil = fleetBrake.error_paused_until;
+        expect(fleetBrake.error_streak).toBe(totalErrors);
+        expect(pausedUntil).toBe(
+          totalErrors < 3
+            ? null
+            : lastProbeAt + Math.min(300_000 * 2 ** (totalErrors - 3), 1_800_000),
+        );
+        const nextProbeAt = Math.max(triggerRetryAt, pausedUntil ?? triggerRetryAt);
 
-        if (pausedUntil === null || pausedUntil > horizon) {
+        // Exercise the earlier expiry while the other brake still holds, then
+        // the instant before both permit a probe (or the end of the outage).
+        const blockedTimes = [
+          Math.min(triggerRetryAt, pausedUntil ?? triggerRetryAt),
+          Math.min(nextProbeAt - 1, horizon),
+        ].filter((ts) => ts < nextProbeAt && ts <= horizon);
+        for (const ts of blockedTimes) {
+          clock.advance(ts - clock.now());
+          const blockedTick = await borg.autonomy.scheduler.tick();
+          expect(blockedTick.errorCount).toBe(0);
+          expect(blockedTick.firedEvents).toBe(0);
+          expect(blockedTick.errorCircuitSkipped).toBe(ts >= triggerRetryAt ? goals.length : 0);
+          expect(run).toHaveBeenCalledTimes(totalErrors);
+          expect(dependencies.autonomyWakesRepository.countSince(startedAt)).toBe(totalErrors);
+        }
+
+        if (nextProbeAt > horizon) {
           break;
         }
 
-        clock.advance(pausedUntil - clock.now());
-        totalErrors += (await borg.autonomy.scheduler.tick()).errorCount;
+        clock.advance(nextProbeAt - clock.now());
+        const probeTick = await borg.autonomy.scheduler.tick();
+        expect(probeTick.errorCount).toBe(1);
+        expect(probeTick.errorCircuitSkipped).toBe(0);
+        totalErrors += probeTick.errorCount;
       }
 
-      expect(totalErrors).toBeLessThanOrEqual(52);
+      expect(clock.now()).toBe(horizon);
+      // 8 probes by 5,910 s + floor((86,400 - 5,910) / 3,600) hourly probes = 30.
+      expect(totalErrors).toBe(30);
+      expect(run).toHaveBeenCalledTimes(totalErrors);
       expect(dependencies.autonomyWakesRepository.countSince(startedAt)).toBe(totalErrors);
       for (const goal of goals) {
         expect(
@@ -1067,11 +1099,12 @@ describe("autonomy integration", () => {
     }
   });
 
-  it("names independent goal-stale wake and turn selections with both score bases", async () => {
+  it("uses the shared progress-debt denominator for wake and turn selection", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
     tempDirs.push(tempDir);
     const clock = new ManualClock(1_800_000_000_000);
     const zeroEmbeddingClient: EmbeddingClient = {
+      profile: { model: "fake-embed", dimensions: 4 },
       embed: async () => new Float32Array(4),
       embedBatch: async (texts) => texts.map(() => new Float32Array(4)),
     };
@@ -1140,11 +1173,11 @@ describe("autonomy integration", () => {
       const wakeSelectedGoal = borg.self.goals.add({
         description: "Wake-selected stale goal",
         priority: 10,
-        createdAt: clock.now() - 2 * DAY_MS,
+        createdAt: clock.now() - 15 * DAY_MS,
         provenance: { kind: "manual" },
       });
-      const turnSelectedGoal = borg.self.goals.add({
-        description: "Turn-selected deadline goal",
+      const deadlineCompetitor = borg.self.goals.add({
+        description: "Deadline competitor goal",
         priority: 9,
         targetAt: clock.now() + Math.floor(0.8 * 604_800_000),
         provenance: { kind: "manual" },
@@ -1169,18 +1202,18 @@ describe("autonomy integration", () => {
       const executiveBlock = finalizerSystem.slice(executiveStart, executiveEnd);
       const autonomyBlock = finalizerSystem.slice(autonomyStart, autonomyEnd);
 
-      expect(executiveBlock).toContain(`goal_id=${turnSelectedGoal.id}`);
-      expect(executiveBlock).toContain("Current driving goal: Turn-selected deadline goal");
-      expect(executiveBlock).not.toContain("Wake-selected stale goal");
+      expect(executiveBlock).toContain(`goal_id=${wakeSelectedGoal.id}`);
+      expect(executiveBlock).toContain("Current driving goal: Wake-selected stale goal");
+      expect(executiveBlock).not.toContain(`goal_id=${deadlineCompetitor.id}`);
       expect(executiveBlock).toContain(
         "Score basis: score_context=turn_selection deadline_lookahead_ms=604800000 progress_debt_stale_ms=1209600000",
       );
       expect(autonomyBlock).toContain("Wake-time trigger selection:");
       expect(autonomyBlock).toContain(`\"goal_id\": \"${wakeSelectedGoal.id}\"`);
       expect(autonomyBlock).toContain("Wake-selected stale goal");
-      expect(autonomyBlock).not.toContain("Turn-selected deadline goal");
+      expect(autonomyBlock).not.toContain("Deadline competitor goal");
       expect(autonomyBlock).toContain(
-        "Score basis: score_context=wake_time_trigger_selection deadline_lookahead_ms=604800000 progress_debt_stale_ms=86400000",
+        "Score basis: score_context=wake_time_trigger_selection deadline_lookahead_ms=604800000 progress_debt_stale_ms=1209600000",
       );
     } finally {
       await borg.close();

@@ -1,9 +1,13 @@
+import { logSimilarityProfile } from "../src/config/similarity.js";
+import { requireEmbeddingClientProfile } from "../src/embeddings/bank-profile.js";
+import { DEFAULT_GATEWAY_BASE_URL } from "../src/sidecar/gateway-config.js";
+import { sidecarEmbeddingProfileFromEnv } from "../src/sidecar/embedding-config.js";
 // borg memory sidecar: a long-lived HTTP service exposing per-tenant long-term
 // memory (one being per tenant via BorgPool) to an external consumer such as the
 // Python "team-agent" service.
 //
 // Run: BORG_MEMORY_TOKEN=... LLM_API_KEY=aif-... NODE_EXTRA_CA_CERTS=/path/ca.pem \
-//        tsx scripts/memory-sidecar.ts
+//        EMBEDDING_MODEL=scw/bge-m3 EMBEDDING_DIMS=1024 tsx scripts/memory-sidecar.ts
 //
 // TLS to the kratos inference endpoint uses the process-level NODE_EXTRA_CA_CERTS
 // (the endpoint is server-CA-only, no client cert), matching the embedding client.
@@ -12,6 +16,7 @@ import { createServer } from "node:http";
 import OpenAI from "openai";
 
 import { createCachingEmbeddingClient } from "../src/embeddings/cache.js";
+import { StallGuardEmbeddingClient } from "../src/embeddings/stall-guard.js";
 import {
   BorgPool,
   OpenAICompatibleEmbeddingClient,
@@ -19,7 +24,14 @@ import {
   loadConfig,
   type OpenAIChatCompletionsClient,
 } from "../src/index.js";
-import { createMemoryHandler } from "../src/sidecar/memory-handler.js";
+import {
+  createMemoryHandler,
+  DEFAULT_RECENT_ACTIVITY_LIMIT,
+  DEFAULT_RECENT_ACTIVITY_WINDOW_MS,
+  DEFAULT_RECENT_ACTIVITY_CANDIDATE_LIMIT,
+  DEFAULT_RECENT_ACTIVITY_RANKING_BUDGET_MS,
+  memoryRecallSemanticVariantCountFromEnv,
+} from "../src/sidecar/memory-handler.js";
 import {
   memoryCommitmentExtractionBudgetFromEnv,
   memoryCommitmentExtractionEnabledFromEnv,
@@ -36,6 +48,12 @@ import {
   memoryTraceEnabledFromEnv,
   memoryTraceMaxTenantsFromEnv,
 } from "../src/sidecar/memory-trace.js";
+import { ResponseWaiterRegistry } from "../src/sidecar/response-waiter-registry.js";
+import { TeamAgentTurnRunner } from "../src/sidecar/team-agent-turn-runner.js";
+import { teamsInboxConfigFromEnv } from "../src/sidecar/teams-inbox-config.js";
+import { DeliveryWaiterRegistry } from "../src/sidecar/delivery-waiter-registry.js";
+import { TeamAgentTaskEventRunner } from "../src/sidecar/team-agent-task-event-runner.js";
+import { SystemClock } from "../src/util/clock.js";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -48,21 +66,63 @@ function requireEnv(name: string): string {
 
 const token = requireEnv("BORG_MEMORY_TOKEN");
 const apiKey = requireEnv("LLM_API_KEY");
-const baseUrl = process.env.KRATOS_BASE_URL ?? "https://inference.kratos.omc.hdp.it.p4/v1";
+const baseUrl = process.env.KRATOS_BASE_URL ?? DEFAULT_GATEWAY_BASE_URL;
 const llmModel = process.env.LLM_MODEL ?? "generative-apis/qwen3-235b-a22b-instruct-2507";
-const embeddingModel = process.env.EMBEDDING_MODEL ?? "generative-apis/qwen3-embedding-8b";
-const embeddingDims = Number(process.env.EMBEDDING_DIMS ?? 4096);
+const { model: embeddingModel, dimensions: embeddingDims } = sidecarEmbeddingProfileFromEnv(
+  process.env,
+);
 const root = process.env.BORG_DATA_ROOT ?? "./data/borg";
 const host = process.env.BORG_MEMORY_HOST ?? "127.0.0.1";
 const port = Number(process.env.BORG_MEMORY_PORT ?? 8088);
 const maxOpen = Number(process.env.BORG_MEMORY_MAX_OPEN ?? 32);
-const recallAbstainThresholdRaw = Number(process.env.BORG_RECALL_ABSTAIN_THRESHOLD ?? 0);
-const recallAbstainThreshold = Number.isFinite(recallAbstainThresholdRaw)
-  ? recallAbstainThresholdRaw
-  : 0;
+// Hard ceiling on a single recall, so the client's own timeout never fires
+// first and downgrades a structured degradation into an opaque transport
+// error. Sits above borg's worst-case graceful path (~4.6s) and below the
+// caller's recall timeout (team-agent: memory.recall_timeout, 6s on prod).
+const recallDeadlineMsRaw = Number(process.env.BORG_RECALL_DEADLINE_MS ?? 5000);
+const recallDeadlineMs = Number.isFinite(recallDeadlineMsRaw) ? recallDeadlineMsRaw : 5000;
+const recentActivityWindowMsRaw = Number(
+  process.env.BORG_MEMORY_RECENT_ACTIVITY_WINDOW_MS ?? DEFAULT_RECENT_ACTIVITY_WINDOW_MS,
+);
+const recentActivityWindowMs =
+  Number.isFinite(recentActivityWindowMsRaw) && recentActivityWindowMsRaw >= 0
+    ? Math.floor(recentActivityWindowMsRaw)
+    : DEFAULT_RECENT_ACTIVITY_WINDOW_MS;
+const recentActivityLimitRaw = Number(
+  process.env.BORG_MEMORY_RECENT_ACTIVITY_LIMIT ?? DEFAULT_RECENT_ACTIVITY_LIMIT,
+);
+const recentActivityLimit =
+  Number.isFinite(recentActivityLimitRaw) && recentActivityLimitRaw > 0
+    ? Math.floor(recentActivityLimitRaw)
+    : DEFAULT_RECENT_ACTIVITY_LIMIT;
+const recencyPriorWeightEnv = process.env.BORG_MEMORY_RECENCY_PRIOR_WEIGHT?.trim() || undefined;
+const recencyPriorHalfLifeEnv =
+  process.env.BORG_MEMORY_RECENCY_PRIOR_HALF_LIFE_HOURS?.trim() || undefined;
+const recencyPriorEnabled = Boolean(recencyPriorWeightEnv) || Boolean(recencyPriorHalfLifeEnv);
+const recencyPriorWeightRaw = Number(recencyPriorWeightEnv ?? 0.15);
+const recencyPriorHalfLifeRaw = Number(recencyPriorHalfLifeEnv ?? 36);
+const recencyPrior = recencyPriorEnabled
+  ? {
+      weight:
+        Number.isFinite(recencyPriorWeightRaw) && recencyPriorWeightRaw >= 0
+          ? Math.min(1, recencyPriorWeightRaw)
+          : 0.15,
+      halfLifeHours:
+        Number.isFinite(recencyPriorHalfLifeRaw) && recencyPriorHalfLifeRaw > 0
+          ? recencyPriorHalfLifeRaw
+          : 36,
+    }
+  : undefined;
+const recallSemanticVariantCount = memoryRecallSemanticVariantCountFromEnv(process.env);
 // Bound every provider call so a hung kratos can't pin a request + pool slot
 // (and block shutdown) indefinitely.
 const requestTimeoutMs = Number(process.env.BORG_MEMORY_LLM_TIMEOUT_MS ?? 120_000);
+// Tight per-attempt stall guard for embedding calls (see StallGuardEmbeddingClient).
+const embeddingStallTimeoutMs = Number(process.env.BORG_EMBEDDING_STALL_TIMEOUT_MS ?? 1000);
+const embeddingStallBatchTimeoutMs = Number(
+  process.env.BORG_EMBEDDING_STALL_BATCH_TIMEOUT_MS ?? 20_000,
+);
+const embeddingStallRetries = Number(process.env.BORG_EMBEDDING_STALL_RETRIES ?? 1);
 const shutdownTimeoutMs = Number(process.env.BORG_MEMORY_SHUTDOWN_MS ?? 15_000);
 
 // borg picks the LLM model per cognition slot from config (which reads process.env
@@ -74,6 +134,8 @@ for (const slot of [
   "BORG_MODEL_COGNITION",
   "BORG_MODEL_BACKGROUND",
   "BORG_MODEL_CREATOR_DIRECTIVE",
+  "BORG_MODEL_CORRECTIVE_PREFERENCE",
+  "BORG_MODEL_SHARED_STATE_COMPILER",
 ]) {
   process.env[slot] ??= llmModel;
 }
@@ -89,12 +151,24 @@ const llmClient = new OpenAICompatibleLLMClient({
 // re-embedded identical intent queries (and each tenant's active commitment
 // directives) over the network — ~24 embedding calls per /memory/recall.
 // One cache instance is shared by all tenants; keys are model+dims+text.
+// Stall guard inside the cache: cache hits never race a timer, misses get a
+// short per-attempt cap + retry instead of inheriting the 120s client bound.
+// The gateway's embedding backend intermittently hangs single requests while
+// a fresh retry completes at healthy latency (~0.2-0.35s), and the recall
+// path must answer within its client's recall budget.
 const embeddingClient = createCachingEmbeddingClient(
-  new OpenAICompatibleEmbeddingClient({
-    client: openai,
-    model: embeddingModel,
-    dims: embeddingDims,
-  }),
+  new StallGuardEmbeddingClient(
+    new OpenAICompatibleEmbeddingClient({
+      client: openai,
+      model: embeddingModel,
+      dims: embeddingDims,
+    }),
+    {
+      timeoutMs: embeddingStallTimeoutMs,
+      batchTimeoutMs: embeddingStallBatchTimeoutMs,
+      maxRetries: embeddingStallRetries,
+    },
+  ),
   { model: embeddingModel, dims: embeddingDims },
 );
 const traceRegistry = memoryTraceEnabledFromEnv(process.env)
@@ -106,23 +180,96 @@ const traceRegistry = memoryTraceEnabledFromEnv(process.env)
   : undefined;
 // This root snapshot controls sidecar-wide admission/scheduling only. Do not
 // pass it to BorgPool: each being must load <root>/<tenant>/config.json itself.
-const sidecarConfig = loadConfig({ env: process.env, dataDir: root });
+const loadedSidecarConfig = loadConfig({ env: process.env, dataDir: root });
+const effectiveEmbeddingProfile = requireEmbeddingClientProfile(embeddingClient);
+const sidecarConfig = {
+  ...loadedSidecarConfig,
+  embedding: {
+    ...loadedSidecarConfig.embedding,
+    model: effectiveEmbeddingProfile.model,
+    dims: effectiveEmbeddingProfile.dimensions,
+  },
+};
+logSimilarityProfile(sidecarConfig, "borg memory sidecar");
 const selfName = memorySelfNameFromEnv(process.env);
+const teamsInboxConfig = teamsInboxConfigFromEnv(process.env);
+const sidecarClock = new SystemClock();
+let pool!: BorgPool;
+const inboxWaiters = teamsInboxConfig.enabled
+  ? new ResponseWaiterRegistry({
+      acquireTenantLease: (tenantId) => pool.acquireBackgroundLease(tenantId),
+      clock: sidecarClock,
+      generatingTtlMs: teamsInboxConfig.timeoutMs + 10_000,
+    })
+  : undefined;
 
-const pool = new BorgPool({
+const deliveryWaiters = teamsInboxConfig.enabled
+  ? new DeliveryWaiterRegistry({
+      acquireTenantLease: (tenantId) => pool.acquireBackgroundLease(tenantId),
+    })
+  : undefined;
+
+pool = new BorgPool({
   root,
   maxOpen,
   openOptions: {
     embeddingDimensions: embeddingDims,
+    embeddingProfile: { model: embeddingModel, dimensions: embeddingDims },
     embeddingClient,
     llmClient,
+    clock: sidecarClock,
     liveCommitmentExtraction: memoryCommitmentExtractionEnabledFromEnv(process.env),
     liveCommitmentExtractionBudget: memoryCommitmentExtractionBudgetFromEnv(process.env),
   },
+  ...(teamsInboxConfig.enabled
+    ? {
+        openOptionsForTenant: (tenantId: string) => ({
+          inbox: {
+            taskEventRunner: (context) =>
+              new TeamAgentTaskEventRunner({
+                ...context,
+                tenant: tenantId,
+                baseUrl: teamsInboxConfig.baseUrl,
+                apiToken: teamsInboxConfig.apiToken,
+                timeoutMs: teamsInboxConfig.timeoutMs,
+              }),
+            onDeliveryAvailable: (sessionId) => deliveryWaiters!.notify(tenantId, sessionId),
+            runner: ({ terminal, entityRepository, sessions, activity }) =>
+              new TeamAgentTurnRunner({
+                tenant: tenantId,
+                baseUrl: teamsInboxConfig.baseUrl,
+                apiToken: teamsInboxConfig.apiToken,
+                timeoutMs: teamsInboxConfig.timeoutMs,
+                staleMs: teamsInboxConfig.staleMs,
+                terminal,
+                entityRepository,
+                sessions,
+                activity,
+                clock: sidecarClock,
+                onGenerating: ({ sessionId, entryIds }) =>
+                  inboxWaiters!.markGenerating({
+                    tenant: tenantId,
+                    sessionId,
+                    entryIds,
+                  }),
+              }),
+            sessionPredicate: (session) => session?.source_type === "teams_inbox",
+            acquireLease: () => pool.acquireBackgroundLease(tenantId),
+            onTerminalCommitted: (terminalEntry) =>
+              inboxWaiters!.resolveTerminal(tenantId, terminalEntry),
+            settleMs: teamsInboxConfig.settleMs,
+            maxSettleMs: teamsInboxConfig.maxSettleMs,
+          },
+        }),
+      }
+    : {}),
   initializeBeing: (_tenantId, borg) => {
     // This is idempotent tenant provisioning performed by the pool lifecycle,
     // not a dream mutation. It intentionally also runs before a dry-run dream.
     borg.entities.ensureSelf(selfName, { provenance: "config_default_user" });
+    if (teamsInboxConfig.enabled) {
+      borg.inbox.catchUp.start();
+    }
   },
   ...(traceRegistry === undefined
     ? {}
@@ -133,6 +280,13 @@ const pool = new BorgPool({
 const maintenanceCoordinator = new MemoryMaintenanceCoordinator({
   pool,
   config: memoryMaintenanceConfigFromConfig(sidecarConfig),
+  // The run report is the only durable record of a maintenance run and the
+  // nightly fan-out finishes seven of them within the same second. Measured on
+  // ai-prod 2026-09-14 (node waw6-pos-becl05): the container runtime kept 7-15
+  // of 30 stdout lines written in a burst and 30 of 30 on stderr, and four of
+  // seven nightly heavy reports were missing from the pod log. Structured
+  // events go to stderr, which is where the error report already goes.
+  writeReport: (line) => console.error(line),
 });
 
 const server = createServer(
@@ -140,7 +294,21 @@ const server = createServer(
     pool,
     token,
     maintenanceCoordinator,
-    recallAbstainThreshold,
+    recallDeadlineMs,
+    recentActivityWindowMs,
+    recentActivityLimit,
+    recentActivityCandidateLimit: Number(
+      process.env.BORG_MEMORY_RECENT_ACTIVITY_CANDIDATE_LIMIT ??
+        DEFAULT_RECENT_ACTIVITY_CANDIDATE_LIMIT,
+    ),
+    recentActivityRankingBudgetMs: Number(
+      process.env.BORG_MEMORY_RECENT_ACTIVITY_RANKING_BUDGET_MS ??
+        DEFAULT_RECENT_ACTIVITY_RANKING_BUDGET_MS,
+    ),
+    recallSemanticVariantCount,
+    ...(recencyPrior === undefined ? {} : { recencyPrior }),
+    ...(inboxWaiters === undefined ? {} : { inboxWaiters }),
+    ...(deliveryWaiters === undefined ? {} : { deliveryWaiters }),
     ...(traceRegistry === undefined ? {} : { traceRegistry }),
   }),
 );
@@ -163,7 +331,11 @@ async function shutdown(signal: string): Promise<void> {
   console.log(`memory-sidecar: ${signal} received, draining in-flight requests...`);
   const result = await drainMemorySidecar({
     timeoutMs: shutdownTimeoutMs,
-    beginShutdown: () => maintenanceCoordinator.beginShutdown(),
+    beginShutdown: () => {
+      inboxWaiters?.shutdown();
+      deliveryWaiters?.shutdown();
+      return maintenanceCoordinator.beginShutdown();
+    },
     forceFinalizeMaintenance: () => maintenanceCoordinator.forceFinalizeAborted(),
     onAbandoned: (runIds) => {
       if (runIds.length > 0) {

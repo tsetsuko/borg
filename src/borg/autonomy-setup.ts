@@ -23,6 +23,7 @@ import type { ExecutiveStepsRepository } from "../executive/index.js";
 import type { MoodRepository } from "../memory/affective/index.js";
 import type { PredictionRepository } from "../memory/predictions/index.js";
 import type { CommitmentRepository } from "../memory/commitments/index.js";
+import type { SourceStreamAudienceDisclosureResolver } from "../memory/common/index.js";
 import type { EpisodicRepository } from "../memory/episodic/index.js";
 import type { SelfDecisionRepository } from "../memory/self-decisions/index.js";
 import type { TrainOfThoughtRepository } from "../memory/train-of-thought/index.js";
@@ -37,8 +38,13 @@ import { DEFAULT_SESSION_ID } from "../util/ids.js";
 import type { BorgStreamWriterFactory } from "./types.js";
 
 export type BuildAutonomySchedulerOptions = {
+  entryIndex?: Pick<
+    import("../stream/index.js").StreamEntryIndexRepository,
+    "describeAnsweredWindow"
+  >;
   config: Config;
   commitmentRepository: CommitmentRepository;
+  sourceStreamAudienceDisclosureResolver: SourceStreamAudienceDisclosureResolver;
   episodicRepository: EpisodicRepository;
   embeddingClient: EmbeddingClient;
   goalsRepository: GoalsRepository;
@@ -85,6 +91,7 @@ export function buildAutonomyScheduler(options: BuildAutonomySchedulerOptions): 
       ? [
           createCommitmentExpiringTrigger({
             commitmentRepository: options.commitmentRepository,
+            sourceStreamAudienceDisclosureResolver: options.sourceStreamAudienceDisclosureResolver,
             watermarkRepository: options.streamWatermarkRepository,
             lookaheadMs: options.config.autonomy.triggers.commitmentExpiring.lookaheadMs,
             clock: options.clock,
@@ -95,6 +102,7 @@ export function buildAutonomyScheduler(options: BuildAutonomySchedulerOptions): 
       ? [
           createGoalFollowupDueTrigger({
             goalsRepository: options.goalsRepository,
+            sourceStreamAudienceDisclosureResolver: options.sourceStreamAudienceDisclosureResolver,
             watermarkRepository: options.streamWatermarkRepository,
             lookaheadMs: options.config.autonomy.triggers.goalFollowupDue.lookaheadMs,
             staleMs: options.config.autonomy.triggers.goalFollowupDue.staleMs,
@@ -112,7 +120,7 @@ export function buildAutonomyScheduler(options: BuildAutonomySchedulerOptions): 
               embeddingClient: options.embeddingClient,
               threshold: options.config.executive.goalFocusThreshold,
               deadlineLookaheadMs: options.config.autonomy.triggers.goalFollowupDue.lookaheadMs,
-              staleMs: options.config.autonomy.executiveFocus.stalenessSec * 1_000,
+              staleMs: options.config.autonomy.triggers.goalFollowupDue.staleMs,
               tracer: options.tracer,
             },
             goalStaleBackoffActionAvailabilityKey,
@@ -125,12 +133,14 @@ export function buildAutonomyScheduler(options: BuildAutonomySchedulerOptions): 
           createExecutiveFocusDueTrigger({
             enabled: options.config.autonomy.executiveFocus.enabled,
             goalsRepository: options.goalsRepository,
+            sourceStreamAudienceDisclosureResolver: options.sourceStreamAudienceDisclosureResolver,
             executiveStepsRepository: options.executiveStepsRepository,
             episodicRepository: options.episodicRepository,
             embeddingClient: options.embeddingClient,
             watermarkRepository: options.streamWatermarkRepository,
             threshold: options.config.executive.goalFocusThreshold,
             stalenessMs: options.config.autonomy.executiveFocus.stalenessSec * 1_000,
+            progressDebtStaleMs: options.config.autonomy.triggers.goalFollowupDue.staleMs,
             dueLeadMs: options.config.autonomy.executiveFocus.dueLeadSec * 1_000,
             wakeCooldownMs: options.config.autonomy.executiveFocus.wakeCooldownSec * 1_000,
             wakeCooldownBackoffMultiplier:
@@ -181,6 +191,7 @@ export function buildAutonomyScheduler(options: BuildAutonomySchedulerOptions): 
       ? [
           createCommitmentRevokedCondition({
             commitmentRepository: options.commitmentRepository,
+            sourceStreamAudienceDisclosureResolver: options.sourceStreamAudienceDisclosureResolver,
             watermarkRepository: options.streamWatermarkRepository,
             clock: options.clock,
           }),
@@ -223,8 +234,15 @@ export function buildAutonomyScheduler(options: BuildAutonomySchedulerOptions): 
   ];
 
   return new AutonomyScheduler({
+    describeAnsweredWindow:
+      options.entryIndex === undefined
+        ? undefined
+        : (sessionId, observedAt) =>
+            options.entryIndex!.describeAnsweredWindow(sessionId, observedAt),
+    beforeTick: () => options.goalsRepository.reconcileBlocks(),
     enabled: options.config.autonomy.enabled,
     intervalMs: options.config.autonomy.intervalMs,
+    prepToolTimeoutMs: options.config.autonomy.prepToolTimeoutMs,
     maxWakesPerWindow: options.config.autonomy.maxWakesPerWindow,
     goalWakeBatchMax: options.config.autonomy.goalWakeBatchMax,
     budgetWindowMs: options.config.autonomy.budgetWindowMs,

@@ -35,6 +35,7 @@ export {
   computeValueAlignmentFromEmbeddings,
 } from "./attention-relevance.js";
 export { applyMmr, type MmrCandidate } from "./mmr.js";
+export type { EpisodeRecencyPrior } from "./evidence-projections.js";
 export {
   MEMORY_DISCLOSURE_CLASSES,
   MEMORY_DISCLOSURE_GUIDANCE_FOR_MODEL,
@@ -82,8 +83,14 @@ export {
   type RetrievalGetEpisodeOptions,
   type RetrievalPipelineOptions,
   type RetrievalSharedOptions,
-  type RetrievalSearchOptions,
 } from "./pipeline.js";
+export type {
+  RecallContextTurn,
+  RecallIdentityHandles,
+  RecallOwnerActivityExcerpt,
+  RecallQueryPlan,
+  RecallQueryPlannerContext,
+} from "./recall-expansion.js";
 export {
   mapWithDisclosureConcurrency,
   memoryDisclosureLabelForEpisodeIds,

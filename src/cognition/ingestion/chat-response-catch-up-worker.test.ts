@@ -31,7 +31,12 @@ import {
 import type { TurnResult } from "../turn-orchestrator.js";
 
 import type { BacklogPrefixResult } from "./backlog-prefix.js";
-import { ChatResponseCatchUpWorker, type ChatResponseCatchUpWorkerConfig } from "./index.js";
+import {
+  ChatResponseCatchUpWorker,
+  TurnOrchestratorChatResponseCatchUpRunner,
+  type ChatResponseCatchUpWorkerConfig,
+  type ChatResponseCatchUpWorkerOptions,
+} from "./index.js";
 
 const DEFAULT_CONFIG: ChatResponseCatchUpWorkerConfig = {
   quietWindowMs: 10,
@@ -147,17 +152,37 @@ function createHarness(
     build?: () => Promise<BacklogPrefixResult>;
     run?: (input: unknown) => Promise<TurnResult>;
     backfill?: (sessionId: SessionId) => Promise<{ inserted: number }>;
+    sessionPredicate?: (sessionId: SessionId) => boolean;
+    stampAfterRun?: boolean;
+    customRunner?: (input: unknown) => Promise<void>;
+    watermarkAfterRun?: (input: unknown, runCount: number) => StreamCursor | null;
+    onReconcileAdvance?: (event: { sessionId: SessionId; advancedThrough: StreamCursor }) => void;
+    acquireLease?: () => { release(): void };
+    reconcileAdvance?: StreamCursor;
+    taskEvents?: ChatResponseCatchUpWorkerOptions["taskEvents"];
   } = {},
 ) {
   const clock = new ManualClock(0);
   const prefixQueue = [...(options.prefixes ?? [])];
   const pendingSessionIds = [...(options.pendingSessionIds ?? [])];
+  let durableWatermark: StreamCursor | null = null;
+  let reconcileAdvance = options.reconcileAdvance ?? null;
   const coordinator = {
-    reconcile: vi.fn(() => ({
-      watermark: null,
-      advancedThrough: null,
-      appliedStamps: 0,
-    })),
+    reconcile: vi.fn(() => {
+      const advancedThrough = reconcileAdvance;
+      if (advancedThrough !== null) {
+        durableWatermark = advancedThrough;
+        reconcileAdvance = null;
+      }
+      return {
+        watermark: durableWatermark,
+        advancedThrough,
+        appliedStamps: advancedThrough === null ? 0 : 1,
+      };
+    }),
+    compareCursors: vi.fn((_sessionId: SessionId, left: StreamCursor, right: StreamCursor) =>
+      left.entryId === right.entryId && left.ts === right.ts ? 0 : -1,
+    ),
   };
   const prefixBuilder = {
     build: vi.fn(options.build ?? (async () => prefixQueue.shift() ?? emptyPrefix())),
@@ -166,15 +191,50 @@ function createHarness(
     listSessionIdsWithPendingResponseBacklog: vi.fn(() => pendingSessionIds),
   };
   const repairSessionStreamEntryIndex = vi.fn(options.backfill ?? (async () => ({ inserted: 0 })));
+  const underlyingRun = options.run ?? (async () => turnResult());
+  let completedRuns = 0;
   const turnOrchestrator = {
-    run: vi.fn(options.run ?? (async () => turnResult())),
+    run: vi.fn(async (input: unknown) => {
+      const result = await underlyingRun(input);
+      if (options.stampAfterRun !== false) {
+        completedRuns += 1;
+        durableWatermark =
+          options.watermarkAfterRun?.(input, completedRuns) ??
+          (input as { inboundBatch: { throughCursorInclusive: StreamCursor } }).inboundBatch
+            .throughCursorInclusive;
+      }
+      return result;
+    }),
   };
+  const customRunner =
+    options.customRunner === undefined
+      ? undefined
+      : {
+          run: vi.fn(async (input: unknown) => {
+            await options.customRunner!(input);
+            if (options.stampAfterRun !== false) {
+              completedRuns += 1;
+              durableWatermark =
+                options.watermarkAfterRun?.(input, completedRuns) ??
+                (input as { inboundBatch: { throughCursorInclusive: StreamCursor } }).inboundBatch
+                  .throughCursorInclusive;
+            }
+          }),
+        };
   const worker = new ChatResponseCatchUpWorker({
+    taskEvents: options.taskEvents,
     coordinator,
     prefixBuilder,
     entryIndex,
     repairSessionStreamEntryIndex,
-    turnOrchestrator,
+    ...(customRunner === undefined ? { turnOrchestrator } : { runner: customRunner }),
+    ...(options.sessionPredicate === undefined
+      ? {}
+      : { sessionPredicate: options.sessionPredicate }),
+    ...(options.onReconcileAdvance === undefined
+      ? {}
+      : { onReconcileAdvance: options.onReconcileAdvance }),
+    ...(options.acquireLease === undefined ? {} : { acquireLease: options.acquireLease }),
     clock,
     setTimeoutFn: (callback, delayMs) => setTimeout(callback, delayMs),
     clearTimeoutFn: (handle) => clearTimeout(handle),
@@ -191,6 +251,7 @@ function createHarness(
     entryIndex,
     repairSessionStreamEntryIndex,
     turnOrchestrator,
+    customRunner,
     worker,
   };
 }
@@ -223,6 +284,202 @@ describe("ChatResponseCatchUpWorker", () => {
     while (tempDirs.length > 0) {
       rmSync(tempDirs.pop() as string, { recursive: true, force: true });
     }
+  });
+
+  function taskLane(run?: () => Promise<void>, count = 1) {
+    const taskEntry = entry({ kind: "internal_event" });
+    const event = {
+      schema_version: 1 as const,
+      event_id: "e",
+      task_id: "t",
+      task_version: 1,
+      kind: "task_completed" as const,
+      occurred_at: "2020-01-01T00:00:00Z",
+      outcome: { status: "succeeded" as const, summary: "done" },
+      origin: { source_entry_ids: [] },
+    };
+    taskEntry.metadata = { task_event: event };
+    const events = Array.from({ length: count }, (_, index) => {
+      const currentEvent = { ...event, event_id: `e${index}` };
+      const currentEntry = index === 0 ? taskEntry : entry({ kind: "internal_event" });
+      currentEntry.metadata = { task_event: currentEvent };
+      return { entry: currentEntry, event: currentEvent };
+    });
+    let answered = 0;
+    const terminal = entry({ kind: "agent_msg" });
+    return {
+      taskEntry,
+      service: {
+        listSessionIds: () => [],
+        listUnanswered: () => events.slice(answered),
+        findTerminal: (_sessionId: SessionId, taskEvent: { entry: StreamEntry }) =>
+          events.slice(0, answered).some((item) => item.entry.id === taskEvent.entry.id)
+            ? terminal
+            : null,
+      },
+      runner: {
+        reconcile: vi.fn(async () => {}),
+        run: vi.fn(async () => {
+          await run?.();
+          answered += 1;
+        }),
+      },
+    };
+  }
+
+  it("uses one in-flight gate for user and task turns and leaves the user watermark unchanged by a task", async () => {
+    const hold = deferred();
+    const lane = taskLane();
+    const batch = prefix({ count: 2 });
+    const h = createHarness({
+      prefixes: [batch, emptyPrefix()],
+      taskEvents: lane,
+      run: async () => {
+        await hold.promise;
+        return turnResult();
+      },
+    });
+    const userDrain = h.worker.tick(DEFAULT_SESSION_ID);
+    await flushAsync();
+    expect(h.worker.tick(DEFAULT_SESSION_ID)).toBe(userDrain);
+    expect(lane.runner.run).not.toHaveBeenCalled();
+    hold.resolve();
+    expect((await userDrain).drained).toBe(2);
+    const watermark = h.coordinator.reconcile().watermark;
+    expect((await h.worker.tick(DEFAULT_SESSION_ID)).drained).toBe(1);
+    expect(lane.runner.run).toHaveBeenCalledTimes(1);
+    expect(h.coordinator.reconcile().watermark).toEqual(watermark);
+    expect(h.turnOrchestrator.run).toHaveBeenCalledWith(
+      expect.objectContaining({
+        inboundBatch: expect.objectContaining({ entryIds: batch.entryIds }),
+      }),
+    );
+  });
+
+  it("coalesces user arrivals during a task turn and runs them after the shared gate releases", async () => {
+    const hold = deferred();
+    const lane = taskLane(() => hold.promise);
+    const batch = prefix({ count: 2 });
+    const h = createHarness({ prefixes: [emptyPrefix(), batch], taskEvents: lane });
+    h.worker.start();
+    await flushAsync();
+    h.worker.onAppend([lane.taskEntry]);
+    await advance(h.clock, 10);
+    expect(lane.runner.run).toHaveBeenCalledTimes(1);
+    h.worker.onAppend([entry()]);
+    await advance(h.clock, 5);
+    h.worker.onAppend([entry()]);
+    expect(h.turnOrchestrator.run).not.toHaveBeenCalled();
+    hold.resolve();
+    await flushAsync();
+    await advance(h.clock, 10);
+    expect(h.turnOrchestrator.run).toHaveBeenCalledTimes(1);
+    expect(h.turnOrchestrator.run).toHaveBeenCalledWith(
+      expect.objectContaining({
+        inboundBatch: expect.objectContaining({ entryIds: batch.entryIds }),
+      }),
+    );
+    await h.worker.stop();
+  });
+
+  it("does not extend a settling user batch when a task event arrives", async () => {
+    const lane = taskLane();
+    const h = createHarness({ prefixes: [prefix(), emptyPrefix()], taskEvents: lane });
+    h.worker.start();
+    await flushAsync();
+    h.worker.onAppend([entry()]);
+    await advance(h.clock, 8);
+    h.worker.onAppend([lane.taskEntry]);
+    await advance(h.clock, 2);
+    expect(h.turnOrchestrator.run).toHaveBeenCalledTimes(1);
+    await h.worker.stop();
+  });
+
+  it("retries task errors using the worker backoff", async () => {
+    let attempts = 0;
+    const lane = taskLane(async () => {
+      if (++attempts === 1) throw new Error("retry");
+    });
+    const h = createHarness({ taskEvents: lane });
+    h.worker.start();
+    await flushAsync();
+    h.worker.onAppend([lane.taskEntry]);
+    await advance(h.clock, 10);
+    expect(lane.runner.run).toHaveBeenCalledTimes(1);
+    await advance(h.clock, 24);
+    expect(lane.runner.run).toHaveBeenCalledTimes(1);
+    await advance(h.clock, 1);
+    expect(lane.runner.run).toHaveBeenCalledTimes(2);
+    expect(h.turnOrchestrator.run).not.toHaveBeenCalled();
+    await h.worker.stop();
+  });
+
+  it("selects pending user work before a failing task-terminal ingestion repair", async () => {
+    const lane = taskLane();
+    lane.runner.reconcile.mockRejectedValue(new Error("task ingestion unavailable"));
+    const batch = prefix();
+    const h = createHarness({ prefixes: [batch, emptyPrefix()], taskEvents: lane });
+    expect(await h.worker.tick(DEFAULT_SESSION_ID)).toMatchObject({
+      status: "drained",
+      drained: 1,
+    });
+    expect(h.turnOrchestrator.run).toHaveBeenCalledTimes(1);
+    expect(lane.runner.reconcile).not.toHaveBeenCalled();
+    expect(await h.worker.tick(DEFAULT_SESSION_ID)).toMatchObject({ status: "error" });
+    expect(lane.runner.reconcile).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps task repair backoff separate while newly pending users observe their quiet window", async () => {
+    const lane = taskLane();
+    lane.runner.reconcile.mockRejectedValue(new Error("task ingestion unavailable"));
+    const h = createHarness({ prefixes: [emptyPrefix(), prefix()], taskEvents: lane });
+    h.worker.start();
+    await flushAsync();
+    h.worker.onAppend([lane.taskEntry]);
+    await advance(h.clock, 10);
+    expect(lane.runner.reconcile).toHaveBeenCalledTimes(1);
+    h.worker.onAppend([entry({ timestamp: h.clock.now() })]);
+    await advance(h.clock, 9);
+    expect(h.turnOrchestrator.run).not.toHaveBeenCalled();
+    await advance(h.clock, 1);
+    expect(h.turnOrchestrator.run).toHaveBeenCalledTimes(1);
+    await advance(h.clock, 14);
+    expect(lane.runner.reconcile).toHaveBeenCalledTimes(1);
+    await advance(h.clock, 1);
+    expect(lane.runner.reconcile).toHaveBeenCalledTimes(2);
+    await h.worker.stop();
+  });
+
+  it("observes user quiet windows between multiple task continuations", async () => {
+    const holds = [deferred(), deferred()];
+    let taskRuns = 0;
+    const lane = taskLane(async () => {
+      await holds[taskRuns++]?.promise;
+    }, 3);
+    const h = createHarness({
+      prefixes: [emptyPrefix(), prefix(), emptyPrefix(), prefix()],
+      taskEvents: lane,
+    });
+    h.worker.start();
+    await flushAsync();
+    h.worker.onAppend([lane.taskEntry]);
+    await advance(h.clock, 10);
+    expect(lane.runner.run).toHaveBeenCalledTimes(1);
+    for (let index = 0; index < 2; index += 1) {
+      h.worker.onAppend([entry({ timestamp: h.clock.now() })]);
+      await advance(h.clock, 5);
+      h.worker.onAppend([entry({ timestamp: h.clock.now() })]);
+      holds[index]!.resolve();
+      await flushAsync();
+      await advance(h.clock, 9);
+      expect(h.turnOrchestrator.run).toHaveBeenCalledTimes(index);
+      expect(lane.runner.run).toHaveBeenCalledTimes(index + 1);
+      await advance(h.clock, 1);
+      expect(h.turnOrchestrator.run).toHaveBeenCalledTimes(index + 1);
+      await advance(h.clock, 1);
+      expect(lane.runner.run).toHaveBeenCalledTimes(index + 2);
+    }
+    await h.worker.stop();
   });
 
   it("wakes only daemon-enqueued user messages without turn ids", async () => {
@@ -397,7 +654,7 @@ describe("ChatResponseCatchUpWorker", () => {
     await flushAsync();
     await advance(harness.clock, 0);
 
-    expect(harness.coordinator.reconcile).toHaveBeenCalledTimes(2);
+    expect(harness.coordinator.reconcile).toHaveBeenCalledTimes(4);
     expect(harness.prefixBuilder.build).toHaveBeenCalledTimes(2);
     expect(harness.turnOrchestrator.run).toHaveBeenCalledTimes(2);
   });
@@ -720,5 +977,160 @@ describe("ChatResponseCatchUpWorker", () => {
     await advance(harness.clock, 1);
 
     expect(harness.turnOrchestrator.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("applies the session predicate at startup, append, pending notification, and drain", async () => {
+    const startupSession = createSessionId();
+    const predicate = vi.fn(() => false);
+    const startup = createHarness({
+      pendingSessionIds: [startupSession],
+      sessionPredicate: predicate,
+    });
+    startup.worker.start();
+    await flushAsync();
+    expect(predicate).toHaveBeenCalledWith(startupSession);
+    expect(startup.coordinator.reconcile).not.toHaveBeenCalled();
+
+    startup.worker.onAppend([entry({ sessionId: DEFAULT_SESSION_ID })]);
+    startup.worker.onPendingSession(DEFAULT_SESSION_ID, 0);
+    await advance(startup.clock, DEFAULT_CONFIG.maxWaitMs);
+    expect(predicate).toHaveBeenCalledWith(DEFAULT_SESSION_ID);
+    expect(startup.prefixBuilder.build).not.toHaveBeenCalled();
+
+    let accepted = true;
+    const beforeDrain = createHarness({
+      prefixes: [prefix()],
+      sessionPredicate: () => accepted,
+    });
+    beforeDrain.worker.start();
+    await flushAsync();
+    beforeDrain.worker.onPendingSession(DEFAULT_SESSION_ID, 0);
+    accepted = false;
+    await expect(beforeDrain.worker.tick(DEFAULT_SESSION_ID)).resolves.toMatchObject({
+      status: "empty",
+      drained: 0,
+    });
+    expect(beforeDrain.prefixBuilder.build).not.toHaveBeenCalled();
+  });
+
+  it("treats a runner return without a covering durable stamp as an error", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const harness = createHarness({ prefixes: [prefix()], stampAfterRun: false });
+
+    await expect(harness.worker.tick(DEFAULT_SESSION_ID)).resolves.toMatchObject({
+      status: "error",
+      drained: 0,
+      hasMore: true,
+      error: expect.stringContaining("did not durably cover"),
+    });
+    expect(harness.turnOrchestrator.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a short watermark advance as partial progress and immediately re-drains", async () => {
+    const first = prefix({ count: 3 });
+    const second = prefix({ count: 2 });
+    const run = vi.fn(async (_input: unknown) => undefined);
+    const harness = createHarness({
+      config: { quietWindowMs: 0 },
+      prefixes: [first, second],
+      customRunner: run,
+      watermarkAfterRun: (input, runCount) =>
+        runCount === 1
+          ? cursor(first.entryIds[0]!, first.throughCursorInclusive!.ts)
+          : (input as { inboundBatch: { throughCursorInclusive: StreamCursor } }).inboundBatch
+              .throughCursorInclusive,
+    });
+
+    harness.worker.start();
+    await flushAsync();
+    harness.worker.onPendingSession(DEFAULT_SESSION_ID, 0);
+    await advance(harness.clock, 0);
+    await runPendingTimers();
+
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[0]?.[0]).toMatchObject({
+      inboundBatch: { entryIds: first.entryIds },
+    });
+    expect(run.mock.calls[1]?.[0]).toMatchObject({
+      inboundBatch: { entryIds: second.entryIds },
+    });
+  });
+
+  it("notifies when reconciliation discovers and advances a durable stamp", async () => {
+    const advancedThrough = cursor(createStreamEntryId(), 10);
+    const onReconcileAdvance = vi.fn();
+    const harness = createHarness({
+      prefixes: [emptyPrefix()],
+      reconcileAdvance: advancedThrough,
+      onReconcileAdvance,
+    });
+
+    await expect(harness.worker.tick(DEFAULT_SESSION_ID)).resolves.toMatchObject({
+      status: "empty",
+    });
+    expect(onReconcileAdvance).toHaveBeenCalledWith({
+      sessionId: DEFAULT_SESSION_ID,
+      advancedThrough,
+    });
+  });
+
+  it("holds a background lease while a drain is scheduled", async () => {
+    const release = vi.fn();
+    const acquireLease = vi.fn(() => ({ release }));
+    const harness = createHarness({ acquireLease });
+
+    harness.worker.start();
+    await flushAsync();
+    acquireLease.mockClear();
+    release.mockClear();
+    harness.worker.onPendingSession(DEFAULT_SESSION_ID, 0);
+
+    expect(acquireLease).toHaveBeenCalledTimes(1);
+    expect(release).not.toHaveBeenCalled();
+    await harness.worker.stop({ graceful: false });
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the default adapter's TurnOrchestrator invocation unchanged", async () => {
+    const run = vi.fn(async () => turnResult());
+    const adapter = new TurnOrchestratorChatResponseCatchUpRunner({ run });
+    const batch = prefix();
+
+    await adapter.run({
+      sessionId: DEFAULT_SESSION_ID,
+      inboundBatch: {
+        kind: "stream_backlog",
+        entryIds: batch.entryIds,
+        throughCursorInclusive: batch.throughCursorInclusive!,
+      },
+    });
+
+    expect(run).toHaveBeenCalledWith({
+      sessionId: DEFAULT_SESSION_ID,
+      origin: "user",
+      lockMode: "try",
+      inboundBatch: {
+        kind: "stream_backlog",
+        entryIds: batch.entryIds,
+        throughCursorInclusive: batch.throughCursorInclusive,
+      },
+    });
+  });
+
+  it("uses a supplied runner instead of the default turn adapter", async () => {
+    const run = vi.fn(async () => undefined);
+    const harness = createHarness({ prefixes: [prefix()], customRunner: run });
+
+    await expect(harness.worker.tick(DEFAULT_SESSION_ID)).resolves.toMatchObject({
+      status: "drained",
+      drained: 1,
+    });
+    expect(run).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: DEFAULT_SESSION_ID,
+        inboundBatch: expect.objectContaining({ kind: "stream_backlog" }),
+      }),
+    );
+    expect(harness.turnOrchestrator.run).not.toHaveBeenCalled();
   });
 });

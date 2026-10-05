@@ -16,38 +16,17 @@ import { timestampFromUtcDayKey } from "../../util/utc-day.js";
 import {
   activityEventSchema,
   type ActivityEvent,
+  type ActivityEventRecordInput,
   type ActivityEventKind,
-  type ActivityEventStatus,
+  type ActivityProjectionSourceEvent,
 } from "./types.js";
+
+export type { ActivityProjectionSourceEvent } from "./types.js";
 
 const ACTIVITY_JSON_ARRAY_CODEC = {
   errorCode: "ACTIVITY_EVENT_ROW_INVALID",
   errorMessage: (label: string) => `Failed to parse activity event ${label}`,
 } satisfies JsonArrayCodecOptions;
-
-export type ActivityEventRecordInput = {
-  id?: ActivityEventId;
-  kind: ActivityEventKind;
-  occurredAt: number;
-  sessionId: SessionId;
-  turnId?: string | null;
-  speakerEntityId?: EntityId | null;
-  actorEntityId?: EntityId | null;
-  audienceEntityId?: EntityId | null;
-  participantEntityIds?: readonly EntityId[];
-  sourceStreamEntryIds: readonly StreamEntryId[];
-  status?: ActivityEventStatus;
-  now?: number;
-};
-
-export type ActivityProjectionSourceEvent = {
-  kind: ActivityEventKind;
-  occurredAt: number;
-  sessionId: SessionId;
-  participantLabel: string;
-  audienceEntityId: EntityId | null;
-  sourceStreamEntryIds: readonly StreamEntryId[];
-};
 
 export type ActivityAutobiographicalSourceEvent = {
   id: ActivityEventId;
@@ -164,6 +143,8 @@ function mapProjectionRow(row: Record<string, unknown>): ActivityProjectionSourc
     kind: row.kind as ActivityEventKind,
     occurredAt: Number(row.occurred_at),
     sessionId: row.session_id as SessionId,
+    conversationKind: row.conversation_kind as ActivityProjectionSourceEvent["conversationKind"],
+    conversationName: String(row.conversation_name ?? ""),
     participantLabel: String(row.participant_label ?? "A participant"),
     audienceEntityId:
       row.audience_entity_id === null || row.audience_entity_id === undefined
@@ -366,7 +347,12 @@ export class ActivityRepository {
     currentSessionId: SessionId;
     sinceMs: number;
     limit: number;
+    kinds?: readonly ActivityEventKind[];
   }): ActivityProjectionSourceEvent[] {
+    const kinds = input.kinds === undefined ? undefined : dedupePreservingOrder(input.kinds);
+    if (kinds?.length === 0) {
+      return [];
+    }
     const rows = this.db
       .prepare(
         `
@@ -376,6 +362,8 @@ export class ActivityRepository {
             e.session_id,
             e.audience_entity_id,
             e.source_stream_entry_ids,
+            s.conversation_kind,
+            s.audience_label AS conversation_name,
             COALESCE(speaker.canonical_name, audience.canonical_name, s.audience_label)
               AS participant_label
           FROM activity_events e
@@ -387,6 +375,7 @@ export class ActivityRepository {
             AND s.status = 'active'
             AND e.session_id <> ?
             AND e.occurred_at >= ?
+            ${kinds === undefined ? "" : `AND e.kind IN (${kinds.map(() => "?").join(", ")})`}
             AND (
               e.kind IN ('user_contact', 'borg_replied')
               OR EXISTS (
@@ -411,9 +400,32 @@ export class ActivityRepository {
           LIMIT ?
         `,
       )
-      .all(input.currentSessionId, input.sinceMs, input.limit) as Record<string, unknown>[];
+      .all(input.currentSessionId, input.sinceMs, ...(kinds ?? []), input.limit) as Record<
+      string,
+      unknown
+    >[];
 
     return rows.map(mapProjectionRow);
+  }
+
+  listObservedGroupAudienceEntityIdsForSpeaker(speakerEntityId: EntityId): EntityId[] {
+    const rows = this.db
+      .prepare(
+        `
+          SELECT DISTINCT e.audience_entity_id
+          FROM activity_events e
+          INNER JOIN entities audience ON audience.id = e.audience_entity_id
+          WHERE
+            e.status = 'active'
+            AND e.kind = 'user_contact'
+            AND e.speaker_entity_id = ?
+            AND audience.kind = 'group'
+          ORDER BY e.audience_entity_id ASC
+        `,
+      )
+      .all(speakerEntityId) as Array<{ audience_entity_id: EntityId }>;
+
+    return rows.map((row) => row.audience_entity_id);
   }
 
   getMostRecentOtherActiveSessionEventOccurredAt(input: {

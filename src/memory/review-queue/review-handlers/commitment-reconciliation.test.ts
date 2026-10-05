@@ -3,9 +3,12 @@ import { describe, expect, it } from "vitest";
 import { createCommitmentId, createEntityId, createStreamEntryId } from "../../../util/ids.js";
 import {
   COMMITMENT_RECONCILIATION_REVIEW_SUBKINDS,
+  commitmentReconciliationJudgmentSchema,
+  commitmentReconciliationModelJudgmentSchema,
   commitmentReconciliationReviewRefsSchema,
   commitmentReconciliationSubkindSchema,
   createCommitmentReconciliationReviewQueueHandler,
+  deriveCommitmentReconciliationJudgment,
 } from "./commitment-reconciliation.js";
 
 describe("commitment reconciliation review handler", () => {
@@ -69,7 +72,8 @@ describe("commitment reconciliation review handler", () => {
     const secondAudienceId = createEntityId();
     const firstEntryId = createStreamEntryId();
     const secondEntryId = createStreamEntryId();
-    const sortedAudienceIds = [firstAudienceId, secondAudienceId].sort();
+    const originAudienceIds = [firstAudienceId, secondAudienceId];
+    const authorizationAudienceIds = [...originAudienceIds].sort();
 
     const refs = commitmentReconciliationReviewRefsSchema.parse({
       target_type: "commitment_reconciliation",
@@ -139,14 +143,87 @@ describe("commitment reconciliation review handler", () => {
       source_stream_entry_ids: [firstEntryId, secondEntryId],
       disclosure_label: {
         disclosureClass: "relationship_private",
-        originAudienceEntityIds: sortedAudienceIds,
-        privateToEntityIds: sortedAudienceIds,
+        // Origins keep member chronology; authorization IDs use lexical set order.
+        originAudienceEntityIds: originAudienceIds,
+        privateToEntityIds: authorizationAudienceIds,
         publicToEntityIds: [],
       },
     });
 
     expect(refs.subkind).toBe("cross_scope_conflict");
     expect(refs.source_stream_entry_ids).toEqual([firstEntryId, secondEntryId]);
-    expect(refs.disclosure_label?.originAudienceEntityIds).toEqual(sortedAudienceIds);
+    expect(refs.disclosure_label).toEqual({
+      disclosureClass: "relationship_private",
+      originAudienceEntityIds: originAudienceIds,
+      privateToEntityIds: authorizationAudienceIds,
+      publicToEntityIds: [],
+    });
+  });
+});
+
+describe("commitment reconciliation model judgment", () => {
+  it("derives the superseded set as the complement of the survivor", () => {
+    const [first, second, third] = [
+      createCommitmentId(),
+      createCommitmentId(),
+      createCommitmentId(),
+    ];
+    const judgment = deriveCommitmentReconciliationJudgment(
+      commitmentReconciliationModelJudgmentSchema.parse({
+        commitment_ids: [first, second, third],
+        resolution: "supersede_to_survivor",
+        survivor_commitment_id: second,
+        reason: "Redundant restatements of one commitment.",
+      }),
+    );
+
+    expect(judgment.superseded_commitment_ids).toEqual([first, third]);
+    // The derived judgment satisfies the stored schema's partition invariant.
+    expect(commitmentReconciliationJudgmentSchema.safeParse(judgment).success).toBe(true);
+  });
+
+  it("derives an empty superseded set when nothing is superseded", () => {
+    const ids = [createCommitmentId(), createCommitmentId()];
+
+    for (const resolution of ["keep_independent", "conflict"] as const) {
+      const judgment = deriveCommitmentReconciliationJudgment(
+        commitmentReconciliationModelJudgmentSchema.parse({
+          commitment_ids: ids,
+          resolution,
+          survivor_commitment_id: null,
+          reason: "Distinct commitments.",
+        }),
+      );
+
+      expect(judgment.superseded_commitment_ids).toEqual([]);
+      expect(commitmentReconciliationJudgmentSchema.safeParse(judgment).success).toBe(true);
+    }
+  });
+
+  it("rejects a model payload that restates the derived superseded set", () => {
+    const [first, second] = [createCommitmentId(), createCommitmentId()];
+
+    expect(
+      commitmentReconciliationModelJudgmentSchema.safeParse({
+        commitment_ids: [first, second],
+        resolution: "supersede_to_survivor",
+        survivor_commitment_id: second,
+        superseded_commitment_ids: [first],
+        reason: "Redundant.",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("still requires the survivor to be one of the commitment ids", () => {
+    const [first, second] = [createCommitmentId(), createCommitmentId()];
+
+    expect(
+      commitmentReconciliationModelJudgmentSchema.safeParse({
+        commitment_ids: [first, second],
+        resolution: "supersede_to_survivor",
+        survivor_commitment_id: createCommitmentId(),
+        reason: "Redundant.",
+      }).success,
+    ).toBe(false);
   });
 });

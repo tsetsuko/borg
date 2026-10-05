@@ -1,7 +1,9 @@
+import { agentDeliveryMigrations } from "../cognition/ingestion/agent-deliveries.js";
 // Opens Borg's configured storage engines and LanceDB tables.
 
 import { join } from "node:path";
 
+import { operatorAttentionMigrations } from "../memory/operator-attention/index.js";
 import { autonomyMigrations } from "../autonomy/index.js";
 import { promptOverrideMigrations } from "../cognition/prompts/override-migrations.js";
 import { promptSurfaceHistoryMigrations } from "../cognition/prompts/prompt-surface-history-migrations.js";
@@ -90,10 +92,6 @@ export function resolveBorgConfig(options: {
         ...DEFAULT_CONFIG.anthropic.models,
         ...rawConfig.anthropic?.models,
       },
-    },
-    procedural: {
-      ...DEFAULT_CONFIG.procedural,
-      ...(rawConfig as Partial<Config>).procedural,
     },
     attachments: {
       ...DEFAULT_CONFIG.attachments,
@@ -271,17 +269,25 @@ export function createMigrations(): Migration[] {
     observedEventMigrations,
     trainOfThoughtMigrations,
     promptSurfaceHistoryMigrations,
-    // New migration GROUPS must be appended at the end: composeMigrations derives
-    // each migration's id from its group's position, so inserting a group mid-list
-    // shifts the ids of every later group and forces already-applied migrations to
-    // re-run on existing databases.
+    operatorAttentionMigrations,
+    agentDeliveryMigrations,
+    // Fork groups go after upstream's, so upstream's group ids stay what upstream
+    // ships and tests. Ids still derive from group position, but the runner now
+    // matches applied migrations by name and re-ids them on open
+    // (reconcileMigrationIds), so a bank that applied this group at an earlier
+    // position carries over without re-running it.
     predictionMigrations,
   );
 }
 
+// The SQLite bank file inside a tenant's dataDir. Exported because tenant
+// DISCOVERY (BorgPool.listTenantIds) keys on its presence to tell a real bank
+// apart from an unrelated directory that happens to sit under the pool root.
+export const BANK_DB_FILENAME = "borg.db";
+
 export function openBorgStorage(config: Config): BorgStorage {
   return {
-    sqlite: openDatabase(join(config.dataDir, "borg.db"), {
+    sqlite: openDatabase(join(config.dataDir, BANK_DB_FILENAME), {
       migrations: createMigrations(),
     }),
     lance: new LanceDbStore({

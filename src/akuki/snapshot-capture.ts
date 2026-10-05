@@ -9,6 +9,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
+import { EMBEDDING_ACCESS_FILE, readBankEmbeddingProfile } from "../embeddings/bank-profile.js";
 import { Borg, FakeEmbeddingClient } from "../index.js";
 import { FakeLLMClient } from "../llm/test-support/fake-client.js";
 import { buildAkukiSnapshot, type AkukiSnapshot } from "./snapshot.js";
@@ -17,6 +18,15 @@ const DEFAULT_DIMS = 1024;
 
 // The copy's LanceDB tables were written at the real model's width, so the fake
 // embedding client must be built at that same width or the vector store is rejected.
+// A bank that carries an embedding profile also pins the model name, and Borg.open
+// refuses a client whose profile differs, so the fake borrows both from it.
+function readEmbeddingProfile(dataDir: string): { model?: string; dims: number } {
+  const profile = readBankEmbeddingProfile(dataDir);
+  return profile === undefined
+    ? { dims: readEmbeddingDims(dataDir) }
+    : { model: profile.model, dims: profile.dimensions };
+}
+
 function readEmbeddingDims(dataDir: string): number {
   try {
     const raw: unknown = JSON.parse(readFileSync(join(dataDir, "config.json"), "utf8"));
@@ -47,7 +57,7 @@ export async function captureAkukiSnapshot(
   options: CaptureAkukiSnapshotOptions,
 ): Promise<CaptureAkukiSnapshotResult> {
   const tenant = options.tenant ?? basename(options.dataDir);
-  const dims = readEmbeddingDims(options.dataDir);
+  const { model, dims } = readEmbeddingProfile(options.dataDir);
 
   const tempRoot = mkdtempSync(join(tmpdir(), "akuki-snapshot-"));
   const copiedDir = join(tempRoot, tenant);
@@ -55,6 +65,10 @@ export async function captureAkukiSnapshot(
 
   try {
     cpSync(options.dataDir, copiedDir, { recursive: true, dereference: true });
+    // The bank lease names whoever holds the live tenant, usually the running
+    // service; in the copy it would make Borg.open wait on a holder it can never
+    // outlast. The copy has no holder, so its lease goes.
+    rmSync(join(copiedDir, EMBEDDING_ACCESS_FILE), { force: true });
 
     // Fakes on purpose: a snapshot must not make a single provider call. Fake
     // embeddings carry no semantic signal, which is irrelevant here because nothing
@@ -62,7 +76,7 @@ export async function captureAkukiSnapshot(
     borg = await Borg.open({
       dataDir: copiedDir,
       embeddingDimensions: dims,
-      embeddingClient: new FakeEmbeddingClient(dims),
+      embeddingClient: new FakeEmbeddingClient(dims, model),
       llmClient: new FakeLLMClient(),
       liveExtraction: false,
     });

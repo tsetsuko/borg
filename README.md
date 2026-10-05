@@ -238,6 +238,10 @@ borg social profile|upsert|adjust-trust
 
 ## Requirements
 
+For per-tenant embedding model changes, use the [embedding migration runbook](docs/embedding-migration.md), including backup, live-tenant drain, resumable re-embedding, verification, and rollback.
+
+See [similarity calibration](docs/similarity-calibration.md) for model-specific thresholds, overrides, and the measurement workflow.
+
 - **Node >= 22.**
 - **An OpenAI-compatible embeddings endpoint.** Defaults to LM Studio on
   `localhost:1234` with `text-embedding-qwen3-embedding-8b` (4096 dims).
@@ -251,6 +255,14 @@ The being's cognition targets **Opus 4.8**. Background and extraction remain
 on Opus 5. The substrate co-produces identity with the cognition model, so the
 design accepts drift when migrating to a successor rather than chasing
 model-swap conformance.
+
+Shared-state compilation uses `anthropic.models.sharedStateCompiler`, defaulting
+to `claude-sonnet-5`. Override it with `BORG_MODEL_SHARED_STATE_COMPILER`; both
+pre-answer and post-response compiles use this slot independently of
+`anthropic.models.recallExpansion`. The compiler records decisions with their
+stated timing and corrects existing entries through `supersede` or `update`,
+including locked entries. Contradiction and evidence of a completed act remain
+model judgments.
 
 ## Development
 

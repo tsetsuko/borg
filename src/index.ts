@@ -1,3 +1,15 @@
+export {
+  similarityThresholds,
+  logSimilarityProfile,
+  DEFAULT_SIMILARITY_PROFILES,
+  QWEN_SIMILARITY_MODEL,
+  BGE_SIMILARITY_MODEL,
+} from "./config/similarity.js";
+export type {
+  SimilarityThresholds,
+  SimilarityConfig,
+  SimilarityConfigSource,
+} from "./config/similarity.js";
 // Borg -- public library entry point.
 // Re-exports the stable library surface; implementation modules stay
 // behind internal paths.
@@ -14,24 +26,33 @@ export {
   type BorgEpisodeSearchOptions,
   type BorgOpenOptions,
 } from "./borg.js";
-export { BorgPool, type BorgPoolOptions } from "./borg/pool.js";
+export { BorgPool, type BorgPoolBackgroundLease, type BorgPoolOptions } from "./borg/pool.js";
 export type {
   BorgActionsFacade,
+  BorgActivityCompletedTurnProjectionInput,
+  BorgActivityObservedTurnProjectionInput,
+  BorgActivityRepliedTurnProjectionInput,
+  BorgActivityFacade,
   BorgAttachmentBytesResult,
   BorgAttachmentMetadataResult,
   BorgAttachmentsFacade,
   BorgAuditFacade,
   BorgAutonomyFacade,
   BorgCommitmentsFacade,
+  BorgCommitmentWithDisclosure,
   BorgCorrectionFacade,
   BorgCreatorDirectivesFacade,
   BorgDreamFacade,
+  BorgDisclosurePayloadFields,
   BorgEntitiesFacade,
   BorgEpisodicFacade,
   BorgFacades,
   BorgIdentityFacade,
   BorgInboxCatchUpController,
   BorgInboxCatchUpDrainResult,
+  BorgAppendBacklogTerminalInput,
+  BorgAppendBacklogTerminalResult,
+  BorgFindTerminalCoveringEntryResult,
   BorgInboxFacade,
   BorgMaintenanceFacade,
   BorgMoodFacade,
@@ -42,6 +63,8 @@ export type {
   BorgReviewFacade,
   BorgReviewResolutionInput,
   BorgSelfFacade,
+  BorgGoalTreeWithDisclosure,
+  BorgGoalWithDisclosure,
   BorgSemanticEdgeWithDisclosure,
   BorgSemanticFacade,
   BorgSemanticNodeListResultWithDisclosure,
@@ -55,6 +78,12 @@ export type {
   BorgStreamFacade,
   BorgWorkmemFacade,
 } from "./borg/public-facade.js";
+export type {
+  ChatResponseCatchUpLease,
+  ChatResponseCatchUpRunInput,
+  ChatResponseCatchUpRunner,
+  ChatResponseReconcileAdvance,
+} from "./cognition/ingestion/index.js";
 export { PROMPT_KEYS, type PromptKey } from "./cognition/prompts/registry.js";
 export {
   CompositeTracer,
@@ -233,7 +262,9 @@ export {
   type AutonomySchedulerSourceDescription,
   type AutonomySchedulerTriggerSourceDescription,
   type AutonomySchedulerWakeGroupDescription,
+  type AutonomySchedulerWakeDescription,
   type AutonomyTickEventResult,
+  type AutonomyWakeExecutionCounts,
   type AutonomyWakeRecord,
   type AutonomyWakeRecordInput,
   type AutonomyWakeSourceCategory,
@@ -244,6 +275,7 @@ export {
 } from "./autonomy/index.js";
 export {
   type ExecutiveFocus,
+  type ExecutiveFocusCandidateSteps,
   type ExecutiveGoalScore,
   type ExecutiveGoalScoreComponents,
   type ExecutiveStep,
@@ -341,6 +373,10 @@ export {
   OPEN_QUESTION_STATUSES,
   type AutobiographicalPeriod,
   type AutobiographicalPeriodPatch,
+  goalBlockInputSchema,
+  goalBlockerSchema,
+  type GoalBlockInput,
+  type GoalBlockRecord,
   type GoalPatch,
   type GoalRecord,
   type GoalStatus,
@@ -515,21 +551,30 @@ export {
   type DisclosureRetrievalOptions,
   type RetrievalGetEpisodeOptions,
   type RetrievalSharedOptions,
-  type RetrievalSearchOptions,
 } from "./retrieval/index.js";
 export {
   NARRATIVE_STREAM_ENTRY_KINDS,
   QUARANTINED_USER_ENTRY_EVENT,
+  STREAM_CONVERSATION_TYPES,
   STREAM_ENTRY_KINDS,
   STREAM_ENTRY_PERSISTENCE_CLASSES,
   isNarrativeStreamEntry,
+  streamConversationSchema,
   streamCursorSchema,
   streamEntryPersistenceClassSchema,
   streamResponseToSchema,
+  taskEventSchema,
+  taskEventResponseToSchema,
+  streamBacklogResponseToSchema,
+  type TaskEvent,
+  type TaskEventResponseTo,
+  type StreamBacklogResponseTo,
   streamSourceMessageKeySchema,
   type StreamCursor,
+  type StreamConversation,
   type StreamEntry,
   type StreamEntryInput,
+  type StreamEntryMetadata,
   type StreamEntryKind,
   type StreamEntryPersistenceClass,
   type StreamResponseTo,
@@ -661,3 +706,13 @@ export {
 export { applyAkukiSeed } from "./akuki/seed/apply.js";
 export { applyAkukiTemperamentEnv } from "./akuki/prediction-config.js";
 export { buildAkukiClients } from "./akuki/tenant.js";
+
+export {
+  operatorAttentionRecordSchema,
+  OPERATOR_ATTENTION_RECENT_LIMIT,
+  OPERATOR_ATTENTION_SUBJECT_MAX_CHARS,
+  type BorgOperatorAttentionFacade,
+  type OperatorAttentionRecord,
+  type OperatorAttentionIndex,
+  type OperatorAttentionIndexRow,
+} from "./memory/operator-attention/types.js";

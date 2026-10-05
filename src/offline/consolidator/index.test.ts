@@ -3,8 +3,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { FakeLLMClient } from "../../llm/test-support/fake-client.js";
 import { buildConsolidationCoverageHash } from "../../memory/episodic/index.js";
 import { memoryDisclosureLabelFromEpisodeAccess } from "../../retrieval/index.js";
-import { createConsolidationFamilyId } from "../../util/ids.js";
-import { SELF_REFERENTIAL_MEMORY_VOICE_GUIDANCE } from "../../util/self-memory-voice.js";
+import { createConsolidationFamilyId, parseEntityId, parseEpisodeId } from "../../util/ids.js";
+import {
+  MEMORY_SOURCE_LANGUAGE_GUIDANCE,
+  SELF_REFERENTIAL_MEMORY_VOICE_GUIDANCE,
+} from "../../util/self-memory-voice.js";
 
 import {
   createEpisodeFixture,
@@ -13,6 +16,7 @@ import {
   type OfflineTestHarness,
 } from "../test-support.js";
 import { ConsolidatorProcess } from "./index.js";
+import { migrationRowText } from "../../../scripts/embedding-migration/inventory.js";
 
 const CONSOLIDATION_TOOL_NAME = "EmitConsolidation";
 
@@ -65,6 +69,45 @@ describe("consolidator process", () => {
       await cleanup.pop()?.();
     }
   });
+
+  it.each([false, true])(
+    "persists byte-identical migration input from the real writer with inline legacy lines (copied=%s)",
+    async (copied) => {
+      const legacy =
+        "I corrected the report. OUTCOME fp=legacy-correction decision=filter-by-author";
+      const synthesized = `The report was corrected.${copied ? `\n${legacy}` : ""}`;
+      const client = new TestEmbeddingClient();
+      const spy = vi.spyOn(client, "embed");
+      const harness = await createOfflineTestHarness({
+        embeddingClient: client,
+        llmClient: new FakeLLMClient({
+          responses: [createConsolidationResponse("Reporting correction", synthesized)],
+        }),
+      });
+      cleanup.push(harness.cleanup);
+      for (const [index, narrative] of [legacy, "The correction was verified."].entries()) {
+        await harness.episodicRepository.createEpisode(
+          createEpisodeFixture(
+            {
+              narrative,
+              created_at: 10_000 + index,
+              updated_at: 10_000 + index,
+            },
+            [0, 1, 0, 0],
+          ),
+        );
+      }
+      const result = await createProcess(harness).run(harness.createContext(), { dryRun: false });
+      expect(result.errors).toEqual([]);
+      const family = harness.episodicRepository.listConsolidationFamilies()[0]!;
+      const stored = await harness.episodicRepository.get(family.current_version_episode_id);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(stored?.consolidation_embedding_input?.synthesized_narrative).toBe(synthesized);
+      expect(migrationRowText("episodes", stored!)).toBe(spy.mock.calls[0]![0]);
+      const serialized = JSON.parse(JSON.stringify(stored));
+      expect(migrationRowText("episodes", serialized)).toBe(spy.mock.calls[0]![0]);
+    },
+  );
 
   it("creates a family version, hides covered raws without archiving them, and supports reversal", async () => {
     const outcomeLine = "OUTCOME fp=consolidation-receipt role=planner tenant=tenant_42";
@@ -425,10 +468,9 @@ describe("consolidator process", () => {
     const harness = await createOfflineTestHarness({
       llmClient: llm,
       configOverrides: {
+        similarity: { overrides: { consolidationSimilarity: 0.9, consolidationDiameter: 0.02 } },
         offline: {
           consolidator: {
-            similarityThreshold: 0.9,
-            maxClusterDiameter: 0.02,
             maxClustersPerRun: 10,
           },
         },
@@ -610,10 +652,9 @@ describe("consolidator process", () => {
         new Map([[consolidationEmbeddingText(summaryTitle, summaryNarrative), [0, 1, 0, 0]]]),
       ),
       configOverrides: {
+        similarity: { overrides: { consolidationSimilarity: 0.8, consolidationDiameter: 0.05 } },
         offline: {
           consolidator: {
-            similarityThreshold: 0.8,
-            maxClusterDiameter: 0.05,
             maxClustersPerRun: 10,
           },
         },
@@ -677,8 +718,16 @@ describe("consolidator process", () => {
       llmClient: llm,
     });
     cleanup.push(harness.cleanup);
-    const alice = harness.entityRepository.resolve("Alice");
-    const bob = harness.entityRepository.resolve("Bob");
+    // Keep origin chronology opposite lexical authorization order so both contracts
+    // are exercised independently and do not depend on randomly generated IDs.
+    const alice = harness.entityRepository.add({
+      id: parseEntityId("ent_bbbbbbbbbbbbbbbb"),
+      canonicalName: "Alice",
+    }).id;
+    const bob = harness.entityRepository.add({
+      id: parseEntityId("ent_aaaaaaaaaaaaaaaa"),
+      canonicalName: "Bob",
+    }).id;
     const selfEntityId = harness.entityRepository.resolve("self", {
       kind: "self",
       provenance: "assistant_seeded",
@@ -686,6 +735,7 @@ describe("consolidator process", () => {
     const sourceEpisodes = [
       createEpisodeFixture(
         {
+          id: parseEpisodeId("ep_cccccccccccccccc"),
           title: "Public architecture note one",
           tags: ["architecture"],
           audience_entity_id: null,
@@ -697,23 +747,25 @@ describe("consolidator process", () => {
       ),
       createEpisodeFixture(
         {
+          id: parseEpisodeId("ep_aaaaaaaaaaaaaaaa"),
           title: "Alice-only architecture note",
           tags: ["architecture"],
           audience_entity_id: alice,
           shared: false,
-          created_at: 20_000,
-          updated_at: 20_000,
+          created_at: 10_000,
+          updated_at: 10_000,
         },
         [0.99, 0, 0, 0],
       ),
       createEpisodeFixture(
         {
+          id: parseEpisodeId("ep_bbbbbbbbbbbbbbbb"),
           title: "Bob-only architecture note",
           tags: ["architecture"],
           audience_entity_id: bob,
           shared: false,
-          created_at: 30_000,
-          updated_at: 30_000,
+          created_at: 10_000,
+          updated_at: 10_000,
         },
         [0.98, 0, 0, 0],
       ),
@@ -729,21 +781,26 @@ describe("consolidator process", () => {
     });
     const episodes = await harness.episodicRepository.listAll();
     const merged = episodes.find((episode) => episode.title === "Merged architecture pattern");
-    const expectedPrivateTo = [alice, bob].sort();
+    const expectedSourceEpisodes = [sourceEpisodes[1]!, sourceEpisodes[2]!, sourceEpisodes[0]!];
+    // Tied raws use ID order; origins retain that chronology and authorization IDs sort lexically.
+    const expectedOriginAudiences = [alice, bob];
+    const expectedPrivateTo = [...expectedOriginAudiences].sort();
 
     expect(result.changes).toHaveLength(1);
     expect(merged?.episode_kind).toBe("consolidation_version");
-    expect(merged?.lineage.derived_from).toEqual(sourceEpisodes.map((episode) => episode.id));
-    expect(merged?.lineage.supersedes).toEqual(sourceEpisodes.map((episode) => episode.id));
+    expect(merged?.lineage.derived_from).toEqual(
+      expectedSourceEpisodes.map((episode) => episode.id),
+    );
+    expect(merged?.lineage.supersedes).toEqual(expectedSourceEpisodes.map((episode) => episode.id));
     expect(merged?.audience_entity_id).toBeNull();
-    expect(merged?.origin_audience_entity_ids).toEqual(expectedPrivateTo);
+    expect(merged?.origin_audience_entity_ids).toEqual(expectedOriginAudiences);
     expect(merged?.shared).toBe(false);
     expect(
       sourceEpisodes.map((episode) => harness.episodicRepository.getStats(episode.id)?.archived),
     ).toEqual([false, false, false]);
     expect(memoryDisclosureLabelFromEpisodeAccess(merged!)).toEqual({
       disclosureClass: "relationship_private",
-      originAudienceEntityIds: expectedPrivateTo,
+      originAudienceEntityIds: expectedOriginAudiences,
       privateToEntityIds: expectedPrivateTo,
       publicToEntityIds: [],
     });
@@ -754,6 +811,9 @@ describe("consolidator process", () => {
     expect(prompt).toContain(`I am the self entity ${selfEntityId};`);
     expect(prompt).toContain(SELF_REFERENTIAL_MEMORY_VOICE_GUIDANCE);
     expect(prompt).toContain("I keep the title topic-neutral and scannable");
+    // The self-referential language rule does not reach a topic-neutral title, so
+    // the source-language anchor must be present in its own right.
+    expect(prompt).toContain(MEMORY_SOURCE_LANGUAGE_GUIDANCE);
     expect(prompt).toContain(alice);
     expect(prompt).toContain(bob);
   });

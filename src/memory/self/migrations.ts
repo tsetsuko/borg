@@ -51,6 +51,7 @@ export const selfMigrations = [
           last_progress_ts INTEGER,
           audience_entity_id TEXT,
           owner_entity_id TEXT,
+          counterparty_entity_id TEXT,
           source_stream_entry_ids TEXT, canonicalized_by_artifact_entry_id TEXT NULL,
           FOREIGN KEY (parent_goal_id) REFERENCES goals(id) ON DELETE SET NULL
         );
@@ -400,6 +401,47 @@ export const selfMigrations = [
       if (!tableHasColumn(db, "goals", "provenance_stream_entry_ids")) {
         db.exec("ALTER TABLE goals ADD COLUMN provenance_stream_entry_ids TEXT");
       }
+    },
+  },
+  {
+    id: 8,
+    name: "open_question_rumination_run_stamps",
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS open_question_rumination_stamps (
+          open_question_id TEXT NOT NULL,
+          source_run_id TEXT NOT NULL,
+          stamped_at INTEGER NOT NULL,
+          PRIMARY KEY (open_question_id, source_run_id),
+          FOREIGN KEY (open_question_id) REFERENCES open_questions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_open_question_rumination_stamps_run
+          ON open_question_rumination_stamps (source_run_id, open_question_id);
+      `);
+    },
+  },
+  {
+    id: 9,
+    name: "goal_counterparty_entity_id",
+    up: (db) => {
+      if (!tableHasColumn(db, "goals", "counterparty_entity_id")) {
+        db.exec("ALTER TABLE goals ADD COLUMN counterparty_entity_id TEXT");
+      }
+    },
+  },
+  {
+    id: 10,
+    name: "goal_named_block_history",
+    up: (db) => {
+      db.exec("ALTER TABLE goals ADD COLUMN block_history_json TEXT NOT NULL DEFAULT '[]'");
+      db.exec("CREATE INDEX idx_goals_blocked ON goals(id) WHERE status = 'blocked'");
+    },
+  },
+  {
+    id: 11,
+    name: "goal_deadline_assignment_basis",
+    up: (db) => {
+      db.exec("ALTER TABLE goals ADD COLUMN target_assigned_at INTEGER NULL");
     },
   },
 ] as const satisfies readonly Migration[];

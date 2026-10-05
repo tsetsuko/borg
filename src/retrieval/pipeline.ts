@@ -1,9 +1,11 @@
+import { similarityThresholds, type SimilarityConfigSource } from "../config/similarity.js";
 import type { AttentionWeights, TemporalCue } from "../contracts/cognitive-contracts.js";
 import {
   commitmentMemoryDisclosureLabel,
   imagePerceptionMemoryDisclosureLabel,
   openQuestionMemoryDisclosureLabel,
 } from "../memory/common/disclosure-serializers.js";
+import type { SourceStreamAudienceDisclosureResolver } from "../memory/common/index.js";
 import type { ImagePerceptionRepository, ImagePerceptionSearchHit } from "../attachments/index.js";
 import type { EmbeddingClient } from "../embeddings/index.js";
 import type { LLMClient } from "../llm/index.js";
@@ -40,10 +42,11 @@ import type { StreamEntry, StreamEntryIndexRepository } from "../stream/index.js
 import { NOOP_TRACER, type TurnTracer } from "../tracing/tracer.js";
 import { SystemClock, type Clock } from "../util/clock.js";
 import { mapWithConcurrency } from "../util/collections.js";
-import { StorageError } from "../util/errors.js";
+import { describeError, StorageError } from "../util/errors.js";
 import {
   DEFAULT_SESSION_ID,
   type AttachmentId,
+  type CommitmentId,
   type EntityId,
   type EpisodeId,
   type SessionId,
@@ -61,6 +64,7 @@ import {
   projectEpisodes,
   projectOpenQuestions,
   projectSemantic,
+  type EpisodeRecencyPrior,
   type EpisodeProjectionSource,
 } from "./evidence-projections.js";
 import { DEFAULT_MMR_LAMBDA } from "./mmr.js";
@@ -82,7 +86,14 @@ import {
   type RecallStateHandle,
   type RecallStateRepository,
 } from "./recall-state.js";
-import { DEFAULT_RECALL_EXPANSION_MODEL, expandRecall } from "./recall-expansion.js";
+import {
+  DEFAULT_RECALL_EXPANSION_SEMANTIC_VARIANT_COUNT,
+  DEFAULT_RECALL_EXPANSION_MODEL,
+  MAX_RECALL_QUERY_FOCUS_CHARS,
+  expandRecall,
+  type RecallQueryPlan,
+  type RecallQueryPlannerContext,
+} from "./recall-expansion.js";
 import type {
   EvidenceItem,
   EvidencePool,
@@ -143,12 +154,24 @@ export type {
 } from "./semantic-retrieval.js";
 
 export type RetrievalPipelineOptions = {
+  similarityConfig?: SimilarityConfigSource;
   embeddingClient: EmbeddingClient;
   llmClient?: LLMClient;
   recallExpansionModel?: string;
+  recallExpansionSemanticVariantCount?: number;
+  // Hard cap for the recall-expansion LLM call; on timeout recall proceeds
+  // without expansion via the existing degraded path. Unset or 0 disables it.
+  recallExpansionTimeoutMs?: number;
+  // IANA zone the recall planner resolves relative time references in (default UTC).
+  recallPlannerTimeZone?: string;
+  // Time attention weight applied when the planner's cue is the only time signal. Callers fix
+  // attentionWeights.time before the planner runs (zero without a cue), so the pipeline restores the
+  // configured weight for a planner-only cue; an explicit non-zero caller weight is kept.
+  plannerCueTimeWeight?: number;
   episodicRepository: EpisodicRepository;
   dataDir: string;
   entryIndex?: StreamEntryIndexRepository;
+  sourceStreamAudienceDisclosureResolver?: SourceStreamAudienceDisclosureResolver;
   semanticNodeRepository?: SemanticNodeRepository;
   semanticEdgeRepository?: Pick<SemanticEdgeRepository, "getEdge">;
   semanticGraph?: SemanticGraph;
@@ -179,7 +202,27 @@ export type RetrievalPipelineOptions = {
   lexicalFusionEnabled?: boolean;
 };
 
+// A retrieval subsystem that failed without failing the whole recall. The
+// tracer already records these, but an interactive caller (the memory
+// sidecar's /memory/recall) needs them inline so it can label a partial answer
+// rather than presenting it as a complete one — "no memories found" and "the
+// search itself broke" must not look identical to the consumer.
+export type RetrievalDegradation = {
+  subsystem: string;
+  reason: string;
+};
+
+// The time reference a retrieval pass acted on, reported once the plan is decided: the caller's
+// own cue, the planner's cue when the caller had none, or nothing. A caller without perception of
+// its own (the memory sidecar) uses it to apply the same period to what it does next.
+export type RecallPlanOutcome = {
+  temporalCue: TemporalCue | null;
+  temporalCueSource: "caller" | "planner" | null;
+};
+
 export type RetrievalSharedOptions = EpisodeCognitionRecallOptions & {
+  onDegraded?: (degradation: RetrievalDegradation) => void;
+  onRecallPlan?: (plan: RecallPlanOutcome) => void;
   rankingAudienceEntityId?: EntityId | null;
   mmrLambda?: number;
   scoreWeights?: ScoreWeights;
@@ -204,6 +247,9 @@ export type RetrievalSharedOptions = EpisodeCognitionRecallOptions & {
   audienceProfile?: SocialProfile | null;
   audienceTerms?: readonly string[];
   entityTerms?: readonly string[];
+  recallQueryPlannerContext?: RecallQueryPlannerContext;
+  semanticVariantCount?: number;
+  recencyPrior?: EpisodeRecencyPrior;
   currentTurnAttachmentIds?: readonly AttachmentId[];
   sessionId?: SessionId;
   turnCounter?: number;
@@ -215,22 +261,17 @@ export type CognitionRetrievalOptions = RetrievalSharedOptions & {
   recallContext: CognitionRecallContext;
   disclosureContext?: DisclosureContext;
   audienceEntityId?: never;
+  visibleAudienceEntityIds?: never;
   crossAudience?: never;
 };
 
 export type DisclosureRetrievalOptions = RetrievalSharedOptions &
-  Pick<EpisodeSearchOptions, "audienceEntityId" | "crossAudience"> & {
+  Pick<EpisodeSearchOptions, "audienceEntityId" | "visibleAudienceEntityIds" | "crossAudience"> & {
     disclosureContext?: DisclosureContext;
     recallContext?: never;
   };
 
 export type CognitionRecallSearchOptions = CognitionRetrievalOptions;
-
-/**
- * @deprecated Use DisclosureRetrievalOptions for disclosure reads or CognitionRetrievalOptions
- * for cognition recall.
- */
-export type RetrievalSearchOptions = DisclosureRetrievalOptions;
 
 type RetrievalExecutionOptions = CognitionRetrievalOptions | DisclosureRetrievalOptions;
 
@@ -269,14 +310,18 @@ type RetrievalProjection = "full" | "episodes-only";
 
 export type RetrievalGetEpisodeOptions = {
   audienceEntityId?: EntityId | null;
+  visibleAudienceEntityIds?: readonly EntityId[];
   crossAudience?: boolean;
 };
 
 type ExpansionOutcome = {
-  succeeded: boolean;
-  facetIntents: RecallIntent[];
+  plannerIntents: RecallIntent[];
   namedTerms: string[];
+  // Planner-resolved time reference; used only when the caller supplied no temporal cue.
+  temporalCue: TemporalCue | null;
 };
+
+type IntentQueryVectorMemo = Map<string, Promise<Float32Array>>;
 
 type EpisodeEvidenceCandidate = {
   intent: RecallIntent;
@@ -341,9 +386,6 @@ type WarmRecallCandidate = {
   stateHandle: RecallStateHandle;
 };
 
-// Tunes the minimum similarity for commitment evidence admission.
-const DEFAULT_COMMITMENT_EVIDENCE_SIMILARITY_THRESHOLD = 0.3;
-
 // Tunes concurrent fanout across independent retrieval intent searches.
 const RETRIEVAL_FANOUT_CONCURRENCY = 5;
 
@@ -405,6 +447,7 @@ export class RetrievalPipeline {
   private readonly decayOptions?: Omit<DecayOptions, "nowMs">;
   private readonly tracer: TurnTracer;
   private readonly lexicalFusionEnabled: boolean;
+  private readonly auxiliaryScoreScale: number;
 
   constructor(private readonly options: RetrievalPipelineOptions) {
     this.clock = options.clock ?? new SystemClock();
@@ -413,6 +456,9 @@ export class RetrievalPipeline {
     this.mmrLambda = options.mmrLambda ?? DEFAULT_MMR_LAMBDA;
     this.decayOptions = options.decayOptions;
     this.lexicalFusionEnabled = options.lexicalFusionEnabled ?? false;
+    this.auxiliaryScoreScale = similarityThresholds(
+      options.similarityConfig ?? { embedding: options.embeddingClient?.profile },
+    ).recallAuxiliaryScoreScale;
   }
 
   retrieveOpenQuestionsForQuery(
@@ -431,6 +477,7 @@ export class RetrievalPipeline {
       query,
       {
         ...options,
+        similarityConfig: this.options.similarityConfig,
         onDegraded:
           this.tracer.enabled && options.traceTurnId !== undefined
             ? (reason, error) => {
@@ -460,6 +507,20 @@ export class RetrievalPipeline {
     return this.searchWithContextInternal(query, options, "cognition");
   }
 
+  // External cognition consumes only episodes; keep Sol's full-context entry above unchanged.
+  async recallEpisodeHitsForCognition(
+    query: string,
+    options: CognitionRetrievalOptions,
+  ): Promise<RetrievedEpisode[]> {
+    const result = await this.searchWithContextInternal(
+      query,
+      options,
+      "cognition",
+      "episodes-only",
+    );
+    return result.episodes;
+  }
+
   // Episodes-only contract: callers get RetrievedEpisode[] and nothing else,
   // so the context lanes are skipped wholesale — see RetrievalProjection for
   // the proof and the accepted observable differences. This is the memory
@@ -477,18 +538,75 @@ export class RetrievalPipeline {
     return result.episodes;
   }
 
+  async searchEpisodesForDisclosureWithTimeRangeFallback(
+    query: string,
+    options: DisclosureRetrievalOptions & {
+      timeRange: { start: number; end: number };
+    },
+  ): Promise<{ episodes: RetrievedEpisode[]; timeRangeFallback: boolean }> {
+    const expansion = await this.tryExpandRecall(query, options);
+    const intentQueryVectors: IntentQueryVectorMemo = new Map();
+    const scoped = await this.searchWithContextInternal(
+      query,
+      { ...options, recordRetrieval: false },
+      "disclosure",
+      "episodes-only",
+      expansion,
+      intentQueryVectors,
+    );
+    const strictEpisodes = scoped.episodes.filter(
+      (result) =>
+        result.episode.start_time >= options.timeRange.start &&
+        result.episode.start_time <= options.timeRange.end,
+    );
+
+    if (strictEpisodes.length > 0) {
+      if (options.recordRetrieval !== false) {
+        const retrievedAt = this.clock.now();
+        for (const result of strictEpisodes) {
+          this.options.episodicRepository.recordRetrieval(
+            result.episode.id,
+            retrievedAt,
+            result.score,
+          );
+        }
+      }
+
+      return { episodes: strictEpisodes, timeRangeFallback: false };
+    }
+
+    // The unscoped fallback drops the range but keeps the asker's time signal in mind: the recency
+    // prior stays suppressed instead of re-tilting the fallback toward this week.
+    const { timeRange: _timeRange, recencyPrior: _recencyPrior, ...unscopedOptions } = options;
+    const fallback = await this.searchWithContextInternal(
+      query,
+      { ...unscopedOptions, strictTimeRange: false },
+      "disclosure",
+      "episodes-only",
+      expansion,
+      intentQueryVectors,
+    );
+
+    return { episodes: fallback.episodes, timeRangeFallback: true };
+  }
+
   private async searchWithContextInternal(
     query: string,
     options: RetrievalExecutionOptions,
     mode: RetrievalExecutionMode,
     projection: RetrievalProjection = "full",
+    expansionOverride?: ExpansionOutcome,
+    intentQueryVectorsOverride?: IntentQueryVectorMemo,
   ): Promise<RetrievedContext> {
     if (this.tracer.enabled && options.traceTurnId !== undefined) {
       this.tracer.emit("retrieval.started", {
         turnId: options.traceTurnId,
         session_id: options.sessionId,
-        query,
-        options: summarizeRetrievalOptions(options),
+        query_length: query.length,
+        ...(this.tracer.includePayloads
+          ? { query: query.slice(0, MAX_RECALL_QUERY_FOCUS_CHARS) }
+          : {}),
+        options: summarizeRetrievalOptions(options, this.tracer.includePayloads),
       });
     }
 
@@ -526,7 +644,25 @@ export class RetrievalPipeline {
       }
     }
 
-    const intents = await this.buildRecallIntents(query, options);
+    const intents = await this.buildRecallIntents(query, options, expansionOverride);
+    const timeSignalPresent =
+      options.timeRange !== undefined || intents.some((intent) => intent.kind === "time");
+    const plannerTimeWeightApplied =
+      intents.some((intent) => intent.kind === "time" && intent.source === "llm-expansion") &&
+      options.attentionWeights !== undefined &&
+      options.attentionWeights.time === 0 &&
+      this.options.plannerCueTimeWeight !== undefined &&
+      this.options.plannerCueTimeWeight > 0;
+    if (plannerTimeWeightApplied) {
+      options = {
+        ...options,
+        attentionWeights: {
+          ...options.attentionWeights!,
+          time: this.options.plannerCueTimeWeight!,
+        },
+      };
+    }
+    const intentQueryVectors = intentQueryVectorsOverride ?? new Map();
     const episodeCandidates = await this.collectEpisodicEvidenceCandidates(
       intents,
       options,
@@ -534,6 +670,7 @@ export class RetrievalPipeline {
       nowMs,
       limit,
       mode,
+      intentQueryVectors,
     );
     this.emitIntentCandidateTrace(intents, episodeCandidates, options);
     const citationResolver = this.createCitationResolver();
@@ -546,14 +683,19 @@ export class RetrievalPipeline {
     // through the pool/projections unchanged. See RetrievalProjection.
     const collectContextLanes = projection !== "episodes-only";
     const semanticRetrievals = collectContextLanes
-      ? await this.collectSemanticRetrievals(intents, options, mode)
+      ? await this.collectSemanticRetrievals(intents, options, mode, intentQueryVectors)
       : [];
     const semantic = mergeSemanticRetrievals(semanticRetrievals.map((item) => item.semantic));
     const openQuestions = collectContextLanes
       ? await this.collectOpenQuestions(intents, semantic, options)
       : [];
     const imagePerceptions = collectContextLanes
-      ? await this.collectImagePerceptionEvidenceWithDisclosureMode(intents, options, mode)
+      ? await this.collectImagePerceptionEvidenceWithDisclosureMode(
+          intents,
+          options,
+          mode,
+          intentQueryVectors,
+        )
       : [];
     const episodeEvidenceSources = episodeCandidates.map((item) => ({
       evidence: episodeCandidateToEvidence(item),
@@ -609,6 +751,17 @@ export class RetrievalPipeline {
       limit,
       mmrLambda: options.mmrLambda ?? this.mmrLambda,
       exactTermReservedSlots: this.lexicalFusionEnabled ? EXACT_TERM_RESERVED_SLOTS : 0,
+      // A time signal (caller or planner cue, or an explicit range) says the asker is pointing at a
+      // period; a "newer is better" prior would only fight that ordering.
+      ...(options.recencyPrior === undefined || timeSignalPresent
+        ? {}
+        : {
+            recencyPrior: {
+              ...options.recencyPrior,
+              weight: options.recencyPrior.weight * this.auxiliaryScoreScale,
+            },
+            nowMs,
+          }),
     });
     const semanticProjection = projectSemantic(evidencePool, toRetrievedSemantic(semantic));
     const openQuestionProjection = projectOpenQuestions(
@@ -657,6 +810,8 @@ export class RetrievalPipeline {
 
     if (this.tracer.enabled && options.traceTurnId !== undefined) {
       this.tracer.emit("retrieval.completed", {
+        recency_prior_applied: options.recencyPrior !== undefined && !timeSignalPresent,
+        planner_time_weight_applied: plannerTimeWeightApplied,
         turnId: options.traceTurnId,
         session_id: options.sessionId,
         episodeCount: context.episodes.length,
@@ -667,6 +822,26 @@ export class RetrievalPipeline {
     }
 
     return context;
+  }
+
+  private async resolveIntentQueryVector(
+    query: string,
+    memo: IntentQueryVectorMemo,
+  ): Promise<Float32Array> {
+    const existing = memo.get(query);
+
+    if (existing !== undefined) {
+      return await existing;
+    }
+
+    const pending = (async (): Promise<Float32Array> => {
+      return await this.options.embeddingClient.embed(query);
+    })();
+    // Keep rejected promises in the per-search memo as well. The collectors'
+    // existing per-intent settling still isolates the failure, while later
+    // collectors do not turn one failed query into repeated provider calls.
+    memo.set(query, pending);
+    return await pending;
   }
 
   private loadRecallStateContext(
@@ -725,6 +900,24 @@ export class RetrievalPipeline {
       context.turn,
       maxWarmEvidenceRendered,
     );
+    const warmCommitmentIds = new Set<CommitmentId>(
+      candidates.flatMap(({ handle }) =>
+        handle.source === "commitment" ? [handle.commitmentId] : [],
+      ),
+    );
+    const rawWarmCommitments =
+      warmCommitmentIds.size === 0 || this.options.commitmentRepository === undefined
+        ? []
+        : this.options.commitmentRepository
+            .list({ activeOnly: true, nowMs })
+            .filter((commitment) => warmCommitmentIds.has(commitment.id));
+    const warmCommitments =
+      this.options.sourceStreamAudienceDisclosureResolver?.resolve({
+        commitments: rawWarmCommitments,
+      }).commitments ?? rawWarmCommitments;
+    const warmCommitmentsById = new Map(
+      warmCommitments.map((commitment) => [commitment.id, commitment]),
+    );
 
     for (const { handle, stateHandle } of candidates) {
       const item = await this.rehydrateRecallHandle(
@@ -736,6 +929,7 @@ export class RetrievalPipeline {
         options,
         nowMs,
         mode,
+        warmCommitmentsById,
       );
 
       if (item !== null) {
@@ -756,6 +950,7 @@ export class RetrievalPipeline {
     options: RetrievalExecutionOptions,
     nowMs: number,
     mode: RetrievalExecutionMode,
+    warmCommitmentsById: ReadonlyMap<CommitmentId, CommitmentRecord>,
   ): Promise<EvidenceItem | null> {
     if (handle.source === "episode") {
       return this.rehydrateEpisodeHandle(handle, stateHandle, options, mode);
@@ -774,7 +969,7 @@ export class RetrievalPipeline {
     }
 
     if (handle.source === "commitment") {
-      return this.rehydrateCommitmentHandle(handle, stateHandle, nowMs);
+      return this.rehydrateCommitmentHandle(handle, stateHandle, warmCommitmentsById);
     }
 
     if (handle.source === "image_perception") {
@@ -1035,22 +1230,11 @@ export class RetrievalPipeline {
   private rehydrateCommitmentHandle(
     handle: Extract<RecallEvidenceHandle, { source: "commitment" }>,
     stateHandle: RecallStateHandle,
-    nowMs: number,
+    warmCommitmentsById: ReadonlyMap<CommitmentId, CommitmentRecord>,
   ): EvidenceItem | null {
-    const commitment = this.options.commitmentRepository?.get(handle.commitmentId);
+    const commitment = warmCommitmentsById.get(handle.commitmentId);
 
-    if (commitment === undefined || commitment === null) {
-      return null;
-    }
-
-    const activeVisible = this.options.commitmentRepository
-      ?.list({
-        activeOnly: true,
-        nowMs,
-      })
-      .some((item) => item.id === commitment.id);
-
-    if (activeVisible !== true) {
+    if (commitment === undefined) {
       return null;
     }
 
@@ -1247,6 +1431,7 @@ export class RetrievalPipeline {
   private async buildRecallIntents(
     query: string,
     options: RetrievalExecutionOptions,
+    expansionOverride?: ExpansionOutcome,
   ): Promise<RecallIntent[]> {
     const intents: RecallIntent[] = [
       {
@@ -1258,9 +1443,9 @@ export class RetrievalPipeline {
         source: "raw-user-message",
       },
     ];
-    const expansion = await this.tryExpandRecall(query, options);
+    const expansion = expansionOverride ?? (await this.tryExpandRecall(query, options));
 
-    intents.push(...expansion.facetIntents);
+    intents.push(...expansion.plannerIntents);
 
     const knownTerms = dedupeTermInputs([
       ...expansion.namedTerms.map((term) => ({ term, source: "llm-expansion" as const })),
@@ -1268,6 +1453,8 @@ export class RetrievalPipeline {
         term,
         source: "perception-entities" as const,
       })),
+      // Explicit audience handles also rescue cold memories outside the vector,
+      // recent and hot pools. Planner identity hints are separate from this API.
       ...(options.audienceTerms ?? []).map((term) => ({
         term,
         source: "audience-aliases" as const,
@@ -1285,20 +1472,41 @@ export class RetrievalPipeline {
       });
     }
 
-    const timeIntentRange = resolveTimeSignals(options).scoringRange;
-
+    // A caller-supplied cue (Sol's perception) wins; the planner's cue fills in when the caller
+    // had none, which is the sidecar's case.
+    const callerCue =
+      resolveTimeSignals({ temporalCue: options.temporalCue }).scoringRange === null
+        ? null
+        : (options.temporalCue ?? null);
+    const plannerCueWins =
+      options.timeRange === undefined && callerCue === null && expansion.temporalCue !== null;
+    const effectiveCue = callerCue ?? expansion.temporalCue;
+    // The cue this pass acts on. Under an explicit range the planner's cue is ignored, so only the
+    // caller's own cue counts there.
+    const actedCue = options.timeRange !== undefined ? callerCue : effectiveCue;
+    const timeIntentRange = resolveTimeSignals({
+      ...options,
+      temporalCue: effectiveCue,
+    }).scoringRange;
     if (timeIntentRange !== null) {
+      // Label and source follow the signal that supplied the bounds: an explicit range or the
+      // caller's cue is "temporal-cue"; only a planner-only cue is attributed to the planner.
+      const labelCue = actedCue;
       intents.push({
         id: "recall_time_0",
         kind: "time",
-        query: options.temporalCue?.label ?? "time range",
+        query: labelCue?.label ?? "time range",
         terms: [],
         timeRange: timeIntentRange,
         strictTime: options.strictTimeRange === true,
         priority: 70,
-        source: "temporal-cue",
+        source: plannerCueWins ? "llm-expansion" : "temporal-cue",
       });
     }
+    options.onRecallPlan?.({
+      temporalCue: actedCue,
+      temporalCueSource: actedCue === null ? null : callerCue !== null ? "caller" : "planner",
+    });
 
     intents.push({
       id: "recall_recent_0",
@@ -1318,55 +1526,137 @@ export class RetrievalPipeline {
   ): Promise<ExpansionOutcome> {
     if (this.options.llmClient === undefined) {
       return {
-        succeeded: false,
-        facetIntents: [],
+        plannerIntents: [],
         namedTerms: [],
+        temporalCue: null,
       };
     }
 
     try {
-      const expansion = await expandRecall({
-        llmClient: this.options.llmClient,
-        model: this.options.recallExpansionModel ?? DEFAULT_RECALL_EXPANSION_MODEL,
-        userMessage: query,
-        tracer: this.tracer,
-        turnId: options.traceTurnId,
-        sessionId: options.sessionId,
-      });
+      const expansion = await this.raceExpansionDeadline(
+        expandRecall({
+          llmClient: this.options.llmClient,
+          model: this.options.recallExpansionModel ?? DEFAULT_RECALL_EXPANSION_MODEL,
+          focus: query,
+          semanticVariantCount:
+            options.semanticVariantCount ??
+            this.options.recallExpansionSemanticVariantCount ??
+            DEFAULT_RECALL_EXPANSION_SEMANTIC_VARIANT_COUNT,
+          ...(options.recallQueryPlannerContext ?? {}),
+          identity: {
+            ...options.recallQueryPlannerContext?.identity,
+            entityTerms: dedupeStrings([
+              ...(options.recallQueryPlannerContext?.identity?.entityTerms ?? []),
+              ...(options.entityTerms ?? []),
+              ...(options.audienceTerms ?? []),
+            ]),
+          },
+          nowMs: this.clock.now(),
+          ...(this.options.recallPlannerTimeZone === undefined
+            ? {}
+            : { timeZone: this.options.recallPlannerTimeZone }),
+          timeoutMs: this.options.recallExpansionTimeoutMs,
+          tracer: this.tracer,
+          turnId: options.traceTurnId,
+          sessionId: options.sessionId,
+        }),
+      );
       const namedTerms = dedupeStrings(expansion.named_terms);
-      const facetIntents = expansion.facets.map((facet, index): RecallIntent => {
-        const kind: RecallIntentKind = facet.kind;
-
-        return {
-          id: `recall_${kind}_${index}`,
-          kind,
-          query: facet.query,
+      const semanticIntents = expansion.semantic_variants.map(
+        (variant, index): RecallIntent => ({
+          id: `recall_semantic_query_${index}`,
+          kind: "semantic_query",
+          query: variant.query,
           terms: [],
-          priority: 60 + facet.priority * 20,
+          priority: 85,
           source: "llm-expansion",
-        };
-      });
+        }),
+      );
+      const typedIntents = expansion.typed_queries.map(
+        (typed, index): RecallIntent => ({
+          id: `recall_${typed.kind}_${index}`,
+          kind: typed.kind,
+          query: typed.query,
+          terms: [],
+          priority: 60 + typed.priority * 20,
+          source: "llm-expansion",
+        }),
+      );
 
       return {
-        succeeded: true,
-        facetIntents,
+        plannerIntents: [...semanticIntents, ...typedIntents],
+        temporalCue: expansion.temporalCue,
         namedTerms,
       };
     } catch (error) {
-      if (this.tracer.enabled && options.traceTurnId !== undefined) {
-        this.tracer.emit("retrieval.degraded", {
-          turnId: options.traceTurnId,
-          session_id: options.sessionId,
-          subsystem: "recall_expansion",
-          reason: error instanceof Error ? error.message : String(error),
-        });
-      }
+      this.reportDegraded(options, {
+        subsystem: "recall_expansion",
+        reason: error instanceof Error ? error.message : String(error),
+      });
 
       return {
-        succeeded: false,
-        facetIntents: [],
+        plannerIntents: [],
         namedTerms: [],
+        temporalCue: null,
       };
+    }
+  }
+
+  // Record a subsystem that degraded without failing the recall: to the trace
+  // (for offline debugging) and to the caller (so an interactive consumer can
+  // label the partial answer). A throwing callback must not take down the
+  // recall it is only reporting on.
+  private reportDegraded(
+    options: RetrievalExecutionOptions,
+    degradation: RetrievalDegradation,
+  ): void {
+    if (this.tracer.enabled && options.traceTurnId !== undefined) {
+      this.tracer.emit("retrieval.degraded", {
+        turnId: options.traceTurnId,
+        session_id: options.sessionId,
+        subsystem: degradation.subsystem,
+        reason: degradation.reason,
+      });
+    }
+
+    try {
+      options.onDegraded?.(degradation);
+    } catch {
+      // Reporting is best-effort; the recall result still stands.
+    }
+  }
+
+  // The abort signal inside expandRecall is advisory: the SDK's retry backoff
+  // does not observe it, so a 429/5xx retry can keep the call pending past the
+  // deadline. This race is the hard cap; the losing call is left to settle on
+  // its own (its rejection is swallowed) and the caller's degraded path runs.
+  private async raceExpansionDeadline(
+    expansion: Promise<RecallQueryPlan>,
+  ): Promise<RecallQueryPlan> {
+    const timeoutMs = this.options.recallExpansionTimeoutMs;
+
+    if (timeoutMs === undefined || timeoutMs <= 0) {
+      return expansion;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    expansion.catch(() => undefined);
+
+    try {
+      return await Promise.race([
+        expansion,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`recall expansion exceeded ${timeoutMs}ms deadline`)),
+            timeoutMs,
+          );
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
     }
   }
 
@@ -1377,14 +1667,43 @@ export class RetrievalPipeline {
     nowMs: number,
     limit: number,
     mode: RetrievalExecutionMode,
+    intentQueryVectors: IntentQueryVectorMemo,
   ): Promise<EpisodeEvidenceCandidate[]> {
-    const rawCandidates = (
-      await Promise.all(
-        intents.map((intent) =>
-          this.collectEpisodicCandidatesForDisclosureModeIntent(intent, options, limit, mode),
+    // Per-intent lanes settle independently: a stalled query embedding kills
+    // the vector lanes for its own intent, but the lexical/indexed lanes of the
+    // other intents still hold usable candidates. Failing the whole recall
+    // there (Promise.all) turned an intermittent gateway stall into a total
+    // recall outage for the caller, so collect what survived and report the
+    // rest as a degradation.
+    const settled = await Promise.allSettled(
+      intents.map((intent) =>
+        this.collectEpisodicCandidatesForDisclosureModeIntent(
+          intent,
+          options,
+          limit,
+          mode,
+          intentQueryVectors,
         ),
+      ),
+    );
+    const rawCandidates = settled
+      .filter(
+        (outcome): outcome is PromiseFulfilledResult<RawEpisodeEvidenceCandidate[]> =>
+          outcome.status === "fulfilled",
       )
-    ).flat();
+      .flatMap((outcome) => outcome.value);
+    const failed = settled.filter(
+      (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
+    );
+
+    if (failed.length > 0) {
+      this.reportDegraded(options, {
+        subsystem: "episodic_candidates",
+        reason:
+          `${failed.length}/${settled.length} episodic intent lane(s) failed: ` +
+          describeError(failed[0]?.reason),
+      });
+    }
     const participantEntityIds = this.resolveParticipantEntityIds(
       rawCandidates,
       rankingAudienceEntityId(options),
@@ -1443,7 +1762,10 @@ export class RetrievalPipeline {
         })),
         ...(this.tracer.includePayloads
           ? {
-              intent_query: intent.query,
+              intent_query:
+                intent.kind === "raw_text"
+                  ? intent.query.slice(0, MAX_RECALL_QUERY_FOCUS_CHARS)
+                  : intent.query,
               matched_terms_by_candidate: candidates.map((candidate) => ({
                 episode_id: candidate.candidate.episode.id,
                 matched_terms: [...candidate.matchedTerms],
@@ -1463,13 +1785,14 @@ export class RetrievalPipeline {
     options: RetrievalExecutionOptions,
     limit: number,
     mode: RetrievalExecutionMode,
+    intentQueryVectors: IntentQueryVectorMemo,
   ): Promise<RawEpisodeEvidenceCandidate[]> {
     const vectorBudget = Math.max(limit * 2, 12);
     const indexedBudget = Math.max(limit * 2, 8);
     const recentBudget = Math.max(limit, 4);
 
-    if (intent.kind === "raw_text" || intent.kind === "topic" || intent.kind === "relationship") {
-      const intentVector = await this.options.embeddingClient.embed(intent.query);
+    if (intent.kind === "raw_text" || intent.kind === "semantic_query") {
+      const intentVector = await this.resolveIntentQueryVector(intent.query, intentQueryVectors);
       const candidates =
         mode === "cognition"
           ? await this.options.episodicRepository.recallByVectorForCognition(intentVector, {
@@ -1608,7 +1931,7 @@ export class RetrievalPipeline {
     );
     const exactBoost = entry.intent.kind === "known_term" ? KNOWN_TERM_INTENT_SCORE_BOOST : 0;
     const recencyBoost = entry.intent.kind === "recent" ? RECENT_INTENT_SCORE_BOOST : 0;
-    const rawScore = score.score + exactBoost + recencyBoost;
+    const rawScore = score.score + (exactBoost + recencyBoost) * this.auxiliaryScoreScale;
 
     return {
       ...score,
@@ -1621,6 +1944,7 @@ export class RetrievalPipeline {
     intents: readonly RecallIntent[],
     options: RetrievalExecutionOptions,
     mode: RetrievalExecutionMode,
+    intentQueryVectors: IntentQueryVectorMemo,
   ): Promise<SemanticEvidenceCandidate[]> {
     const relevantIntents = intents.filter((intent) => isSemanticIntentKind(intent.kind));
 
@@ -1629,7 +1953,10 @@ export class RetrievalPipeline {
       RETRIEVAL_FANOUT_CONCURRENCY,
       async (intent): Promise<SemanticEvidenceCandidate | null> => {
         try {
-          const intentVector = await this.options.embeddingClient.embed(intent.query);
+          const intentVector = await this.resolveIntentQueryVector(
+            intent.query,
+            intentQueryVectors,
+          );
           const resolveSemanticContextForMode =
             mode === "disclosure"
               ? resolveSemanticContextForDisclosure
@@ -1639,6 +1966,7 @@ export class RetrievalPipeline {
             {
               ...options,
               queryVector: intentVector,
+              similarityConfig: this.options.similarityConfig,
               exactTerms: intent.kind === "known_term" ? intent.terms : [],
               underReviewMultiplier:
                 options.underReviewMultiplier ?? this.options.semanticUnderReviewMultiplier,
@@ -1726,6 +2054,7 @@ export class RetrievalPipeline {
     intents: readonly RecallIntent[],
     options: RetrievalExecutionOptions,
     mode: RetrievalExecutionMode,
+    intentQueryVectors: IntentQueryVectorMemo,
   ): Promise<ImagePerceptionEvidenceCandidate[]> {
     if (this.options.imagePerceptionRepository === undefined) {
       return [];
@@ -1739,7 +2068,7 @@ export class RetrievalPipeline {
       RETRIEVAL_FANOUT_CONCURRENCY,
       async (intent): Promise<ImagePerceptionEvidenceCandidate[]> => {
         try {
-          const vector = await this.options.embeddingClient.embed(intent.query);
+          const vector = await this.resolveIntentQueryVector(intent.query, intentQueryVectors);
           const imageRecallLimit = Math.max(1, options.limit ?? 5);
           const imageRecallInput = {
             vector,
@@ -1812,10 +2141,14 @@ export class RetrievalPipeline {
       return [];
     }
 
-    const activeCommitments = this.options.commitmentRepository.list({
+    const rawActiveCommitments = this.options.commitmentRepository.list({
       activeOnly: true,
       nowMs: this.clock.now(),
     });
+    const activeCommitments =
+      this.options.sourceStreamAudienceDisclosureResolver?.resolve({
+        commitments: rawActiveCommitments,
+      }).commitments ?? rawActiveCommitments;
 
     if (activeCommitments.length === 0) {
       return [];
@@ -1836,7 +2169,9 @@ export class RetrievalPipeline {
     }
     const threshold =
       this.options.commitmentEvidenceSimilarityThreshold ??
-      DEFAULT_COMMITMENT_EVIDENCE_SIMILARITY_THRESHOLD;
+      similarityThresholds(
+        this.options.similarityConfig ?? { embedding: this.options.embeddingClient?.profile },
+      ).commitmentEvidence;
     const evidence: EvidenceItem[] = [];
 
     for (const [intentIndex, intent] of relevantIntents.entries()) {
@@ -1949,6 +2284,7 @@ export class RetrievalPipeline {
   private scoringDefaults(): EpisodeScoreDefaults {
     const defaults: EpisodeScoreDefaults = {
       scoreWeights: this.scoreWeights,
+      auxiliaryScoreScale: this.auxiliaryScoreScale,
     };
 
     if (this.decayOptions !== undefined) {
@@ -2005,7 +2341,10 @@ export class RetrievalPipeline {
   }
 }
 
-function summarizeRetrievalOptions(options: RetrievalExecutionOptions): JsonValue {
+function summarizeRetrievalOptions(
+  options: RetrievalExecutionOptions,
+  includePayloads: boolean,
+): JsonValue {
   return {
     limit: options.limit ?? null,
     strictTimeRange: options.strictTimeRange ?? false,
@@ -2016,7 +2355,10 @@ function summarizeRetrievalOptions(options: RetrievalExecutionOptions): JsonValu
     primaryGoalSelected: options.primaryGoalDescription !== undefined,
     activeValueCount: options.activeValues?.length ?? 0,
     audienceTermCount: options.audienceTerms?.length ?? 0,
-    entityTerms: options.entityTerms === undefined ? [] : [...options.entityTerms],
+    entityTermCount: options.entityTerms?.length ?? 0,
+    ...(includePayloads
+      ? { entityTerms: options.entityTerms === undefined ? [] : [...options.entityTerms] }
+      : {}),
     graphWalkDepth: options.graphWalkDepth ?? null,
     maxGraphNodes: options.maxGraphNodes ?? null,
     asOf: options.asOf ?? null,
@@ -2301,6 +2643,7 @@ function warmRecallScore(stateHandle: RecallStateHandle): number {
 function episodeVisibilityOptions(options: RetrievalExecutionOptions): EpisodeSearchOptions {
   return {
     audienceEntityId: options.audienceEntityId,
+    visibleAudienceEntityIds: options.visibleAudienceEntityIds,
     crossAudience: options.crossAudience,
   };
 }
@@ -2420,8 +2763,7 @@ function mergeRawEpisodeCandidates(
 function isSemanticIntentKind(kind: RecallIntentKind): boolean {
   return (
     kind === "raw_text" ||
-    kind === "topic" ||
-    kind === "relationship" ||
+    kind === "semantic_query" ||
     kind === "known_term" ||
     kind === "commitment" ||
     kind === "open_question"

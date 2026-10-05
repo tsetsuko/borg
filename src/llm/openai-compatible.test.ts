@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { OpenAICompatibleLLMClient, type OpenAIChatCompletionsClient } from "./openai-compatible.js";
+import {
+  OpenAICompatibleLLMClient,
+  type OpenAIChatCompletionsClient,
+} from "./openai-compatible.js";
 import { callStructuredTool, isStructuredToolCallError } from "./structured-tool-call.js";
 import type { LLMCompleteOptions, LLMConverseOptions, LLMToolDefinition } from "./index.js";
-import { ConfigError, LLMError } from "../util/errors.js";
+import { ConfigError, LLMError, LLMToolArgumentsError } from "../util/errors.js";
 
 type CapturedParams = Record<string, unknown>;
 
@@ -42,15 +45,17 @@ function completeOptions(overrides: Partial<LLMCompleteOptions> = {}): LLMComple
   };
 }
 
-function toolCallResponse(args: string) {
+function toolCallResponse(args: string, finishReason = "tool_calls") {
   return {
     choices: [
       {
         message: {
           content: null,
-          tool_calls: [{ id: "call_1", type: "function", function: { name: "EmitFacts", arguments: args } }],
+          tool_calls: [
+            { id: "call_1", type: "function", function: { name: "EmitFacts", arguments: args } },
+          ],
         },
-        finish_reason: "tool_calls",
+        finish_reason: finishReason,
       },
     ],
     usage: { prompt_tokens: 11, completion_tokens: 7 },
@@ -86,12 +91,18 @@ describe("OpenAICompatibleLLMClient", () => {
     expect(captured.tools).toEqual([
       {
         type: "function",
-        function: { name: "EmitFacts", description: "Emit extracted facts", parameters: TOOL.inputSchema },
+        function: {
+          name: "EmitFacts",
+          description: "Emit extracted facts",
+          parameters: TOOL.inputSchema,
+        },
       },
     ]);
 
     expect(result.stop_reason).toBe("tool_use");
-    expect(result.tool_calls).toEqual([{ id: "call_1", name: "EmitFacts", input: { facts: ["a", "b"] } }]);
+    expect(result.tool_calls).toEqual([
+      { id: "call_1", name: "EmitFacts", input: { facts: ["a", "b"] } },
+    ]);
     expect(result.input_tokens).toBe(11);
     expect(result.output_tokens).toBe(7);
   });
@@ -166,12 +177,42 @@ describe("OpenAICompatibleLLMClient", () => {
     expect(captured.max_tokens).toBe(16_384);
   });
 
-  it("throws LLMError on unparseable tool arguments (becomes llm_failed via callStructuredTool)", async () => {
+  it("throws LLMToolArgumentsError on unparseable tool arguments, carrying the stop reason", async () => {
+    let calls = 0;
     const client = new OpenAICompatibleLLMClient({
-      client: fakeClient(toolCallResponse("{not json")),
+      client: fakeClient(toolCallResponse("{not json"), () => {
+        calls += 1;
+      }),
     });
 
-    await expect(client.complete(completeOptions())).rejects.toBeInstanceOf(LLMError);
+    const direct = await client.complete(completeOptions()).catch((error: unknown) => error);
+
+    expect(direct).toBeInstanceOf(LLMError);
+    expect(direct).toBeInstanceOf(LLMToolArgumentsError);
+    expect((direct as LLMToolArgumentsError).code).toBe("LLM_TOOL_ARGUMENTS_UNPARSEABLE");
+    expect((direct as LLMToolArgumentsError).stopReason).toBe("tool_use");
+    expect((direct as LLMToolArgumentsError).message).toContain("stop_reason: tool_use");
+
+    calls = 0;
+    const failure = await callStructuredTool({
+      llmClient: client,
+      request: completeOptions(),
+      toolName: "EmitFacts",
+      parse: (input) => input,
+    }).catch((error: unknown) => error);
+
+    // A malformed (not cut-off) emission is re-issued once before giving up.
+    expect(isStructuredToolCallError(failure, "llm_failed")).toBe(true);
+    expect(calls).toBe(2);
+  });
+
+  it("does not retry tool arguments that were cut off by the output limit", async () => {
+    let calls = 0;
+    const client = new OpenAICompatibleLLMClient({
+      client: fakeClient(toolCallResponse('{"facts":[', "length"), () => {
+        calls += 1;
+      }),
+    });
 
     const failure = await callStructuredTool({
       llmClient: client,
@@ -181,6 +222,15 @@ describe("OpenAICompatibleLLMClient", () => {
     }).catch((error: unknown) => error);
 
     expect(isStructuredToolCallError(failure, "llm_failed")).toBe(true);
+    const cause = (failure as { cause?: LLMToolArgumentsError }).cause as LLMToolArgumentsError;
+    expect(cause).toBeInstanceOf(LLMToolArgumentsError);
+    expect(cause.stopReason).toBe("max_tokens");
+    // The provider billed the cut-off response; its usage and size travel on the error.
+    expect(cause.argumentsLength).toBe('{"facts":['.length);
+    expect(cause.usage).toEqual({ input_tokens: 11, output_tokens: 7 });
+    expect(cause.message).toContain("stop_reason: max_tokens, 10 chars");
+    expect((failure as { usage: unknown }).usage).toEqual({ input_tokens: 11, output_tokens: 7 });
+    expect(calls).toBe(1);
   });
 
   it("drives callStructuredTool end-to-end on a well-formed forced tool call", async () => {
@@ -207,7 +257,9 @@ describe("OpenAICompatibleLLMClient", () => {
       }),
     });
 
-    const result = await client.complete(completeOptions({ tools: undefined, tool_choice: undefined }));
+    const result = await client.complete(
+      completeOptions({ tools: undefined, tool_choice: undefined }),
+    );
     expect(result.text).toBe("hello");
     expect(result.stop_reason).toBe("end_turn");
     expect(result.tool_calls).toEqual([]);
@@ -223,7 +275,11 @@ describe("OpenAICompatibleLLMClient", () => {
               message: {
                 content: "done",
                 tool_calls: [
-                  { id: "c2", type: "function", function: { name: "EmitFacts", arguments: '{"facts":[]}' } },
+                  {
+                    id: "c2",
+                    type: "function",
+                    function: { name: "EmitFacts", arguments: '{"facts":[]}' },
+                  },
                 ],
               },
               finish_reason: "tool_calls",
@@ -259,7 +315,13 @@ describe("OpenAICompatibleLLMClient", () => {
       {
         role: "assistant",
         content: "calling",
-        tool_calls: [{ id: "c1", type: "function", function: { name: "EmitFacts", arguments: '{"facts":[]}' } }],
+        tool_calls: [
+          {
+            id: "c1",
+            type: "function",
+            function: { name: "EmitFacts", arguments: '{"facts":[]}' },
+          },
+        ],
       },
       { role: "tool", tool_call_id: "c1", content: "ok" },
     ]);
@@ -268,6 +330,28 @@ describe("OpenAICompatibleLLMClient", () => {
       { type: "text", text: "done" },
       { type: "tool_use", id: "c2", name: "EmitFacts", input: { facts: [] } },
     ]);
+  });
+
+  it("carries usage and argument length on unparseable converse tool arguments too", async () => {
+    const client = new OpenAICompatibleLLMClient({
+      client: fakeClient(toolCallResponse('{"facts":[', "length")),
+    });
+
+    const thrown = await client
+      .converse({
+        model: "qwen",
+        budget: "x",
+        messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      })
+      .catch((error: unknown) => error);
+
+    expect(thrown).toBeInstanceOf(LLMToolArgumentsError);
+    expect((thrown as LLMToolArgumentsError).stopReason).toBe("max_tokens");
+    expect((thrown as LLMToolArgumentsError).argumentsLength).toBe('{"facts":['.length);
+    expect((thrown as LLMToolArgumentsError).usage).toEqual({
+      input_tokens: 11,
+      output_tokens: 7,
+    });
   });
 
   it("rejects image_ref blocks in converse (no attachment resolver)", async () => {

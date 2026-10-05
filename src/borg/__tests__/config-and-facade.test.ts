@@ -25,16 +25,26 @@ import {
 } from "./test-helpers.js";
 import { DemoMessageConnector } from "../../outbound/index.js";
 import {
-  createEpisodeFixture,
-  createSemanticNodeFixture,
-} from "../../offline/test-support.js";
+  AUTONOMY_WAKE_STARTUP_INTERRUPTED_DETAIL,
+  AUTONOMY_WAKE_STARTUP_INTERRUPTED_GRACE_MS,
+  type AutonomyWakesRepository,
+} from "../../autonomy/index.js";
+import { createEpisodeFixture, createSemanticNodeFixture } from "../../offline/test-support.js";
 import { resolveMemoryDisclosureLabelForEpisodeIds } from "../../retrieval/index.js";
 import { createBorgFacades } from "../facade.js";
 import type { BorgDependencies } from "../types.js";
+import { createEntityId } from "../../util/ids.js";
+import type { StreamEntryIndexRepository } from "../../stream/index.js";
 
 type DisclosureBatchingInternals = {
   deps: {
     episodicRepository: EpisodicRepository;
+  };
+};
+
+type AutonomyWakeInternals = {
+  deps: {
+    autonomyWakesRepository: AutonomyWakesRepository;
   };
 };
 
@@ -84,7 +94,7 @@ describe("Borg", () => {
       cognition: "test-cognition",
     });
     expect(config.affective).toEqual(DEFAULT_CONFIG.affective);
-    expect(config.procedural).toEqual(DEFAULT_CONFIG.procedural);
+    expect(config.similarity).toEqual(DEFAULT_CONFIG.similarity);
     expect(config.retrieval).toEqual(DEFAULT_CONFIG.retrieval);
     expect(config.executive).toEqual(DEFAULT_CONFIG.executive);
     expect(config.host_capabilities).toBe(DEFAULT_CONFIG.host_capabilities);
@@ -422,6 +432,94 @@ describe("Borg", () => {
     }
   });
 
+  it("adds source-derived disclosure fields to goal and commitment facade collections", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-disclosure-facade-"));
+    tempDirs.push(tempDir);
+    const borg = await Borg.open({
+      dataDir: tempDir,
+      clock: new ManualClock(1_000),
+      embeddingDimensions: 4,
+      embeddingClient: new ScriptedEmbeddingClient(),
+      llmClient: new FakeLLMClient(),
+    });
+
+    try {
+      const historicalAudienceId = borg.entities.resolve("Historical operator thread", {
+        kind: "group",
+      });
+      const currentScopeId = borg.entities.resolve("Continuous room", { kind: "group" });
+      const sessionId = createSessionId();
+      borg.sessions.ensure({
+        session_id: sessionId,
+        source_type: "demo",
+        label: "Historical operator thread",
+        audience_label: "Historical operator thread",
+        audience_entity_id: historicalAudienceId,
+        conversation_kind: "demo",
+      });
+      const source = await borg.stream.append(
+        {
+          kind: "user_msg",
+          content: "historical source",
+          audience: "Historical operator thread",
+        },
+        { session: sessionId },
+      );
+      const commitment = borg.identity.addCommitment({
+        type: "boundary",
+        kind: "boundary",
+        directiveFamily: "historical_origin_facade",
+        directive: "Keep the original audience distinct from current scope.",
+        priority: 10,
+        restrictedAudience: currentScopeId,
+        provenance: { kind: "manual" },
+        sourceStreamEntryIds: [source.id],
+      });
+      const goal = borg.self.goals.add({
+        description: "Preserve historical audience provenance.",
+        priority: 8,
+        audienceEntityId: currentScopeId,
+        provenance: { kind: "manual" },
+        sourceStreamEntryIds: [source.id],
+      });
+      const entryIndex = borgInternals<{
+        deps: { entryIndex: StreamEntryIndexRepository };
+      }>(borg).deps.entryIndex;
+      const lookupMany = vi.spyOn(entryIndex, "lookupMany");
+
+      const listedCommitments = borg.commitments.list({ activeOnly: true });
+      expect(lookupMany).toHaveBeenCalledTimes(1);
+      lookupMany.mockClear();
+      const listedGoals = borg.self.goals.list({ status: "active" });
+      expect(lookupMany).toHaveBeenCalledTimes(1);
+
+      expect(commitment.disclosure_label).toMatchObject({
+        origin_audience_entity_ids: [historicalAudienceId],
+        private_to_entity_ids: [currentScopeId],
+      });
+      expect(listedCommitments.find((record) => record.id === commitment.id)).toMatchObject({
+        disclosure: expect.stringContaining(`origin_audience=${historicalAudienceId}`),
+        disclosure_label: {
+          origin_audience_entity_ids: [historicalAudienceId],
+          private_to_entity_ids: [currentScopeId],
+        },
+      });
+      expect(goal.disclosure_label).toMatchObject({
+        origin_audience_entity_ids: [historicalAudienceId],
+        private_to_entity_ids: [currentScopeId],
+      });
+      expect(listedGoals.find((record) => record.id === goal.id)).toMatchObject({
+        disclosure: expect.stringContaining(`origin_audience=${historicalAudienceId}`),
+        disclosure_label: {
+          origin_audience_entity_ids: [historicalAudienceId],
+          private_to_entity_ids: [currentScopeId],
+        },
+      });
+    } finally {
+      await borg.close();
+    }
+  });
+
   it("exposes read-only semantic edge lookup through the facade", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
     tempDirs.push(tempDir);
@@ -693,9 +791,7 @@ describe("Borg", () => {
         ],
       }),
     );
-    const getMany = vi.fn(
-      async (_episodeIds: readonly ReturnType<typeof createEpisodeId>[]) => [],
-    );
+    const getMany = vi.fn(async (_episodeIds: readonly ReturnType<typeof createEpisodeId>[]) => []);
     const facades = createBorgFacades({
       actionRepository: {},
       episodicRepository: { getMany },
@@ -746,6 +842,43 @@ describe("Borg", () => {
         },
       }),
     );
+  });
+
+  it("keeps facade social and attention defaults in cognition episodic recall", async () => {
+    const audience = createEntityId();
+    const searchEpisodesForDisclosure = vi.fn(async (_query: string, _options: unknown) => []);
+    const recallEpisodeHitsForCognition = vi.fn(async (_query: string, _options: unknown) => []);
+    const profile = { entity_id: audience };
+    const facades = createBorgFacades({
+      actionRepository: {},
+      config: DEFAULT_CONFIG,
+      entityRepository: { get: () => ({ canonical_name: "Alice", aliases: ["A"] }) },
+      socialRepository: { getProfile: () => profile },
+      retrievalPipeline: { searchEpisodesForDisclosure, recallEpisodeHitsForCognition },
+    } as unknown as BorgDependencies);
+    await facades.episodic.search("recall", { audienceEntityId: audience });
+    await facades.episodic.recallForCognition("recall", {
+      recallContext: {
+        reader: "self",
+        currentSessionId: createSessionId(),
+        currentAudienceEntityId: audience,
+        currentParticipantEntityIds: [audience],
+      },
+    });
+    const disclosureOptions = searchEpisodesForDisclosure.mock.calls[0]![1] as Record<
+      string,
+      unknown
+    >;
+    const cognitionOptions = recallEpisodeHitsForCognition.mock.calls[0]![1];
+    expect(cognitionOptions).toMatchObject({
+      audienceProfile: profile,
+      audienceTerms: ["Alice", "A"],
+      attentionWeights: disclosureOptions.attentionWeights,
+      rankingAudienceEntityId: audience,
+      strictTimeRange: disclosureOptions.strictTimeRange,
+    });
+    expect(cognitionOptions).not.toHaveProperty("audienceEntityId");
+    expect(cognitionOptions).not.toHaveProperty("visibleAudienceEntityIds");
   });
 
   it("lets a deployment override the attention weights from config", async () => {
@@ -989,21 +1122,82 @@ describe("Borg", () => {
     }
   });
 
+  it("reconciles only an aged orphaned autonomy wake when composing repositories", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    const clock = new ManualClock(1_000);
+    const openOptions = {
+      dataDir: tempDir,
+      clock,
+      embeddingDimensions: 4,
+      embeddingClient: new ScriptedEmbeddingClient(),
+      llmClient: new FakeLLMClient(),
+    };
+    const borg = await Borg.open(openOptions);
+    const wakes = borgInternals<AutonomyWakeInternals>(borg).deps.autonomyWakesRepository;
+    const orphan = wakes.record({
+      trigger_name: "scheduled_wake",
+      wake_source_type: "trigger",
+      source_category: "contemplative",
+    });
+    await borg.close();
+
+    const immediateReopen = await Borg.open(openOptions);
+
+    try {
+      const immediateWakes =
+        borgInternals<AutonomyWakeInternals>(immediateReopen).deps.autonomyWakesRepository;
+      expect(immediateWakes.listSince(0, 10)).toContainEqual(
+        expect.objectContaining({
+          id: orphan.id,
+          outcome: null,
+          outcome_detail: null,
+        }),
+      );
+    } finally {
+      await immediateReopen.close();
+    }
+
+    clock.advance(AUTONOMY_WAKE_STARTUP_INTERRUPTED_GRACE_MS + 1);
+    const agedReopen = await Borg.open(openOptions);
+
+    try {
+      const reopenedWakes =
+        borgInternals<AutonomyWakeInternals>(agedReopen).deps.autonomyWakesRepository;
+      expect(reopenedWakes.listSince(0, 10)).toContainEqual(
+        expect.objectContaining({
+          id: orphan.id,
+          outcome: "interrupted",
+          outcome_detail: AUTONOMY_WAKE_STARTUP_INTERRUPTED_DETAIL,
+        }),
+      );
+      expect(reopenedWakes.interruptOrphanedWakesAtStartup()).toBe(0);
+    } finally {
+      await agedReopen.close();
+    }
+  });
+
   it("closes opened resources if a later Borg.open step fails", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
     tempDirs.push(tempDir);
 
     const sqliteCloseSpy = vi.spyOn(SqliteDatabase.prototype, "close");
     const lanceCloseSpy = vi.spyOn(LanceDbStore.prototype, "close");
-    const failure = new Error("embedding init failed");
+    const failure = new Error("LLM init failed");
     const openOptions = {
       dataDir: tempDir,
+      embeddingDimensions: 4,
+      embeddingClient: new ScriptedEmbeddingClient(),
     } as {
       dataDir: string;
+      embeddingDimensions: number;
       embeddingClient?: ScriptedEmbeddingClient;
+      llmClient?: FakeLLMClient;
     };
 
-    Object.defineProperty(openOptions, "embeddingClient", {
+    // Embedding initialization now precedes storage for the profile guard;
+    // fail at the subsequent LLM composition step to exercise cleanup.
+    Object.defineProperty(openOptions, "llmClient", {
       get() {
         throw failure;
       },

@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 
+import { operatorAttentionPromptRow } from "../../../memory/operator-attention/disclosure.js";
+import { unknownMemoryDisclosureLabel } from "../../../memory/common/disclosure-label.js";
+import { HEADWAY_EMISSION_KINDS } from "../../../autonomy/index.js";
 import type { MoodHistoryEntry } from "../../../memory/affective/index.js";
 import type { CommitmentRecord } from "../../../memory/commitments/index.js";
 import type { SocialProfile } from "../../../memory/social/index.js";
@@ -45,7 +48,7 @@ import {
 } from "../../prompts/participation.js";
 import { PROMPT_KEYS, type PromptKey } from "../../prompts/registry.js";
 import type { OperatorSessionSnapshot } from "../../lifecycle/turn-phase/session-snapshot.js";
-import { buildCreatorDirectiveBriefingForTurn } from "../../lifecycle/turn-phase/retrieval-phase.js";
+import { buildCreatorDirectiveBriefing } from "../../lifecycle/turn-phase/retrieval-phase.js";
 import type { DeliberationContext } from "../types.js";
 import { memoryDisclosurePayloadFields } from "../../../memory/common/disclosure-serializers.js";
 import { formatAutonomyTriggerContext } from "../../autonomy-trigger.js";
@@ -249,6 +252,78 @@ function extractBlock(prompt: string, tag: string): string {
   expect(end).toBeGreaterThan(start);
 
   return prompt.slice(start, end + closeTag.length);
+}
+
+function makeSchedulerStateWithSources(): NonNullable<
+  NonNullable<DeliberationContext["turnMechanismEvidence"]>["autonomySchedulerState"]
+> {
+  return {
+    observedAt: NOW_MS,
+    enabled: true,
+    tickInFlight: false,
+    intervalMs: 60_000,
+    droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+    intervalArmedAt: NOW_MS - 3_600_000,
+    nextTickAt: NOW_MS + 60_000,
+    scheduledTickAt: NOW_MS + 60_000,
+    sources: [
+      {
+        name: "commitment_expiring",
+        type: "trigger",
+        category: "operational",
+        enabled: true,
+        next_due_at: NOW_MS + 900_000,
+      },
+      {
+        name: "executive_focus_due",
+        type: "trigger",
+        category: "operational",
+        enabled: true,
+        next_due_at: null,
+      },
+      {
+        name: "scheduled_wake",
+        type: "trigger",
+        category: "contemplative",
+        enabled: false,
+        next_due_at: null,
+      },
+      {
+        name: "mood_valence_drop",
+        type: "condition",
+        category: "operational",
+        enabled: true,
+      },
+    ],
+    fleetBrake: {
+      enabled: true,
+      empty_streak: 0,
+      empty_streak_threshold: 5,
+      streak_anchor_ts: null,
+      cooldown_until: null,
+      error_streak: 0,
+      error_streak_threshold: 3,
+      error_paused_until: null,
+      bypass_count: 0,
+      freshness_bypass_cap: 3,
+      window_outcomes: { headway: 0, silent: 0, error: 0, busy: 0, interrupted: 0 },
+      window_headway_reasons: { total: 0, without_detail: 0, reasons: [] },
+      window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+      window_error_span: null,
+      window_silent_span: null,
+      window_silent_reasons: { total: 0, without_detail: 0, reasons: [] },
+    },
+    budget: {
+      max_wakes_per_window: 6,
+      window_ms: 24 * 60 * 60_000,
+      window_started_at: NOW_MS - 24 * 60 * 60_000,
+      used_in_current_window: 1,
+      reserved_contemplative_wakes_per_window: 0,
+      contemplative_used_in_current_window: 0,
+      wakes_in_current_window_by_trigger: [],
+      next_budget_slot_frees_at: null,
+    },
+  };
 }
 
 function makeOperatorSessionSnapshot(
@@ -972,7 +1047,7 @@ describe("buildBaseSystemPrompt", () => {
         createdAt: 1_000,
       });
 
-      const briefing = buildCreatorDirectiveBriefingForTurn({
+      const briefing = buildCreatorDirectiveBriefing({
         applicable: repository.listApplicable({
           currentAudienceEntityId: audienceId,
           participantEntityIds: [audienceId],
@@ -1889,6 +1964,7 @@ describe("buildBaseSystemPrompt", () => {
 
   it("labels self-memory prompt blocks for executive focus, current period, and recent growth", () => {
     const goalAudienceId = createEntityId();
+    const counterpartyEntityId = createEntityId();
     const goal = {
       id: "goal_aaaaaaaaaaaaaaaa" as never,
       description: "Understand the continuity model",
@@ -1902,6 +1978,7 @@ describe("buildBaseSystemPrompt", () => {
       target_at: null,
       audience_entity_id: goalAudienceId,
       owner_entity_id: null,
+      counterparty_entity_id: counterpartyEntityId,
       source_stream_entry_ids: [createStreamEntryId()],
       provenance: { kind: "manual" },
     } as NonNullable<NonNullable<DeliberationContext["executiveFocus"]>["selected_goal"]>;
@@ -1991,7 +2068,13 @@ describe("buildBaseSystemPrompt", () => {
     const executiveBlock = extractBlock(prompt, "borg_executive_focus");
 
     expect(selfSnapshotBlock).toContain("Understand the continuity model");
+    expect(selfSnapshotBlock).toContain(`counterparty_entity_id=${counterpartyEntityId}`);
+    expect(selfSnapshotBlock).toContain(
+      "participant the responsibility runs toward; not owner or audience",
+    );
     expect(selfSnapshotBlock).toContain(`private-to=${goalAudienceId}`);
+    expect(selfSnapshotBlock).not.toContain(`private-to=${counterpartyEntityId}`);
+    expect(executiveBlock).toContain(`counterparty_entity_id=${counterpartyEntityId}`);
     expect(executiveBlock).toContain(
       `Focus identity: goal_id=${goal.id} label="Understand the continuity model"`,
     );
@@ -2163,7 +2246,7 @@ describe("buildBaseSystemPrompt", () => {
         score_basis: {
           score_context: "wake_time_trigger_selection" as const,
           deadline_lookahead_ms: 604_800_000,
-          progress_debt_stale_ms: 86_400_000,
+          progress_debt_stale_ms: 1_209_600_000,
         },
       },
     };
@@ -2173,7 +2256,7 @@ describe("buildBaseSystemPrompt", () => {
 
     expect(autonomyBlock).toContain("Wake-time trigger selection:");
     expect(autonomyBlock).toContain(
-      "Score basis: score_context=wake_time_trigger_selection deadline_lookahead_ms=604800000 progress_debt_stale_ms=86400000",
+      "Score basis: score_context=wake_time_trigger_selection deadline_lookahead_ms=604800000 progress_debt_stale_ms=1209600000",
     );
     expect(autonomyBlock.indexOf("Wake-time trigger selection:")).toBeLessThan(
       autonomyBlock.indexOf('"reason": "goal_stale"'),
@@ -2511,6 +2594,28 @@ describe("buildBaseSystemPrompt", () => {
     expect(block).toContain("Compare against the last clean release state");
   });
 
+  // `entities=` and `mood=` sit on one line under one provenance sentence, and
+  // that sentence used to say both were extracted from one text. Only the
+  // first is: the affective classifier is additionally handed the recency
+  // window (perception/gateway.ts -> memory/affective/extractor.ts), which on a
+  // self-audience session carries the being's own prior turns -- so the
+  // qualifier on the named window, "the sender's words, not mine", was false of
+  // the half it was attached to. Pin the correction and the retired claim
+  // together; the input asymmetry itself is pinned in perception.test.ts.
+  it("scopes the named working-state window to entities and names the mood classifier's recency input", () => {
+    const block = extractBlock(
+      buildBaseSystemPrompt(makeContext(), PROMPT_OPTIONS),
+      "borg_working_state",
+    );
+
+    expect(block).not.toContain("Both fields above were extracted this turn from one text");
+    expect(block).toContain(
+      "That text is the whole of what entities= was extracted from and only part of what mood= was scored against",
+    );
+    expect(block).toContain("up to the last ten recency strings for this session");
+    expect(block).toContain("this reading is not a function of the named text alone");
+  });
+
   it("renders active discourse stop state in trusted guidance", () => {
     const prompt = buildBaseSystemPrompt(
       makeContext({
@@ -2616,6 +2721,10 @@ describe("buildBaseSystemPrompt", () => {
               observedAt: NOW_MS,
               enabled: true,
               tickInFlight: false,
+              intervalMs: 60_000,
+              droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+              intervalArmedAt: NOW_MS - 3_600_000,
+              sources: [],
               nextTickAt: NOW_MS + 60_000,
               scheduledTickAt: NOW_MS + 60_000,
               fleetBrake: {
@@ -2629,8 +2738,18 @@ describe("buildBaseSystemPrompt", () => {
                 error_paused_until: null,
                 bypass_count: 0,
                 freshness_bypass_cap: 3,
-                window_outcomes: { headway: 0, silent: 0, error: 0, busy: 0 },
+                window_outcomes: {
+                  headway: 0,
+                  silent: 0,
+                  error: 0,
+                  busy: 0,
+                  interrupted: 0,
+                },
+                window_headway_reasons: { total: 0, without_detail: 0, reasons: [] },
                 window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+                window_error_span: null,
+                window_silent_span: null,
+                window_silent_reasons: { total: 0, without_detail: 0, reasons: [] },
               },
               budget: {
                 max_wakes_per_window: 6,
@@ -2650,6 +2769,7 @@ describe("buildBaseSystemPrompt", () => {
                       silent: 1,
                       error: 0,
                       busy: 0,
+                      interrupted: 0,
                     },
                   },
                   {
@@ -2662,6 +2782,7 @@ describe("buildBaseSystemPrompt", () => {
                       silent: 0,
                       error: 1,
                       busy: 0,
+                      interrupted: 0,
                     },
                   },
                 ],
@@ -2681,15 +2802,18 @@ describe("buildBaseSystemPrompt", () => {
         "Wake budget: used=5 / limit=6 / window=1h rolling, covering wakes stamped at or after 2023-11-14T21:13:20.000Z",
       );
       expect(block).toContain(
-        "trigger_name=scheduled_reflection wake_count=4 in_flight=1(fired 2023-11-14T21:28:20.000Z) outcome_counts(headway=2 silent=1 error=0 busy=0)",
+        "trigger_name=scheduled_reflection wake_count=4 in_flight=1(fired 2023-11-14T21:28:20.000Z) outcome_counts(headway=2 silent=1 error=0 busy=0 interrupted=0)",
       );
       // in_flight=0 prints bare: an empty stamp list has nothing to name, and a
       // count of zero cannot be mistaken for a row whose identity was withheld.
       expect(block).toContain(
-        "trigger_name=goal_followup_due wake_count=1 in_flight=0 outcome_counts(headway=0 silent=0 error=1 busy=0)",
+        "trigger_name=goal_followup_due wake_count=1 in_flight=0 outcome_counts(headway=0 silent=0 error=1 busy=0 interrupted=0)",
       );
+      // A stamp leaving the list is the ambiguous case rather than a close: the
+      // window's lower edge drops unresolved rows and resolved ones alike, so
+      // the disappearance is named as undetermined instead of read as an outcome.
       expect(block).toContain(
-        "The stamps are the only cross-read identity this block carries -- one repeating across two reads is a single row not moving, one that changes is a different wake -- and the counts alone cannot support that comparison at any number of reads.",
+        "The stamps support cross-read identity: one repeating across two reads is one row still open, one that changes is a different wake, and one that disappears either closed or left the window.",
       );
       expect(block).toContain("Next budget slot frees: 2023-11-14T22:43:20.000Z (in 30m).");
       expect(block).toContain(
@@ -2698,6 +2822,119 @@ describe("buildBaseSystemPrompt", () => {
     },
   );
 
+  it("renders the attention total, dates, filers and subjects beside wake rows on autonomous turns", () => {
+    const schedulerState = makeSchedulerStateWithSources();
+    const filer = createEntityId();
+    schedulerState.windowWakes = [];
+    schedulerState.operatorAttentionIndex = {
+      total: 125,
+      records: [
+        operatorAttentionPromptRow({
+          record_key: "new",
+          filed_at: NOW_MS,
+          filer_entity_id: filer,
+          subject: "件名 <handoff>",
+        }),
+        operatorAttentionPromptRow({
+          record_key: "old",
+          filed_at: NOW_MS - 1_000,
+          filer_entity_id: filer,
+          subject: null,
+          disclosure_label: unknownMemoryDisclosureLabel(),
+        }),
+      ],
+    };
+    const render = () =>
+      extractBlock(
+        buildBaseSystemPrompt(
+          makeContext({
+            turnOrigin: "autonomous",
+            turnMechanismEvidence: {
+              recentSuppressions: [],
+              recentRegenerations: [],
+              autonomySchedulerState: schedulerState,
+            },
+          }),
+          { ...PROMPT_OPTIONS, nowMs: NOW_MS },
+        ),
+        "borg_mechanism_evidence",
+      );
+    const block = render();
+    expect(block).toContain("Operator attention records: total=125; latest 2 shown, newest first.");
+    expect(block).toContain(
+      `2023-11-14T22:13:20.000Z | filer=${filer} | subject="件名 &lt;handoff&gt;"`,
+    );
+    expect(block).toContain(
+      `2023-11-14T22:13:19.000Z | filer=${filer} | subject=subject unavailable`,
+    );
+    expect(block).toContain("Wake rows in that current window, newest first: none.");
+    expect(block).toContain("These records do not gate action.");
+    const attentionRows = block.split("\n").filter((line) => line.includes("| subject="));
+    expect(attentionRows).toHaveLength(2);
+    expect(attentionRows[0]).toContain("disclosure_class=operator_private");
+    expect(attentionRows[1]).toContain("disclosure_class=unknown");
+    for (const row of attentionRows) {
+      expect(row).toContain(`origin_audience=${filer} private-to=unknown`);
+      expect(row).toContain("I can use this internally");
+    }
+    schedulerState.operatorAttentionIndex = { total: 0, records: [] };
+    expect(render()).toContain("Operator attention records: total=0; latest 0 shown");
+  });
+
+  it("renders per-wake finalizer and stall counts, their legend, and null-safe totals", () => {
+    const schedulerState = makeSchedulerStateWithSources();
+    schedulerState.windowWakes = [
+      {
+        ts: NOW_MS - 11 * 60_000,
+        trigger_name: "scheduled_reflection",
+        outcome: "headway",
+        headway_bases: ["continued private thought"],
+        finalizer_rounds: 3,
+        stall_retries: 2,
+      },
+      {
+        ts: NOW_MS - 20 * 60_000,
+        trigger_name: "goal_followup_due",
+        outcome: "silent",
+        headway_bases: null,
+        finalizer_rounds: null,
+        stall_retries: null,
+      },
+    ];
+    schedulerState.budget = {
+      ...schedulerState.budget,
+      used_in_current_window: 2,
+    };
+    const prompt = buildBaseSystemPrompt(
+      makeContext({
+        turnOrigin: "autonomous",
+        turnMechanismEvidence: {
+          recentSuppressions: [],
+          recentRegenerations: [],
+          autonomySchedulerState: schedulerState,
+        },
+      }),
+      { ...PROMPT_OPTIONS, nowMs: NOW_MS },
+    );
+    const block = extractBlock(prompt, "borg_mechanism_evidence");
+    const rows = block.split("\n").filter((line) => line.startsWith("- <wake "));
+
+    expect(rows[0]).toContain(
+      'tr="scheduled_reflection" o="headway" hb="continued private thought" fr="3" sr="2"',
+    );
+    expect(rows[1]).toContain('tr="goal_followup_due" o="silent"');
+    expect(rows[1]).not.toContain(" hb=");
+    expect(rows[1]).not.toContain(" fr=");
+    expect(rows[1]).not.toContain(" sr=");
+    expect(block).toContain("fr=finalizer rounds, sr=transport stall retries");
+    expect(block).toContain("fr or sr absent means not recorded or unknown");
+    expect(block).toContain("older rows, callers that omit counts");
+    expect(block).toContain("interrupted recording (including startup-interrupted rows)");
+    expect(block).toContain(
+      "Wake execution totals over those 2 row(s): fr=3 from 1/2 rows with fr recorded; sr=2 from 1/2 rows with sr recorded. Absent values are excluded, not counted as zero.",
+    );
+  });
+
   // `enabled` is the constructor flag and never a liveness fact, but the line
   // used to spend it as one ("Scheduler loop: running"). The two ways the loop
   // falls behind -- a tick still running, or the interval merely lagging --
@@ -2705,26 +2942,49 @@ describe("buildBaseSystemPrompt", () => {
   // the symptom and none of the cause. tickInFlight is the cause, and on an
   // autonomous turn it is true because the tick is building the turn, which the
   // render has to say or it becomes a field that is true whenever it is read.
+  //
+  // The refused-fire counts are the cost of that same in-flight state, and they
+  // are the only quantity here with no writer downstream: the interval callback
+  // early-returns without touching the wake repository, so a window in which
+  // every fire was refused and a window in which nothing was due leave the same
+  // (absent) trace in the budget and outcome tallies. The per-tick count also
+  // survives the blind spot above -- the flag is true by construction inside a
+  // tick, but how many fires that tick has already refused is not.
   it.each([
     {
       name: "config flag is not liveness",
       tickInFlight: false,
+      droppedIntervalFires: { since_interval_armed: 4, current_tick: null },
       turnOrigin: "user" as const,
-      expected: "not an observation that the loop is alive",
+      expected: [
+        "not an observation that the loop is alive",
+        "Interval fires refused because a tick was already running: 4 since the loop was last armed. A refused fire writes nothing anywhere, so the periods it covers are missing from the counts above rather than counted as quiet.",
+      ],
+      absent: "of them by the tick that was in flight",
     },
     {
       name: "stuck tick names itself on one read",
       tickInFlight: true,
+      droppedIntervalFires: { since_interval_armed: 121, current_tick: 117 },
       turnOrigin: "user" as const,
-      expected: "a stuck tick and not a lagging interval",
+      expected: [
+        "a stuck tick and not a lagging interval",
+        "Interval fires refused because a tick was already running: 121 since the loop was last armed, 117 of them by the tick that was in flight at that read.",
+      ],
+      absent: null,
     },
     {
       name: "autonomous turn names its own blind spot",
       tickInFlight: true,
+      droppedIntervalFires: { since_interval_armed: 42, current_tick: 9 },
       turnOrigin: "autonomous" as const,
-      expected: "true by construction on an autonomous turn and discriminates nothing here",
+      expected: [
+        "true by construction on an autonomous turn and discriminates nothing here; the refusal count that follows does, being a fact about how long that tick has held rather than about which turn is reading it.",
+        "Interval fires refused because a tick was already running: 42 since the loop was last armed, 9 of them by the tick that was in flight at that read.",
+      ],
+      absent: null,
     },
-  ])("$name", ({ tickInFlight, turnOrigin, expected }) => {
+  ])("$name", ({ tickInFlight, droppedIntervalFires, turnOrigin, expected, absent }) => {
     const block = extractBlock(
       buildBaseSystemPrompt(
         makeContext({
@@ -2736,6 +2996,10 @@ describe("buildBaseSystemPrompt", () => {
               observedAt: NOW_MS,
               enabled: true,
               tickInFlight,
+              intervalMs: 60_000,
+              droppedIntervalFires,
+              intervalArmedAt: NOW_MS - 3_600_000,
+              sources: [],
               nextTickAt: NOW_MS + 60_000,
               scheduledTickAt: NOW_MS + 60_000,
               fleetBrake: {
@@ -2749,8 +3013,18 @@ describe("buildBaseSystemPrompt", () => {
                 error_paused_until: null,
                 bypass_count: 0,
                 freshness_bypass_cap: 3,
-                window_outcomes: { headway: 0, silent: 0, error: 0, busy: 0 },
+                window_outcomes: {
+                  headway: 0,
+                  silent: 0,
+                  error: 0,
+                  busy: 0,
+                  interrupted: 0,
+                },
+                window_headway_reasons: { total: 0, without_detail: 0, reasons: [] },
                 window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+                window_error_span: null,
+                window_silent_span: null,
+                window_silent_reasons: { total: 0, without_detail: 0, reasons: [] },
               },
               budget: {
                 max_wakes_per_window: 6,
@@ -2773,16 +3047,373 @@ describe("buildBaseSystemPrompt", () => {
 
     expect(line).toContain("Scheduler loop: enabled in configuration");
     expect(line).not.toContain("Scheduler loop: running");
-    expect(line).toContain(expected);
+    for (const fragment of expected) {
+      expect(line).toContain(fragment);
+    }
+    if (absent !== null) {
+      expect(line).not.toContain(absent);
+    }
+    // The period travels with the stamps on every branch. Two scheduled stamps
+    // are only comparable against it: the anchor advances on tick entry, so the
+    // stamp moves in whole multiples while one handle stays armed, and the
+    // reader cannot tell a re-arm from a long tick without knowing the multiple.
+    expect(line).toContain(
+      "The scheduled stamp is the last tick entry plus the interval, which is 60000ms: while one handle stays armed it moves in whole multiples of that (plus timer drift), so a delta between two reads that is not a multiple means the handle was re-armed -- which needs the loop stopped and started again, since starting it while a handle exists does nothing.",
+    );
+    // The arming stamp is the direct form of the same question the grid clause
+    // above answers by arithmetic. The grid needs two reads, an unbroken series,
+    // and an off-grid residue larger than timer drift; the refusal count that
+    // precedes it cannot answer it at all, because a reset to zero and a counter
+    // that did not move are the same reading. The stamp is the epoch itself.
+    expect(line).toContain(
+      "The loop was last armed 2023-11-14T21:13:20.000Z: that stamp is the epoch this count resets against, so one repeating across two reads is a single armed handle and one that changes is a re-arm -- a comparison the count alone cannot support, since a reset is indistinguishable from not having moved.",
+    );
   });
 
-  // in_flight is the one wake state with no terminal write of its own: the
-  // bookkeeping catch around recordOutcome returns without recording anything,
-  // so an orphaned row stays NULL forever and wake_count still equals in_flight
-  // plus the outcome_counts. The count alone is therefore identity-free -- a
-  // permanent orphan and a healthy transient render as the same integer with the
-  // arithmetic closing either way -- and the fire stamps are what makes the two
-  // separable across reads.
+  // A resting brake has two causes and used to render one string. Below threshold
+  // and threshold-crossed-but-expired are a different number of failures from a
+  // refusal, and a reader who carries the first reading into the second is wrong
+  // about how close the next wake is to being refused. Both branches are asserted
+  // here rather than one, because the defect was that they were indistinguishable.
+  it("separates the two states a resting fleet brake renders", () => {
+    const brakeLine = (
+      brake: Partial<{
+        empty_streak: number;
+        cooldown_until: number | null;
+        error_streak: number;
+        error_paused_until: number | null;
+      }>,
+    ): string => {
+      const block = extractBlock(
+        buildBaseSystemPrompt(
+          makeContext({
+            turnOrigin: "user",
+            turnMechanismEvidence: {
+              recentSuppressions: [],
+              recentRegenerations: [],
+              autonomySchedulerState: {
+                observedAt: NOW_MS,
+                enabled: true,
+                tickInFlight: false,
+                intervalMs: 60_000,
+                droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+                intervalArmedAt: NOW_MS - 3_600_000,
+                sources: [],
+                nextTickAt: NOW_MS + 60_000,
+                scheduledTickAt: NOW_MS + 60_000,
+                fleetBrake: {
+                  enabled: true,
+                  empty_streak: 0,
+                  empty_streak_threshold: 5,
+                  streak_anchor_ts: null,
+                  cooldown_until: null,
+                  error_streak: 0,
+                  error_streak_threshold: 3,
+                  error_paused_until: null,
+                  bypass_count: 0,
+                  freshness_bypass_cap: 3,
+                  window_outcomes: { headway: 0, silent: 0, error: 0, busy: 0, interrupted: 0 },
+                  window_headway_reasons: { total: 0, without_detail: 0, reasons: [] },
+                  window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+                  window_error_span: null,
+                  window_silent_span: null,
+                  window_silent_reasons: { total: 0, without_detail: 0, reasons: [] },
+                  ...brake,
+                },
+                budget: {
+                  max_wakes_per_window: 6,
+                  window_ms: 60 * 60_000,
+                  window_started_at: NOW_MS - 60 * 60_000,
+                  used_in_current_window: 1,
+                  reserved_contemplative_wakes_per_window: 0,
+                  contemplative_used_in_current_window: 0,
+                  wakes_in_current_window_by_trigger: [],
+                  next_budget_slot_frees_at: NOW_MS + 30 * 60_000,
+                },
+              },
+            },
+          }),
+          { ...PROMPT_OPTIONS, nowMs: NOW_MS },
+        ),
+        "borg_mechanism_evidence",
+      );
+      return block.split("\n").find((entry) => entry.startsWith("Fleet brake")) ?? "";
+    };
+
+    const belowThreshold = brakeLine({});
+    const expiredPause = brakeLine({
+      error_streak: 3,
+      error_paused_until: NOW_MS - 30 * 60_000,
+    });
+
+    expect(belowThreshold).toContain("not currently holding");
+    expect(expiredPause).toContain("not currently holding");
+    // The whole point: the phrase is shared and the rest of the line is not.
+    expect(belowThreshold).not.toEqual(expiredPause);
+    expect(belowThreshold).toContain("no error-streak pause is set, the streak behind it");
+    expect(belowThreshold).not.toContain("ran out");
+    expect(expiredPause).toContain("the error-streak pause it opened ran out");
+    expect(expiredPause).toContain("still at 3/3");
+    expect(expiredPause).toContain("re-anchors that pause rather than starting the streak over");
+    for (const line of [belowThreshold, expiredPause]) {
+      expect(line).toContain(
+        "Not holding is two states, not one: a streak below its threshold, and a threshold already crossed whose pause has expired",
+      );
+    }
+
+    const holding = brakeLine({
+      error_streak: 3,
+      error_paused_until: NOW_MS + 30 * 60_000,
+    });
+    expect(holding).toContain("holding -- error-streak pause until");
+    expect(holding).not.toContain("Not holding is two states");
+  });
+
+  // The only prospective field the scheduler produces. Everything else on the
+  // block is retrospective or about the loop's own health, so nothing else there
+  // supports a claim about the next wake that could turn out wrong. Rendering it
+  // also empties the dropped-field list, which flips the boundary clause to its
+  // no-gap branch -- the branch existed and had never been reachable.
+  it("renders each wake source's arming state and the ways its due stamp misleads", () => {
+    const block = extractBlock(
+      buildBaseSystemPrompt(
+        makeContext({
+          turnOrigin: "user",
+          turnMechanismEvidence: {
+            recentSuppressions: [],
+            recentRegenerations: [],
+            autonomySchedulerState: makeSchedulerStateWithSources(),
+          },
+        }),
+        { ...PROMPT_OPTIONS, nowMs: NOW_MS },
+      ),
+      "borg_mechanism_evidence",
+    );
+
+    expect(block).toContain(
+      "Wake sources held by that scheduler, with each trigger's own next-due stamp as of that read. This is the forward view; the wakes-by-trigger counts above are the same names counted backwards.",
+    );
+    expect(block).toContain(
+      "- name=commitment_expiring type=trigger category=operational registered=true next_due_at=2023-11-14T22:28:20.000Z (",
+    );
+    expect(block).toContain(
+      "- name=executive_focus_due type=trigger category=operational registered=true next_due_at=none",
+    );
+    expect(block).toContain(
+      "- name=scheduled_wake type=trigger category=contemplative registered=false next_due_at=none",
+    );
+    // Conditions have no such field on the description at all. The line stops
+    // rather than printing a null, so the absence reads as the field not
+    // existing rather than as nothing being due.
+    expect(block).toContain(
+      "- name=mood_valence_drop type=condition category=operational registered=true\n",
+    );
+    expect(block).not.toContain(
+      "name=mood_valence_drop type=condition category=operational registered=true next_due_at",
+    );
+    // The floor is next_tick_at's in shape and not in clock. describe() reads
+    // once for the header, then awaits each source in list order, and every
+    // nextDueAt() reads clock.now() itself -- so a floored stamp lands at or
+    // after the printed read by the scan cost up to its row, and the gap between
+    // two floored stamps measures the traversal rather than the schedule. Read as
+    // "equal to the read means already due", a page where nothing is equal to
+    // the read says nothing is due.
+    expect(block).toContain(
+      "next_due_at is that source's own earliest eligibility, floored the way next_tick_at is -- but to a clock the trigger reads inside its own call, as the scan reaches its row in the order printed, not to the read stamp above.",
+    );
+    // Both bounds, because the copy has now been wrong at each end: the floor is
+    // at-or-after, and the scan cost is routinely under the millisecond the
+    // stamps print to, so equality happens and had to stop being denied.
+    expect(block).toContain(
+      "prints a stamp at or after that read and never before it -- equal to it when the scan reaches its row inside the same millisecond, later when it does not",
+    );
+    // The span between two floored stamps is the earlier row's own scan plus
+    // everything the loop did between them, which on the live list includes a
+    // trigger whose stamp is genuinely future and therefore not comparable to
+    // either. The earlier row's term is the one that dominates: its read is the
+    // first statement of its own call, so its whole scan is charged after its
+    // stamp.
+    expect(block).toContain(
+      "the earlier row's own scan plus everything between their rows, including rows whose own stamp is null or genuinely future, rather than which of them is due first",
+    );
+    // The wording that carried the traversal but not the row emitting it,
+    // pinned because it makes an adjacent 13ms gap and a 1ms gap spanning a
+    // third row read as contradictory.
+    expect(block).not.toContain("the scan cost of everything between their rows");
+    // The narrower wording this replaced, pinned because it read as an
+    // enumeration and left out the case that actually sits in the span: a row
+    // publishing a genuinely future stamp is publishing a stamp, so "rows that
+    // publish no stamp of their own" excludes scheduled_wake -- the row between
+    // the two triggers whose 1ms gap a reader on the live list would measure.
+    expect(block).not.toContain("rows that publish no stamp of their own");
+    expect(block).not.toContain("floored to the read clock exactly as next_tick_at is");
+    // The overclaim that replaced it, pinned the same way: a page where the scan
+    // reaches its first flooring row inside the read's own millisecond -- the
+    // majority of live reads -- falsifies it outright.
+    expect(block).not.toContain("slightly after that read rather than equal to it");
+    // The reading that costs nothing to make and is wrong in the flattering
+    // direction: a null read as a prediction of quiet.
+    expect(block).toContain(
+      "next_due_at=none does not mean nothing is due from that source. It means the source published no stamp",
+    );
+    expect(block).toContain(
+      "A none is therefore consistent with that source firing on the very next tick.",
+    );
+    // Carrying the field empties the dropped list, so the block's own statement
+    // of its gap flips to the no-gap branch rather than falling silent.
+    expect(block).toContain(
+      "Every field the scheduler's read produces is rendered somewhere below, so this block and that read differ by nothing.",
+    );
+    // Retracted wording, pinned so it cannot return under a rewrite: the block
+    // said this list was the one thing it did not carry.
+    expect(block).not.toContain("except its per-source list");
+    expect(block).not.toContain(
+      "That is the whole difference between this block and the read it names",
+    );
+  });
+
+  // A ceiling on the wake-source section, because it did not have one. Every
+  // clarification here has been paid for out of a block with no size pin, so
+  // growth is only ever noticed by the reader whose page it lands on, after it
+  // has landed. This is the whole rendered section at its widest input -- every
+  // source registered, every stamp present -- so a later sentence has to be
+  // argued for against a number instead of added into slack nobody is counting.
+  // Raise it deliberately when a clarification is worth the width; do not raise
+  // it to make a red test green.
+  //
+  // Raised once, 2_200 -> 2_360, for the at-or-after correction and the span
+  // clause: the sentence it replaced said an already-due source prints "slightly
+  // after that read rather than equal to it", and 38 of the 69 distinct
+  // scheduler reads in the 2026-08-31 -> 2026-09-02 traces print exactly equal.
+  // The width bought a clause that is false on the majority of live pages being
+  // deleted, which is the case the "argue for it against a number" rule was for.
+  const WAKE_SOURCE_SECTION_CHAR_CEILING = 2_360;
+
+  it("keeps the wake-source section under a stated width", () => {
+    const block = extractBlock(
+      buildBaseSystemPrompt(
+        makeContext({
+          turnOrigin: "user",
+          turnMechanismEvidence: {
+            recentSuppressions: [],
+            recentRegenerations: [],
+            autonomySchedulerState: makeSchedulerStateWithSources(),
+          },
+        }),
+        { ...PROMPT_OPTIONS, nowMs: NOW_MS },
+      ),
+      "borg_mechanism_evidence",
+    );
+    const start = block.indexOf("Wake sources held by that scheduler");
+    const end = block.indexOf(
+      "registered says the source was built into this scheduler, not that it is otherwise unblocked.",
+    );
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+
+    const section = block.slice(start, end + 94);
+
+    expect(section.length).toBeLessThanOrEqual(WAKE_SOURCE_SECTION_CHAR_CEILING);
+  });
+
+  // Every countdown on this block hangs on a stamp taken at the read and is
+  // measured against the header clock. Six more of them arrive with the source
+  // list, and stating the basis once beats repeating it per line.
+  it("names which clock the per-source countdowns are measured from when the read is stale", () => {
+    const block = extractBlock(
+      buildBaseSystemPrompt(
+        makeContext({
+          turnOrigin: "user",
+          turnMechanismEvidence: {
+            recentSuppressions: [],
+            recentRegenerations: [],
+            autonomySchedulerState: makeSchedulerStateWithSources(),
+          },
+        }),
+        { ...PROMPT_OPTIONS, nowMs: NOW_MS + 4_000 },
+      ),
+      "borg_mechanism_evidence",
+    );
+
+    expect(block).toContain(
+      "The parenthesised countdowns are measured from the current_time_ms at the top of this prompt, 4000ms after the read, so like the other countdowns here they read shorter than the wait as of the read.",
+    );
+  });
+
+  // Null under the same condition as the tick stamps: with no handle there is no
+  // epoch to name, and an armed stamp beside "no next tick scheduled" would be a
+  // fossil of the previous arming read as current state.
+  it("omits the arming stamp when no interval handle is armed", () => {
+    const block = extractBlock(
+      buildBaseSystemPrompt(
+        makeContext({
+          turnOrigin: "user",
+          turnMechanismEvidence: {
+            recentSuppressions: [],
+            recentRegenerations: [],
+            autonomySchedulerState: {
+              observedAt: NOW_MS,
+              enabled: true,
+              tickInFlight: false,
+              intervalMs: 60_000,
+              droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+              intervalArmedAt: null,
+              sources: [],
+              nextTickAt: null,
+              scheduledTickAt: null,
+              fleetBrake: {
+                enabled: true,
+                empty_streak: 0,
+                empty_streak_threshold: 5,
+                streak_anchor_ts: null,
+                cooldown_until: null,
+                error_streak: 0,
+                error_streak_threshold: 3,
+                error_paused_until: null,
+                bypass_count: 0,
+                freshness_bypass_cap: 3,
+                window_outcomes: {
+                  headway: 0,
+                  silent: 0,
+                  error: 0,
+                  busy: 0,
+                  interrupted: 0,
+                },
+                window_headway_reasons: { total: 0, without_detail: 0, reasons: [] },
+                window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+                window_error_span: null,
+                window_silent_span: null,
+                window_silent_reasons: { total: 0, without_detail: 0, reasons: [] },
+              },
+              budget: {
+                max_wakes_per_window: 15,
+                window_ms: 24 * 60 * 60_000,
+                window_started_at: NOW_MS - 24 * 60 * 60_000,
+                used_in_current_window: 0,
+                reserved_contemplative_wakes_per_window: 1,
+                contemplative_used_in_current_window: 0,
+                wakes_in_current_window_by_trigger: [],
+                next_budget_slot_frees_at: null,
+              },
+            },
+          },
+        }),
+        { ...PROMPT_OPTIONS, nowMs: NOW_MS },
+      ),
+      "borg_mechanism_evidence",
+    );
+    const line = block.split("\n").find((entry) => entry.startsWith("Scheduler loop:")) ?? "";
+
+    expect(line).toContain("no next tick scheduled");
+    expect(line).toContain("Interval fires refused because a tick was already running:");
+    expect(line).not.toContain("The loop was last armed");
+  });
+
+  // in_flight is the pre-terminal state between the fire stamp and its outcome.
+  // The count alone is identity-free, so fire stamps support comparison across
+  // reads; bookkeeping failures and process restarts now explicitly close rows
+  // as interrupted.
   it("names the in-flight rows by fire stamp, oldest first, and names what the cap dropped", () => {
     const block = extractBlock(
       buildBaseSystemPrompt(
@@ -2795,6 +3426,10 @@ describe("buildBaseSystemPrompt", () => {
               observedAt: NOW_MS,
               enabled: true,
               tickInFlight: false,
+              intervalMs: 60_000,
+              droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+              intervalArmedAt: NOW_MS - 3_600_000,
+              sources: [],
               nextTickAt: NOW_MS + 60_000,
               scheduledTickAt: NOW_MS + 60_000,
               fleetBrake: {
@@ -2808,8 +3443,18 @@ describe("buildBaseSystemPrompt", () => {
                 error_paused_until: null,
                 bypass_count: 0,
                 freshness_bypass_cap: 3,
-                window_outcomes: { headway: 0, silent: 0, error: 0, busy: 0 },
+                window_outcomes: {
+                  headway: 0,
+                  silent: 0,
+                  error: 0,
+                  busy: 0,
+                  interrupted: 0,
+                },
+                window_headway_reasons: { total: 0, without_detail: 0, reasons: [] },
                 window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+                window_error_span: null,
+                window_silent_span: null,
+                window_silent_reasons: { total: 0, without_detail: 0, reasons: [] },
               },
               budget: {
                 max_wakes_per_window: 15,
@@ -2830,7 +3475,13 @@ describe("buildBaseSystemPrompt", () => {
                       NOW_MS - 60 * 60_000,
                       NOW_MS - 30 * 60_000,
                     ],
-                    outcome_counts: { headway: 0, silent: 0, error: 0, busy: 0 },
+                    outcome_counts: {
+                      headway: 0,
+                      silent: 0,
+                      error: 0,
+                      busy: 0,
+                      interrupted: 0,
+                    },
                   },
                 ],
                 next_budget_slot_frees_at: null,
@@ -2843,16 +3494,18 @@ describe("buildBaseSystemPrompt", () => {
       "borg_mechanism_evidence",
     );
 
-    // The three oldest print because a row whose outcome write was skipped only
-    // sinks further toward the head as newer wakes resolve past it. The residue
-    // is named rather than truncated away, so the printed list is never readable
-    // as the whole population.
+    // The three oldest print and the residue is named, so the printed list is
+    // never readable as the whole population.
     expect(block).toContain(
-      "trigger_name=goal_followup_due wake_count=5 in_flight=5(fired 2023-11-14T18:13:20.000Z, 2023-11-14T19:13:20.000Z, 2023-11-14T20:13:20.000Z, 2 newer not listed) outcome_counts(headway=0 silent=0 error=0 busy=0)",
+      "trigger_name=goal_followup_due wake_count=5 in_flight=5(fired 2023-11-14T18:13:20.000Z, 2023-11-14T19:13:20.000Z, 2023-11-14T20:13:20.000Z, 2 newer not listed) outcome_counts(headway=0 silent=0 error=0 busy=0 interrupted=0)",
     );
     expect(block).toContain(
-      "Nothing times that state out: if the outcome write is skipped the row stays in_flight permanently, and wake_count still equals in_flight plus the outcome_counts, so the arithmetic closing here is not evidence the row is live.",
+      "A normal completion records headway, silent, error, or busy; a post-turn bookkeeping failure records interrupted, and startup reconciliation records any NULL row left by a prior process as interrupted.",
     );
+    expect(block).toContain(
+      "A non-zero in_flight count can therefore be a healthy turn currently running.",
+    );
+    expect(block).not.toContain("Nothing resolves that state");
   });
 
   // observedAt is NOW_MS - 29_000, so the render clock is 29s past the scheduler read. Each case
@@ -2904,6 +3557,10 @@ describe("buildBaseSystemPrompt", () => {
               observedAt,
               enabled: true,
               tickInFlight: false,
+              intervalMs: 60_000,
+              droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+              intervalArmedAt: NOW_MS - 3_600_000,
+              sources: [],
               nextTickAt,
               scheduledTickAt,
               fleetBrake: {
@@ -2917,8 +3574,18 @@ describe("buildBaseSystemPrompt", () => {
                 error_paused_until: null,
                 bypass_count: 0,
                 freshness_bypass_cap: 3,
-                window_outcomes: { headway: 0, silent: 0, error: 0, busy: 0 },
+                window_outcomes: {
+                  headway: 0,
+                  silent: 0,
+                  error: 0,
+                  busy: 0,
+                  interrupted: 0,
+                },
+                window_headway_reasons: { total: 0, without_detail: 0, reasons: [] },
                 window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+                window_error_span: null,
+                window_silent_span: null,
+                window_silent_reasons: { total: 0, without_detail: 0, reasons: [] },
               },
               budget: {
                 max_wakes_per_window: 6,
@@ -2974,7 +3641,9 @@ describe("buildBaseSystemPrompt", () => {
         expect(againstHeader).toBeNull();
         const readIso = /Read at (\S+?), \d+ms before the current_time_ms/.exec(block)?.[1];
         expect(readIso).toBe(new Date(observedAt).toISOString());
-        expect(block).toContain(`reports ${readIso}, which is the read clock, not a scheduled time`);
+        expect(block).toContain(
+          `reports ${readIso}, which is the read clock, not a scheduled time`,
+        );
         const overdue = /next tick was due (\S+?), (\d+)ms before that read/.exec(block);
         expect(Date.parse(readIso ?? "") - Date.parse(overdue?.[1] ?? "")).toBe(
           Number(overdue?.[2] ?? Number.NaN),
@@ -3007,6 +3676,10 @@ describe("buildBaseSystemPrompt", () => {
             observedAt,
             enabled: true,
             tickInFlight: false,
+            intervalMs: 60_000,
+            droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+            intervalArmedAt: NOW_MS - 3_600_000,
+            sources: [],
             nextTickAt: NOW_MS + 60_000,
             scheduledTickAt: NOW_MS + 60_000,
             fleetBrake: {
@@ -3020,8 +3693,18 @@ describe("buildBaseSystemPrompt", () => {
               error_paused_until: null,
               bypass_count: 0,
               freshness_bypass_cap: 3,
-              window_outcomes: { headway: 0, silent: 5, error: 0, busy: 0 },
+              window_outcomes: {
+                headway: 0,
+                silent: 5,
+                error: 0,
+                busy: 0,
+                interrupted: 0,
+              },
+              window_headway_reasons: { total: 0, without_detail: 0, reasons: [] },
               window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+              window_error_span: null,
+              window_silent_span: null,
+              window_silent_reasons: { total: 0, without_detail: 0, reasons: [] },
             },
             budget: {
               max_wakes_per_window: 6,
@@ -3051,7 +3734,20 @@ describe("buildBaseSystemPrompt", () => {
     expect(block).not.toContain("Next budget slot frees: 2023-11-14T22:14:01.000Z (in ~41s).");
   });
 
-  it("names the lower operational ceiling while the contemplative reservation is unspent", () => {
+  it("names every route to headway and denies that a journal entry identifies the outcome", () => {
+    const batchedGoalIds = [
+      "goal_aaaaaaaaaaaaaaaa",
+      "goal_bbbbbbbbbbbbbbbb",
+      "goal_cccccccccccccccc",
+      "goal_dddddddddddddddd",
+      "goal_eeeeeeeeeeeeeeee",
+    ];
+    const batchedGoalDetail = batchedGoalIds
+      .flatMap((goalId) => [
+        `progress recorded on ${goalId}`,
+        `goal ${goalId} retired by this turn`,
+      ])
+      .join("; ");
     const prompt = buildBaseSystemPrompt(
       makeContext({
         turnOrigin: "user",
@@ -3062,6 +3758,10 @@ describe("buildBaseSystemPrompt", () => {
             observedAt: NOW_MS,
             enabled: true,
             tickInFlight: false,
+            intervalMs: 60_000,
+            droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+            intervalArmedAt: NOW_MS - 3_600_000,
+            sources: [],
             nextTickAt: NOW_MS + 60_000,
             scheduledTickAt: NOW_MS + 60_000,
             fleetBrake: {
@@ -3075,8 +3775,124 @@ describe("buildBaseSystemPrompt", () => {
               error_paused_until: null,
               bypass_count: 0,
               freshness_bypass_cap: 3,
-              window_outcomes: { headway: 0, silent: 0, error: 0, busy: 0 },
+              window_outcomes: {
+                headway: 4,
+                silent: 2,
+                error: 0,
+                busy: 0,
+                interrupted: 0,
+              },
+              window_headway_reasons: {
+                total: 4,
+                without_detail: 0,
+                reasons: [
+                  {
+                    detail: "emitted message",
+                    count: 2,
+                    triggers: [{ trigger: "open_question_dormant", count: 2 }],
+                  },
+                  {
+                    detail: "continue_thought",
+                    count: 1,
+                    triggers: [{ trigger: "scheduled_reflection", count: 1 }],
+                  },
+                  {
+                    detail: batchedGoalDetail,
+                    count: 1,
+                    triggers: [{ trigger: "executive_focus_due", count: 1 }],
+                  },
+                ],
+              },
               window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+              window_error_span: null,
+              window_silent_span: null,
+              window_silent_reasons: { total: 2, without_detail: 2, reasons: [] },
+            },
+            budget: {
+              max_wakes_per_window: 15,
+              window_ms: 24 * 60 * 60_000,
+              window_started_at: NOW_MS - 24 * 60 * 60_000,
+              used_in_current_window: 6,
+              reserved_contemplative_wakes_per_window: 0,
+              contemplative_used_in_current_window: 0,
+              wakes_in_current_window_by_trigger: [],
+              next_budget_slot_frees_at: null,
+            },
+          },
+        },
+      }),
+      { ...PROMPT_OPTIONS, nowMs: NOW_MS },
+    );
+    const block = extractBlock(prompt, "borg_mechanism_evidence");
+
+    // Derived from the constant the scheduler compares against, not transcribed:
+    // a kind added there without reaching this page fails here rather than
+    // leaving the definition quietly one route short.
+    for (const kind of HEADWAY_EMISSION_KINDS) {
+      expect(block).toContain(kind);
+    }
+    expect(block).toContain("headway is a predicate over how the turn ended");
+    expect(block).toContain("a tool.outbound.post inside it came back delivered");
+    expect(block).toContain("the turn recorded progress on that goal");
+    expect(block).toContain("A closure by another actor between the scan and this accounting");
+    expect(block).toContain(
+      "only goal progress or a retirement attributable to this turn resets that goal's empty-wake backoff",
+    );
+    expect(block).toContain("Why those wakes counted as headway, same rows as headway=4 above");
+    expect(block).toContain("- 2x emitted message");
+    expect(block).toContain("- 1x continue_thought");
+    expect(block).toContain(`- 1x ${batchedGoalDetail}`);
+    for (const goalId of batchedGoalIds) {
+      expect(block).toContain(goalId);
+    }
+    // The inference the page previously left open: every headway route that
+    // dominates this window also writes a journal entry, so the correlation is
+    // perfect and self-confirming unless the page denies it outright.
+    expect(block).toContain(
+      "which outcome a wake recorded is not recoverable from what it left in the journal",
+    );
+  });
+
+  it("names the lower operational ceiling while the contemplative reservation is unspent", () => {
+    const prompt = buildBaseSystemPrompt(
+      makeContext({
+        turnOrigin: "user",
+        turnMechanismEvidence: {
+          recentSuppressions: [],
+          recentRegenerations: [],
+          autonomySchedulerState: {
+            observedAt: NOW_MS,
+            enabled: true,
+            tickInFlight: false,
+            intervalMs: 60_000,
+            droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+            intervalArmedAt: NOW_MS - 3_600_000,
+            sources: [],
+            nextTickAt: NOW_MS + 60_000,
+            scheduledTickAt: NOW_MS + 60_000,
+            fleetBrake: {
+              enabled: true,
+              empty_streak: 0,
+              empty_streak_threshold: 5,
+              streak_anchor_ts: null,
+              cooldown_until: null,
+              error_streak: 0,
+              error_streak_threshold: 3,
+              error_paused_until: null,
+              bypass_count: 0,
+              freshness_bypass_cap: 3,
+              window_outcomes: {
+                headway: 0,
+                silent: 0,
+                error: 0,
+                busy: 0,
+                interrupted: 0,
+              },
+              window_headway_reasons: { total: 0, without_detail: 0, reasons: [] },
+              window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+              window_error_span: null,
+              window_silent_span: null,
+              window_silent_reasons: { total: 0, without_detail: 0, reasons: [] },
             },
             budget: {
               max_wakes_per_window: 15,
@@ -3091,7 +3907,13 @@ describe("buildBaseSystemPrompt", () => {
                   wake_count: 12,
                   in_flight: 0,
                   in_flight_started_at: [],
-                  outcome_counts: { headway: 4, silent: 8, error: 0, busy: 0 },
+                  outcome_counts: {
+                    headway: 4,
+                    silent: 8,
+                    error: 0,
+                    busy: 0,
+                    interrupted: 0,
+                  },
                 },
               ],
               next_budget_slot_frees_at: NOW_MS + 30 * 60_000,
@@ -3114,6 +3936,9 @@ describe("buildBaseSystemPrompt", () => {
       windowErrorReasons: NonNullable<
         NonNullable<DeliberationContext["turnMechanismEvidence"]>["autonomySchedulerState"]
       >["fleetBrake"]["window_error_reasons"],
+      windowErrorSpan: NonNullable<
+        NonNullable<DeliberationContext["turnMechanismEvidence"]>["autonomySchedulerState"]
+      >["fleetBrake"]["window_error_span"] = null,
     ) =>
       extractBlock(
         buildBaseSystemPrompt(
@@ -3126,6 +3951,10 @@ describe("buildBaseSystemPrompt", () => {
                 observedAt: NOW_MS,
                 enabled: true,
                 tickInFlight: false,
+                intervalMs: 60_000,
+                droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+                intervalArmedAt: NOW_MS - 3_600_000,
+                sources: [],
                 nextTickAt: NOW_MS + 60_000,
                 scheduledTickAt: NOW_MS + 60_000,
                 fleetBrake: {
@@ -3144,8 +3973,13 @@ describe("buildBaseSystemPrompt", () => {
                     silent: 0,
                     error: windowErrorReasons.total,
                     busy: 0,
+                    interrupted: 0,
                   },
+                  window_headway_reasons: { total: 0, without_detail: 0, reasons: [] },
                   window_error_reasons: windowErrorReasons,
+                  window_error_span: windowErrorSpan,
+                  window_silent_span: null,
+                  window_silent_reasons: { total: 0, without_detail: 0, reasons: [] },
                 },
                 budget: {
                   max_wakes_per_window: 15,
@@ -3172,23 +4006,49 @@ describe("buildBaseSystemPrompt", () => {
       total: 5,
       without_detail: 0,
       reasons: [
-        { detail: "LLMError: Failed to complete Anthropic request", count: 4 },
-        { detail: "EmbeddingError: Failed to generate embeddings", count: 1 },
+        {
+          detail: "LLMError: Failed to complete Anthropic request",
+          count: 4,
+          triggers: [
+            { trigger: "scheduled_reflection", count: 3 },
+            { trigger: "open_question_dormant", count: 1 },
+          ],
+        },
+        {
+          detail: "EmbeddingError: Failed to generate embeddings",
+          count: 1,
+          triggers: [{ trigger: "open_question_dormant", count: 1 }],
+        },
       ],
     });
 
     expect(attributed).toContain("error=5");
-    expect(attributed).toContain("Why those errored wakes failed, same rows as error=5 above:");
-    expect(attributed).toContain("- 4x LLMError: Failed to complete Anthropic request");
-    expect(attributed).toContain("- 1x EmbeddingError: Failed to generate embeddings");
+    expect(attributed).toContain("Why those errored wakes failed, same rows as error=5 above.");
     expect(attributed).toContain("The reasons above account for all 5.");
+
+    // The trigger split rides on the reason's own line. Without it the block
+    // prints the same wakes split two ways with nothing joining them, and two
+    // splits whose shapes agree read as a correspondence they have not earned.
+    expect(attributed).toContain(
+      "- 4x LLMError: Failed to complete Anthropic request [scheduled_reflection 3, open_question_dormant 1]",
+    );
+    expect(attributed).toContain(
+      "- 1x EmbeddingError: Failed to generate embeddings [open_question_dormant 1]",
+    );
+    expect(attributed).toContain("two splits agreeing in shape is not a correspondence");
 
     // Undetailed rows are stated, so the reason counts are never read as
     // covering the bucket when they fall short of it.
     const partial = buildPrompt({
       total: 5,
       without_detail: 3,
-      reasons: [{ detail: "LLMError: Failed to complete Anthropic request", count: 2 }],
+      reasons: [
+        {
+          detail: "LLMError: Failed to complete Anthropic request",
+          count: 2,
+          triggers: [{ trigger: "scheduled_reflection", count: 2 }],
+        },
+      ],
     });
 
     expect(partial).toContain("The reasons above account for 2 of 5; the rest is 3 with no");
@@ -3199,13 +4059,13 @@ describe("buildBaseSystemPrompt", () => {
       total: 7,
       without_detail: 0,
       reasons: [
-        { detail: "reason-a", count: 1 },
-        { detail: "reason-b", count: 1 },
-        { detail: "reason-c", count: 1 },
-        { detail: "reason-d", count: 1 },
-        { detail: "reason-e", count: 1 },
-        { detail: "reason-f", count: 1 },
-        { detail: "reason-g", count: 1 },
+        { detail: "reason-a", count: 1, triggers: [{ trigger: "scheduled_reflection", count: 1 }] },
+        { detail: "reason-b", count: 1, triggers: [{ trigger: "scheduled_reflection", count: 1 }] },
+        { detail: "reason-c", count: 1, triggers: [{ trigger: "scheduled_reflection", count: 1 }] },
+        { detail: "reason-d", count: 1, triggers: [{ trigger: "scheduled_reflection", count: 1 }] },
+        { detail: "reason-e", count: 1, triggers: [{ trigger: "scheduled_reflection", count: 1 }] },
+        { detail: "reason-f", count: 1, triggers: [{ trigger: "scheduled_reflection", count: 1 }] },
+        { detail: "reason-g", count: 1, triggers: [{ trigger: "scheduled_reflection", count: 1 }] },
       ],
     });
 
@@ -3220,9 +4080,330 @@ describe("buildBaseSystemPrompt", () => {
     expect(buildPrompt({ total: 0, without_detail: 0, reasons: [] })).toContain(
       "Errored wakes in that window: none, so there is no failure to attribute.",
     );
+
+    // The count alone cannot separate one run from a scatter, and the two
+    // support opposite readings of whichever trigger holds most of the
+    // failures. A run clipped by the window edge is the case that misleads
+    // hardest, so it is stated rather than left to be inferred from a rate.
+    const clipped = buildPrompt(
+      {
+        total: 3,
+        without_detail: 0,
+        reasons: [
+          {
+            detail: "LLMError: Failed to complete Anthropic request",
+            count: 3,
+            triggers: [{ trigger: "scheduled_reflection", count: 3 }],
+          },
+        ],
+      },
+      { other_outcomes_between: 0, extends_before_window: true },
+    );
+
+    expect(clipped).toContain(
+      "Where those errored wakes sit: No wake that ended any other way falls between the first and last of them, so inside this window they are one unbroken run; the wake immediately before the first of them also errored, and that wake is outside this window -- the run started earlier, so any rate taken over this window is a slice of it",
+    );
+
+    const scattered = buildPrompt(
+      {
+        total: 3,
+        without_detail: 0,
+        reasons: [
+          {
+            detail: "LLMError: Failed to complete Anthropic request",
+            count: 3,
+            triggers: [{ trigger: "scheduled_reflection", count: 3 }],
+          },
+        ],
+      },
+      { other_outcomes_between: 9, extends_before_window: false },
+    );
+
+    expect(scattered).toContain(
+      "9 wake(s) that ended some other way fall between the first and last of them, so inside this window the failures are interleaved rather than one run",
+    );
+    expect(scattered).toContain(
+      "the wake immediately before the first of them did not error, so the run does begin inside this window",
+    );
+
+    // No retained predecessor is the absence of evidence, not a no.
+    const unbounded = buildPrompt(
+      {
+        total: 2,
+        without_detail: 0,
+        reasons: [
+          {
+            detail: "LLMError: Failed to complete Anthropic request",
+            count: 2,
+            triggers: [{ trigger: "scheduled_reflection", count: 2 }],
+          },
+        ],
+      },
+      { other_outcomes_between: 0, extends_before_window: null },
+    );
+
+    expect(unbounded).toContain(
+      "no earlier wake is retained, so whether the failures start at the window edge or merely become visible there is not answerable from here",
+    );
+
+    // A bucket with no recorded reasons still carries the positioning: the
+    // rows that most need it are the ones whose failure was never written down.
+    const bareWithSpan = buildPrompt(
+      { total: 4, without_detail: 4, reasons: [] },
+      { other_outcomes_between: 0, extends_before_window: true },
+    );
+
+    expect(bareWithSpan).toContain("none of them carrying a recorded failure");
+    expect(bareWithSpan).toContain("they are one unbroken run");
+
+    // A single failure in the window cannot be a run, and the between-count
+    // that would say so is empty by construction rather than by observation.
+    const sole = buildPrompt(
+      {
+        total: 1,
+        without_detail: 0,
+        reasons: [
+          {
+            detail: "Autonomous preparation failed: Timed out after 30000ms",
+            count: 1,
+            triggers: [{ trigger: "scheduled_reflection", count: 1 }],
+          },
+        ],
+      },
+      { other_outcomes_between: 0, extends_before_window: true },
+    );
+
+    expect(sole).toContain(
+      "Where that errored wake sits: it is the only one in this window, so its first and last are the same row and nothing can fall between them -- the interleaving count is empty by construction here, and neither a run nor a scatter is readable from one row; the wake immediately before it also errored, and that wake is outside this window -- so the one inside is the tail of a run that starts earlier, and a rate taken over this window is a rate over that tail.",
+    );
+    expect(sole).not.toContain("one unbroken run");
   });
 
-  it("omits mechanism evidence when scheduler and turn-mechanism state are absent", () => {
+  it("splits the silent-wake count by recorded ending and names the classes that can appear", () => {
+    const buildPrompt = (
+      windowSilentReasons: NonNullable<
+        NonNullable<DeliberationContext["turnMechanismEvidence"]>["autonomySchedulerState"]
+      >["fleetBrake"]["window_silent_reasons"],
+      windowSilentSpan: NonNullable<
+        NonNullable<DeliberationContext["turnMechanismEvidence"]>["autonomySchedulerState"]
+      >["fleetBrake"]["window_silent_span"] = null,
+    ) =>
+      extractBlock(
+        buildBaseSystemPrompt(
+          makeContext({
+            turnOrigin: "user",
+            turnMechanismEvidence: {
+              recentSuppressions: [],
+              recentRegenerations: [],
+              autonomySchedulerState: {
+                observedAt: NOW_MS,
+                enabled: true,
+                tickInFlight: false,
+                intervalMs: 60_000,
+                droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+                intervalArmedAt: NOW_MS - 3_600_000,
+                sources: [],
+                nextTickAt: NOW_MS + 60_000,
+                scheduledTickAt: NOW_MS + 60_000,
+                fleetBrake: {
+                  enabled: true,
+                  empty_streak: 0,
+                  empty_streak_threshold: 5,
+                  streak_anchor_ts: null,
+                  cooldown_until: null,
+                  error_streak: 0,
+                  error_streak_threshold: 3,
+                  error_paused_until: null,
+                  bypass_count: 0,
+                  freshness_bypass_cap: 3,
+                  window_outcomes: {
+                    headway: 0,
+                    silent: windowSilentReasons.total,
+                    error: 0,
+                    busy: 0,
+                    interrupted: 0,
+                  },
+                  window_headway_reasons: { total: 0, without_detail: 0, reasons: [] },
+                  window_error_reasons: { total: 0, without_detail: 0, reasons: [] },
+                  window_error_span: null,
+                  window_silent_span: windowSilentSpan,
+                  window_silent_reasons: windowSilentReasons,
+                },
+                budget: {
+                  max_wakes_per_window: 15,
+                  window_ms: 24 * 60 * 60_000,
+                  window_started_at: NOW_MS - 24 * 60 * 60_000,
+                  used_in_current_window: windowSilentReasons.total,
+                  reserved_contemplative_wakes_per_window: 1,
+                  contemplative_used_in_current_window: 0,
+                  wakes_in_current_window_by_trigger: [],
+                  next_budget_slot_frees_at: NOW_MS + 30 * 60_000,
+                },
+              },
+            },
+          }),
+          { ...PROMPT_OPTIONS, nowMs: NOW_MS },
+        ),
+        "borg_mechanism_evidence",
+      );
+
+    // A wake closed on purpose and a wake a guard stopped are the two readings
+    // silent=N cannot separate, but only the first advances empty_streak; the
+    // split names the policy the scheduler applied.
+    const attributed = buildPrompt({
+      total: 4,
+      without_detail: 0,
+      reasons: [
+        {
+          detail: "deliberate-silence: s2_planner_no_output",
+          count: 3,
+          triggers: [{ trigger: "executive_focus_due", count: 3 }],
+        },
+        {
+          detail: "guard-blocked: commitment_violation_after_regenerate",
+          count: 1,
+          triggers: [{ trigger: "scheduled_reflection", count: 1 }],
+        },
+      ],
+    });
+
+    expect(attributed).toContain("silent=4");
+    expect(attributed).toContain("How those silent wakes ended, same rows as silent=4 above,");
+    expect(attributed).toContain(
+      "- 3x deliberate-silence: s2_planner_no_output [executive_focus_due 3]",
+    );
+    expect(attributed).toContain(
+      "- 1x guard-blocked: commitment_violation_after_regenerate [scheduled_reflection 1]",
+    );
+    expect(attributed).toContain("The endings above account for all 4.");
+    // The contrast set is named, so one rendered class is never read as the only
+    // class that exists.
+    expect(attributed).toContain("emission-failed");
+    expect(attributed).toContain("every class except guard-blocked advances empty_streak");
+    expect(attributed).toContain("guard-blocked leaves it unchanged");
+
+    // Rows written before the ending was recorded are stated rather than left as
+    // an unexplained shortfall against silent=N.
+    const partial = buildPrompt({
+      total: 5,
+      without_detail: 3,
+      reasons: [
+        {
+          detail: "deliberate-silence: finalizer_no_output",
+          count: 2,
+          triggers: [{ trigger: "executive_focus_due", count: 2 }],
+        },
+      ],
+    });
+
+    expect(partial).toContain("The endings above account for 2 of 5; the rest is 3 with no");
+
+    // The same count scattered and consecutive are a different fact, and here
+    // the difference is a reading about the entity rather than the provider:
+    // only a run has the shape of a chosen quiet. A run clipped by the window
+    // edge is the case that misleads hardest, so it is stated.
+    const clipped = buildPrompt(
+      {
+        total: 3,
+        without_detail: 0,
+        reasons: [
+          {
+            detail: "deliberate-silence: finalizer_no_output",
+            count: 3,
+            triggers: [{ trigger: "executive_focus_due", count: 3 }],
+          },
+        ],
+      },
+      { other_outcomes_between: 0, extends_before_window: true },
+    );
+
+    expect(clipped).toContain(
+      "Where those silent wakes sit: No wake that ended any other way falls between the first and last of them, so inside this window they are one unbroken run",
+    );
+    expect(clipped).toContain(
+      "the wake immediately before the first of them was also silent, and that wake is outside this window -- the stretch started earlier, so reading these as a run of chosen quiet reads a slice of a longer one",
+    );
+
+    const scattered = buildPrompt(
+      {
+        total: 3,
+        without_detail: 0,
+        reasons: [
+          {
+            detail: "deliberate-silence: finalizer_no_output",
+            count: 3,
+            triggers: [{ trigger: "executive_focus_due", count: 3 }],
+          },
+        ],
+      },
+      { other_outcomes_between: 7, extends_before_window: false },
+    );
+
+    expect(scattered).toContain(
+      "7 wake(s) that ended some other way fall between the first and last of them, so inside this window the silences are interleaved rather than one stretch",
+    );
+    expect(scattered).toContain(
+      "the wake immediately before the first of them was not silent, so the stretch does begin inside this window",
+    );
+
+    // Rows with no recorded ending are the ones whose positioning carries the
+    // most, since nothing else about them is available.
+    const bareWithSpan = buildPrompt(
+      { total: 4, without_detail: 4, reasons: [] },
+      { other_outcomes_between: 0, extends_before_window: null },
+    );
+
+    expect(bareWithSpan).toContain("none of them carrying a recorded ending");
+    expect(bareWithSpan).toContain(
+      "no earlier wake is retained, so whether the silences start at the window edge or merely become visible there is not answerable from here",
+    );
+
+    // One silence in the window is the case the interleaving read cannot serve:
+    // first and last are the same row, so the between-count is zero by
+    // construction and the plural wording would call an isolated closure an
+    // unbroken run -- the reading toward disposition this line exists against.
+    const sole = buildPrompt(
+      {
+        total: 1,
+        without_detail: 0,
+        reasons: [
+          {
+            detail: "deliberate-silence: finalizer_no_output",
+            count: 1,
+            triggers: [{ trigger: "open_question_dormant", count: 1 }],
+          },
+        ],
+      },
+      { other_outcomes_between: 0, extends_before_window: false },
+    );
+
+    expect(sole).toContain(
+      "Where that silent wake sits: it is the only one in this window, so its first and last are the same row and nothing can fall between them -- the interleaving count is empty by construction here, and neither a run nor a scatter is readable from one row; the wake immediately before it was not silent, so it is not the tail of anything the table retains.",
+    );
+    expect(sole).not.toContain("one unbroken run");
+
+    // The edge is the half that still carries evidence at one row: a lone
+    // in-window silence preceded by another is the tail of a longer stretch.
+    const soleClipped = buildPrompt(
+      {
+        total: 1,
+        without_detail: 1,
+        reasons: [],
+      },
+      { other_outcomes_between: 0, extends_before_window: true },
+    );
+
+    expect(soleClipped).toContain(
+      "the wake immediately before it was also silent, and that wake is outside this window -- so the one inside is the tail of a stretch that starts earlier, and how far back that stretch runs is not on this page",
+    );
+    expect(soleClipped).not.toContain("one unbroken run");
+
+    expect(buildPrompt({ total: 0, without_detail: 0, reasons: [] })).toContain(
+      "Silent wakes in that window: none, so there is no silence to attribute.",
+    );
+  });
+
+  it("labels edge evidence as unavailable when scheduler and turn-mechanism state are absent", () => {
     const prompt = buildBaseSystemPrompt(
       makeContext({
         turnMechanismEvidence: {
@@ -3233,7 +4414,7 @@ describe("buildBaseSystemPrompt", () => {
       { ...PROMPT_OPTIONS, nowMs: NOW_MS },
     );
 
-    expect(prompt).not.toContain("<borg_mechanism_evidence>");
+    expect(prompt).toContain("Answered-window edge: evidence unavailable on this capture");
   });
 
   it("renders closure-loop finalizer guidance in trusted discourse control", () => {
@@ -4281,6 +5462,58 @@ describe("buildBaseSystemPrompt", () => {
     expect(block).not.toContain("0.90");
   });
 
+  // The trajectory legend bound each row to "the text that arrived that turn" -- the exact
+  // binding `workingStateMoodProvenance` retracted for the same quantity, left standing on
+  // the block a reader reaches for a history of that field. Two blocks disagreeing about
+  // one quantity's input is worse than either being silent, so pin both directions here:
+  // the retired string as an absence, the recency clause and the trigger= scope as content.
+  it("scopes trajectory rows to the classifier's full input, not the arrived text alone", () => {
+    const block = extractBlock(
+      buildBaseSystemPrompt(
+        makeContext({
+          affectiveTrajectory: [
+            makeMoodHistoryEntry(1, 2, -0.3, 0.4, "user expressed frustration"),
+          ],
+        }),
+        PROMPT_OPTIONS,
+      ),
+      "borg_affective_trajectory",
+    );
+
+    expect(block).not.toContain("raw classifier reading of the text that arrived that turn");
+    expect(block).toContain("The reading is not a function of that turn's arrived text alone");
+    expect(block).toContain("up to the last ten recency strings for the session");
+    expect(block).toContain(
+      "trigger= is a 120-character head slice of the arrived message bodies with the transport envelope stripped",
+    );
+    expect(block).toContain("names no part of the recency half");
+  });
+
+  // The trigger= scope was still too generous: sliced off the rendered batch, 120
+  // characters never reached past the `<inbound_message>` attribute list, so the field
+  // named a stream id on every row a wrapping transport wrote. The write now takes the
+  // bodies, but rows stored before it keep the envelope and stay on the page until they
+  // age out -- so the legend has to describe the old shape too, or a reader checking it
+  // against a pre-change row catches the legend lying rather than the row aging.
+  it("tells a reader how to recognize a trigger written before the source changed", () => {
+    const block = extractBlock(
+      buildBaseSystemPrompt(
+        makeContext({
+          affectiveTrajectory: [makeMoodHistoryEntry(1, 2, -0.3, 0.4, "the deadline moved")],
+        }),
+        PROMPT_OPTIONS,
+      ),
+      "borg_affective_trajectory",
+    );
+
+    expect(block).toContain(
+      "a subset of what was scored rather than a prefix of it",
+    );
+    expect(block).toContain(
+      "a trigger that opens with a transport tag instead of with text is a row written before that source changed",
+    );
+  });
+
   it("omits affective trajectory when history is empty or undefined", () => {
     const emptyPrompt = buildBaseSystemPrompt(
       makeContext({
@@ -4590,6 +5823,42 @@ describe("buildAutonomousOutboundAuthorizationSection", () => {
     expect(section).toContain("<label>philosophy debate</label>");
     // audience_entity_id is the join to the origin_audience recall already carries.
     expect(section).toContain(`<audience_entity_id>${audienceEntityId}</audience_entity_id>`);
+  });
+
+  it("names the order the route list is built and truncated by", () => {
+    const section =
+      buildAutonomousOutboundAuthorizationSection(baseContext, "autonomous", toolMenu) ?? "";
+
+    expect(section).toContain('ordered_by="most_recently_active_first"');
+    expect(section).toContain("<ordering>");
+    expect(section).toContain(
+      "the cap on this list drops the least-recently-active routes rather than sampling",
+    );
+    // The head of the list is whichever thread most recently RECEIVED something,
+    // because the ordering key moves at ingestion -- which is the same condition
+    // that makes it likely to be mid-turn and answer a reach with target_busy.
+    expect(section).toContain(
+      "A thread's activity stamp moves when a message arrives in it, not only when its turn ends",
+    );
+    expect(section).toContain(
+      "Position here says when that thread last moved, and nothing about whether it can be reached now.",
+    );
+  });
+
+  it("keeps the ordering line inside the route list rather than the posture", () => {
+    const section =
+      buildAutonomousOutboundAuthorizationSection(baseContext, "autonomous", toolMenu) ?? "";
+    const withoutTargets =
+      buildAutonomousOutboundAuthorizationSection(
+        { ...baseContext, targets: [] },
+        "autonomous",
+        toolMenu,
+      ) ?? "";
+
+    expect(section.indexOf("<ordering>")).toBeGreaterThan(section.indexOf("<reachable_threads "));
+    expect(section.indexOf("<ordering>")).toBeLessThan(section.indexOf("<target "));
+    expect(withoutTargets).not.toContain("<ordering>");
+    expect(withoutTargets).not.toContain("most_recently_active_first");
   });
 
   it("omits audience_entity_id when the thread has no audience entity", () => {

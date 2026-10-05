@@ -2,10 +2,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { FixedClock, ManualClock } from "../../util/clock.js";
-import { openDatabase } from "../../storage/sqlite/index.js";
+import { composeMigrations, openDatabase } from "../../storage/sqlite/index.js";
 import { IdentityCasMismatchError, ProvenanceError } from "../../util/errors.js";
 import {
   createEntityId,
@@ -15,8 +15,14 @@ import {
   type EpisodeId,
 } from "../../util/ids.js";
 import { expectedRecordVersion } from "../common/cas.js";
+import { identityMigrations, IdentityEventRepository } from "../identity/index.js";
 import { selfMigrations } from "./migrations.js";
-import { GoalsRepository, TraitsRepository, ValuesRepository } from "./repository.js";
+import {
+  GOAL_TURN_ROLLBACK_REASON,
+  GoalsRepository,
+  TraitsRepository,
+  ValuesRepository,
+} from "./repository.js";
 
 describe("self repositories", () => {
   const manualProvenance = { kind: "manual" } as const;
@@ -122,6 +128,52 @@ describe("self repositories", () => {
     }
   });
 
+  it("counts every stored value and trait, so list() cannot narrow unnoticed", () => {
+    // A renderer claims it printed every value and trait by comparing its draw
+    // against these counts. That check is only worth anything while list() and
+    // count() see the same rows, and nothing on the rendered surface would show
+    // a filter appearing in list(). This is where that shows up instead.
+    const db = openDatabase(":memory:", { migrations: [...selfMigrations] });
+    const values = new ValuesRepository({ db, clock: new FixedClock(100) });
+    const traits = new TraitsRepository({ db, clock: new FixedClock(100) });
+
+    try {
+      expect(values.count()).toBe(0);
+      expect(traits.count()).toBe(0);
+
+      for (const [index, label] of ["stability", "candour", "restraint"].entries()) {
+        values.add({
+          label,
+          description: `Value ${label}.`,
+          priority: index + 1,
+          provenance: manualProvenance,
+        });
+      }
+      // Deliberately spread across strengths and states: any future draw that
+      // ranks, thresholds, or filters by either would drop rows here.
+      traits.reinforce({ label: "terse", delta: 0.9, provenance: manualProvenance, timestamp: 100 });
+      traits.reinforce({
+        label: "patient",
+        delta: 0.05,
+        provenance: manualProvenance,
+        timestamp: 100,
+      });
+
+      expect(values.count()).toBe(values.list().length);
+      expect(traits.count()).toBe(traits.list().length);
+      expect(values.count()).toBe(3);
+      expect(traits.count()).toBe(2);
+
+      const removed = values.list()[0];
+      expect(removed).toBeDefined();
+      if (removed !== undefined) values.remove(removed.id);
+      expect(values.count()).toBe(values.list().length);
+      expect(values.count()).toBe(2);
+    } finally {
+      db.close();
+    }
+  });
+
   it("CAS-protects value, goal, and trait removals", () => {
     const db = openDatabase(":memory:", {
       migrations: [...selfMigrations],
@@ -169,6 +221,10 @@ describe("self repositories", () => {
       expect(() =>
         goals.remove(goal.id, {
           expectedVersion: expectedRecordVersion(goal),
+          auditContext: {
+            reason: "test goal removal",
+            provenance: manualProvenance,
+          },
         }),
       ).toThrow(IdentityCasMismatchError);
       expect(goals.get(goal.id)).not.toBeNull();
@@ -193,6 +249,94 @@ describe("self repositories", () => {
         }),
       ).toThrow(IdentityCasMismatchError);
       expect(traits.get(trait.id)).not.toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("audits rollback goal restores and deletes with persisted records", () => {
+    const db = openDatabase(":memory:", {
+      migrations: composeMigrations(selfMigrations, identityMigrations),
+    });
+    const clock = new ManualClock(100);
+    const identityEvents = new IdentityEventRepository({ db, clock });
+    const goals = new GoalsRepository({ db, clock, identityEventRepository: identityEvents });
+
+    try {
+      const original = goals.add({
+        description: "Keep rollback goal audits complete",
+        priority: 8,
+        provenance: manualProvenance,
+      });
+      goals.updateStatus(original.id, "done", manualProvenance);
+      const changed = goals.get(original.id)!;
+      const restored = goals.restore(original);
+
+      expect(restored).toMatchObject({
+        id: original.id,
+        record_version: changed.record_version,
+        status: "active",
+      });
+      expect(
+        goals.remove(original.id, {
+          auditContext: {
+            reason: GOAL_TURN_ROLLBACK_REASON,
+            provenance: { kind: "system" },
+          },
+        }),
+      ).toBe(true);
+
+      const events = identityEvents.list({ recordType: "goal", recordId: original.id, limit: 10 });
+      expect(events.map((event) => event.action)).toEqual(["delete", "update", "update", "create"]);
+      expect(events[0]).toMatchObject({
+        action: "delete",
+        old_value: restored,
+        new_value: null,
+        reason: GOAL_TURN_ROLLBACK_REASON,
+        provenance: { kind: "system" },
+      });
+      expect(events[1]).toMatchObject({
+        action: "update",
+        old_value: changed,
+        new_value: restored,
+        reason: GOAL_TURN_ROLLBACK_REASON,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("rolls back goal restore and delete mutations when their audit write fails", () => {
+    const db = openDatabase(":memory:", {
+      migrations: composeMigrations(selfMigrations, identityMigrations),
+    });
+    const clock = new ManualClock(100);
+    const identityEvents = new IdentityEventRepository({ db, clock });
+    const goals = new GoalsRepository({ db, clock, identityEventRepository: identityEvents });
+
+    try {
+      const original = goals.add({
+        description: "Keep goal and audit in one transaction",
+        priority: 7,
+        provenance: manualProvenance,
+      });
+      goals.updateStatus(original.id, "done", manualProvenance);
+      const changed = goals.get(original.id)!;
+      vi.spyOn(identityEvents, "record").mockImplementation(() => {
+        throw new Error("identity event unavailable");
+      });
+
+      expect(() => goals.restore(original)).toThrow("identity event unavailable");
+      expect(goals.get(original.id)).toEqual(changed);
+      expect(() =>
+        goals.remove(original.id, {
+          auditContext: {
+            reason: GOAL_TURN_ROLLBACK_REASON,
+            provenance: { kind: "system" },
+          },
+        }),
+      ).toThrow("identity event unavailable");
+      expect(goals.get(original.id)).toEqual(changed);
     } finally {
       db.close();
     }
@@ -291,6 +435,8 @@ describe("self repositories", () => {
         description: "Help Alice track italki options",
         priority: 9,
         audienceEntityId: alice,
+        ownerEntityId: null,
+        counterpartyEntityId: bob,
         sourceStreamEntryIds: [streamEntryId],
         provenance: {
           kind: "online",
@@ -306,6 +452,8 @@ describe("self repositories", () => {
 
       expect(goals.get(aliceGoal.id)).toMatchObject({
         audience_entity_id: alice,
+        owner_entity_id: null,
+        counterparty_entity_id: bob,
         source_stream_entry_ids: [streamEntryId],
       });
       expect(
@@ -326,6 +474,7 @@ describe("self repositories", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-self-goals-"));
     const dbPath = join(tempDir, "borg.db");
     const audienceEntityId = createEntityId();
+    const counterpartyEntityId = createEntityId();
 
     try {
       const firstDb = openDatabase(dbPath, {
@@ -340,6 +489,7 @@ describe("self repositories", () => {
         terminalCondition: "The italki shortlist reaches a selected tutor",
         priority: 8,
         audienceEntityId,
+        counterpartyEntityId,
         provenance: manualProvenance,
       });
       firstDb.close();
@@ -356,8 +506,10 @@ describe("self repositories", () => {
         expect(
           secondGoals
             .list({ status: "active", visibleToAudienceEntityId: audienceEntityId })
-            .map((item) => [item.id, item.terminal_condition]),
-        ).toEqual([[goal.id, "The italki shortlist reaches a selected tutor"]]);
+            .map((item) => [item.id, item.terminal_condition, item.counterparty_entity_id]),
+        ).toEqual([
+          [goal.id, "The italki shortlist reaches a selected tutor", counterpartyEntityId],
+        ]);
       } finally {
         secondDb.close();
       }
@@ -398,9 +550,13 @@ describe("self repositories", () => {
     };
     const terminalConditionMigration = selfMigrations.find((migration) => migration.id === 6);
     const streamProvenanceMigration = selfMigrations.find((migration) => migration.id === 7);
+    const counterpartyMigration = selfMigrations.find(
+      (migration) => migration.name === "goal_counterparty_entity_id",
+    );
 
     expect(terminalConditionMigration).toBeDefined();
     expect(streamProvenanceMigration).toBeDefined();
+    expect(counterpartyMigration).toBeDefined();
 
     try {
       const oldDb = openDatabase(dbPath, {
@@ -438,7 +594,14 @@ describe("self repositories", () => {
       oldDb.close();
 
       const migratedDb = openDatabase(dbPath, {
-        migrations: [oldGoalBaseline, terminalConditionMigration!, streamProvenanceMigration!],
+        migrations: [
+          oldGoalBaseline,
+          terminalConditionMigration!,
+          streamProvenanceMigration!,
+          counterpartyMigration!,
+          selfMigrations.find((migration) => migration.name === "goal_named_block_history")!,
+          selfMigrations.find((migration) => migration.name === "goal_deadline_assignment_basis")!,
+        ],
       });
       const goals = new GoalsRepository({
         db: migratedDb,
@@ -449,10 +612,18 @@ describe("self repositories", () => {
         const columns = migratedDb.pragma("table_info(goals)") as Array<{ name: string }>;
         expect(columns.map((column) => column.name)).toContain("terminal_condition");
         expect(columns.map((column) => column.name)).toContain("provenance_stream_entry_ids");
+        expect(columns.map((column) => column.name)).toContain("counterparty_entity_id");
+        expect(() => counterpartyMigration!.up(migratedDb)).not.toThrow();
+        expect(
+          (migratedDb.pragma("table_info(goals)") as Array<{ name: string }>).filter(
+            (column) => column.name === "counterparty_entity_id",
+          ),
+        ).toHaveLength(1);
         expect(goals.get(goalId)).toEqual(
           expect.objectContaining({
             id: goalId,
             terminal_condition: null,
+            counterparty_entity_id: null,
           }),
         );
       } finally {

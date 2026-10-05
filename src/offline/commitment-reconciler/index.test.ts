@@ -17,7 +17,6 @@ function reconciliationResponse(
     commitment_ids: string[];
     resolution: "supersede_to_survivor" | "keep_independent" | "conflict";
     survivor_commitment_id?: string | null;
-    superseded_commitment_ids?: string[];
     reason: string;
   }>,
   usage: { inputTokens: number; outputTokens: number } = { inputTokens: 20, outputTokens: 10 },
@@ -34,7 +33,6 @@ function reconciliationResponse(
         input: {
           judgments: judgments.map((judgment) => ({
             survivor_commitment_id: null,
-            superseded_commitment_ids: [],
             ...judgment,
           })),
         },
@@ -109,7 +107,6 @@ describe("CommitmentReconcilerProcess", () => {
               commitment_ids: [first!.id, second!.id],
               resolution: "supersede_to_survivor",
               survivor_commitment_id: second!.id,
-              superseded_commitment_ids: [first!.id],
               reason: "Both records express the same handle-format commitment.",
             },
           ]);
@@ -289,6 +286,16 @@ describe("CommitmentReconcilerProcess", () => {
       openOnly: true,
     });
     const refs = reviews[0]?.refs as CommitmentReconciliationReviewRefs;
+    const originAudienceIds = [
+      { commitment: first, audience: firstAudience },
+      { commitment: second, audience: secondAudience },
+    ]
+      .sort(
+        (left, right) =>
+          left.commitment.created_at - right.commitment.created_at ||
+          left.commitment.id.localeCompare(right.commitment.id),
+      )
+      .map(({ audience }) => audience);
     const sortedAudienceIds = [firstAudience, secondAudience].sort();
     const promptPayload = JSON.parse(
       String(llmClient.requests[0]?.messages[0]?.content ?? "{}"),
@@ -342,7 +349,7 @@ describe("CommitmentReconcilerProcess", () => {
       source_stream_entry_ids: expect.arrayContaining([firstEntryId, secondEntryId]),
       disclosure_label: {
         disclosureClass: "relationship_private",
-        originAudienceEntityIds: sortedAudienceIds,
+        originAudienceEntityIds: originAudienceIds,
         privateToEntityIds: sortedAudienceIds,
         publicToEntityIds: [],
       },

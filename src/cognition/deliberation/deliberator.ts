@@ -86,6 +86,7 @@ import type {
   DeliberationResult,
   DeliberationUsage,
   DeliberatorOptions,
+  FinalizerTransport,
 } from "./types.js";
 import type { SessionParticipationPolicy } from "../../sessions/index.js";
 import { isCreatorInOperatorContext } from "../authority.js";
@@ -95,12 +96,14 @@ import {
   buildFinalizerToolMenuItems,
   resolveFinalizerNonTerminalTools,
 } from "./autonomous-finalizer-tools.js";
+import { OUTBOUND_POST_TOOL_NAME } from "../../tools/internal/outbound-post-name.js";
 
 export type {
   DeliberationContext,
   DeliberationResult,
   DeliberationUsage,
   DeliberatorOptions,
+  FinalizerTransport,
   SelfSnapshot,
   TurnStakes,
 } from "./types.js";
@@ -275,6 +278,7 @@ function buildFinalizerCallOptions(
     baseSystemPrompt: context.baseSystemPrompt,
     cacheableSystemPrompt: context.cacheableSystemPrompt,
     finalizerDynamicPromptCacheEnabled: options.finalizerDynamicPromptCacheEnabled ?? true,
+    finalizerTransport: options.finalizerTransport ?? "unary",
     finalizerSurfaceVariant: configuredSurfaceVariant,
     finalizerContextCapture: options.finalizerContextCapture,
     ...(resolvedSurfaceVariant === "legacy" && options.finalizerContextCapture === undefined
@@ -297,6 +301,7 @@ function buildFinalizerCallOptions(
       ? {}
       : { allowedEmissions: context.allowedEmissions }),
     outboundToolAvailable: context.outboundToolAvailable,
+    participationPolicy: context.effectiveContext.participationPolicy ?? "active",
     turnOrigin: context.effectiveContext.turnOrigin,
     currentSenderBorgRole: context.effectiveContext.creatorContext?.currentSenderBorgRole ?? null,
     sessionAudienceRole: context.effectiveContext.creatorContext?.sessionAudienceRole,
@@ -916,15 +921,17 @@ export class Deliberator {
     const nonTerminalFinalizerTools = resolveFinalizerNonTerminalTools({
       dispatcher: this.options.toolDispatcher,
       turnOrigin: effectiveContext.turnOrigin,
-      outboundToolAvailable,
     });
+    const availableNonTerminalFinalizerTools = nonTerminalFinalizerTools.filter(
+      (tool) => tool.name !== OUTBOUND_POST_TOOL_NAME || outboundToolAvailable,
+    );
     effectiveContext = {
       ...effectiveContext,
       ...(effectiveContext.turnOrigin === "autonomous"
         ? {
             autonomousFinalizerToolMenu: buildFinalizerToolMenuItems([
               ...availableEmissionTools,
-              ...nonTerminalFinalizerTools,
+              ...availableNonTerminalFinalizerTools,
             ]),
           }
         : {}),

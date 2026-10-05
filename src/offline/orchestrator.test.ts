@@ -1,4 +1,8 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { publicMemoryDisclosureLabel } from "../memory/common/disclosure-label.js";
+import { createSemanticNodeId } from "../util/ids.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { refreshSerializedEmbeddings } from "../embeddings/serialized.js";
+import type { MaintenancePlan } from "./plan-file.js";
 
 import type { TurnTraceData, TurnTraceEventName, TurnTracer } from "../tracing/tracer.js";
 import { StreamReader, StreamWriter } from "../stream/index.js";
@@ -78,6 +82,60 @@ describe("maintenance orchestrator", () => {
     while (cleanup.length > 0) {
       await cleanup.pop()?.();
     }
+  });
+
+  it("rejects saved vectors without text before creating a stream writer or applying a plan", async () => {
+    const harness = await createOfflineTestHarness();
+    cleanup.push(harness.cleanup);
+    const createStreamWriter = vi.fn(() => harness.createContext().streamWriter);
+    const orchestrator = new MaintenanceOrchestrator({
+      baseContext: baseContextFrom(harness.createContext()),
+      auditLog: harness.auditLog,
+      processRegistry: createProcessRegistry({}),
+      createStreamWriter,
+      prepareSerializedEmbeddings: (payload) =>
+        refreshSerializedEmbeddings(payload, harness.createContext().embeddingClient),
+    });
+    const episodeId = createEpisodeFixture().id;
+    const plan: MaintenancePlan = {
+      kind: "borg_maintenance_plan",
+      version: 2,
+      run_id: createMaintenanceRunId(),
+      created_at: 1,
+      processes: [
+        {
+          process: "reflector",
+          tokens_used: 0,
+          errors: [],
+          budget_exhausted: false,
+          items: [
+            {
+              cluster_key: "test",
+              episode_ids: [episodeId],
+              source_disclosure_label: publicMemoryDisclosureLabel(),
+              candidate_support_edges: [],
+              target: {
+                mode: "update",
+                node_id: createSemanticNodeId(),
+                patch: {
+                  description: "replacement",
+                  confidence: 0.7,
+                  source_episode_ids: [episodeId],
+                  last_verified_at: 1,
+                  embedding: [1, 2, 3, 4],
+                  archived: false,
+                },
+              },
+              review: { kind: "new_insight", reason: "queued" },
+            },
+          ],
+        },
+      ],
+    };
+    await expect(orchestrator.apply(plan)).rejects.toMatchObject({
+      code: "SERIALIZED_EMBEDDING_INCOMPATIBLE",
+    });
+    expect(createStreamWriter).not.toHaveBeenCalled();
   });
 
   it("emits a dream_report and links audit rows to the run id", async () => {
@@ -270,6 +328,7 @@ describe("maintenance orchestrator", () => {
         },
       ],
       budget_exhausted: false,
+      notes: ["tension scaffolding dropped: 0"],
       candidate_stats: {
         proposed: 3,
         accepted: 2,
@@ -334,7 +393,7 @@ describe("maintenance orchestrator", () => {
         candidates_accepted: 2,
         candidates_rejected: 1,
         candidates_truncated: 1,
-        notes: ["candidate_cap_truncated:1"],
+        notes: ["tension scaffolding dropped: 0", "candidate_cap_truncated:1"],
         errors: 1,
       }),
     });
@@ -347,6 +406,51 @@ describe("maintenance orchestrator", () => {
         candidates_rejected: 2,
         errors: 2,
       }),
+    });
+    const dreamReport = new StreamReader({
+      dataDir: harness.tempDir,
+      sessionId: DEFAULT_SESSION_ID,
+    }).tail(1)[0];
+
+    expect(dreamReport?.content).toMatchObject({
+      notes: ["overseer: tension scaffolding dropped: 0"],
+    });
+  });
+
+  it("carries ruminator due, visited, and budget-cut counts into the dream report", async () => {
+    const harness = await createOfflineTestHarness({});
+    cleanup.push(harness.cleanup);
+    const schedulerNote =
+      "rumination scheduler: due=9; selected=8; visited=3; budget_cut=5; budget_cut_question_ids=oq_cut";
+    const ruminator = fakeProcess("ruminator", {
+      process: "ruminator",
+      dryRun: false,
+      changes: [],
+      tokens_used: 150_010,
+      errors: [],
+      budget_exhausted: true,
+      notes: [schedulerNote],
+    });
+    const orchestrator = new MaintenanceOrchestrator({
+      baseContext: baseContextFrom(harness.createContext()),
+      auditLog: harness.auditLog,
+      createStreamWriter: () =>
+        new StreamWriter({
+          dataDir: harness.tempDir,
+          sessionId: DEFAULT_SESSION_ID,
+          clock: harness.clock,
+        }),
+      processRegistry: createProcessRegistry({ ruminator }),
+    });
+
+    await orchestrator.run({ processes: [ruminator], opts: { dryRun: false } });
+
+    const dreamReport = new StreamReader({
+      dataDir: harness.tempDir,
+      sessionId: DEFAULT_SESSION_ID,
+    }).tail(1)[0];
+    expect(dreamReport?.content).toMatchObject({
+      notes: [`ruminator: ${schedulerNote}`, "Budget exhausted: ruminator"],
     });
   });
 });

@@ -642,7 +642,14 @@ async function seedP2EndpointRecords(borg: Borg, clock: ManualClock) {
   });
   const review = internal.deps.reviewQueueRepository.enqueue({
     kind: "belief_revision",
-    refs: { target_type: "semantic_node", target_id: "semn_demo" },
+    refs: {
+      target_type: "semantic_node",
+      target_id: "semn_aaaaaaaaaaaaaaaa",
+      invalidated_edge_id: "seme_aaaaaaaaaaaaaaaa",
+      dependency_path_edge_ids: [],
+      surviving_support_edge_ids: [],
+      evidence_episode_ids: [],
+    },
     reason: "dependency invalidated",
     sourceProcess: "belief-reviser",
   });
@@ -1107,6 +1114,62 @@ describe("demo server", () => {
     const idleAfter = await app.request("/api/inflight?session=default");
     expect(idleAfter.status).toBe(200);
     expect(await idleAfter.json()).toEqual({ inflight: null });
+  });
+
+  it("accepts only attention envelopes and makes reposts idempotent", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-demo-attention-"));
+    tempDirs.push(tempDir);
+    const { borg, live } = await openHarness({ tempDir });
+    closers.push(() => borg.close());
+    const { app } = createDemoServerApp({ borgHandle: { current: borg }, live });
+    const record = {
+      record_key: "cclink:api-test",
+      filed_at: 1_700_000_000_000,
+      filer_entity_id: borg.entities.resolve("Counterpart"),
+      subject: "件名",
+    };
+    const posted = await requestJson(app, "/api/operator-attention", "POST", record);
+    expect(posted.status).toBe(200);
+    expect(await posted.json()).toEqual({ inserted: true });
+    const resent = await requestJson(app, "/api/operator-attention", "POST", {
+      ...record,
+      subject: null,
+    });
+    expect(await resent.json()).toEqual({ inserted: false });
+    expect(borg.operatorAttention.snapshot()).toEqual({
+      total: 1,
+      records: [
+        {
+          ...record,
+          disclosure_label: {
+            disclosureClass: "operator_private",
+            originAudienceEntityIds: [record.filer_entity_id],
+            privateToEntityIds: [],
+            publicToEntityIds: [],
+          },
+        },
+      ],
+    });
+    const legacy = await requestJson(app, "/api/operator-attention", "POST", {
+      ...record,
+      record_key: "cclink:legacy",
+      filed_at: record.filed_at - 1,
+      subject: null,
+    });
+    expect(legacy.status).toBe(200);
+    for (const bad of [
+      { ...record, body: "NEVER STORE THIS BODY" },
+      { ...record, reason: "NEVER STORE THIS BODY" },
+      { ...record, filed_at: "yesterday" },
+      { ...record, filer_entity_id: "not-an-entity" },
+      { ...record, subject: "first line\nbody" },
+      { ...record, subject: "x".repeat(241) },
+    ]) {
+      const response = await requestJson(app, "/api/operator-attention", "POST", bad);
+      expect(response.status).toBe(400);
+    }
+    expect(borg.operatorAttention.snapshot().total).toBe(2);
+    expect(JSON.stringify(borg.operatorAttention.snapshot())).not.toContain("NEVER STORE");
   });
 
   it("serves creator and operator session endpoints", async () => {
@@ -2197,6 +2260,7 @@ describe("demo server", () => {
     const valueAddSpy = vi.spyOn(borg.self.values, "add");
     const goalAddSpy = vi.spyOn(borg.self.goals, "add");
     const goalStatusSpy = vi.spyOn(borg.self.goals, "updateStatus");
+    const goalBlockSpy = vi.spyOn(borg.self.goals, "block");
     const goalProgressSpy = vi.spyOn(borg.self.goals, "updateProgress");
     const growthAddSpy = vi.spyOn(borg.self.growthMarkers, "add");
     const questionResolveSpy = vi.spyOn(borg.self.openQuestions, "resolve");
@@ -2265,7 +2329,15 @@ describe("demo server", () => {
       priority: 2,
     });
     expect(goal.status).toBe(200);
-    const goalBody = (await goal.json()) as { id: string };
+    const goalBody = (await goal.json()) as {
+      id: string;
+      disclosure?: string;
+      disclosure_label?: { disclosure_class?: string };
+    };
+    expect(goalBody).toMatchObject({
+      disclosure: expect.stringContaining("disclosure_class=self_private"),
+      disclosure_label: { disclosure_class: "self_private" },
+    });
     expect(goalAddSpy).toHaveBeenCalledWith(
       expect.objectContaining({ description: "ship sprint B", priority: 2 }),
     );
@@ -2281,9 +2353,16 @@ describe("demo server", () => {
       priority: 1,
       provenance: { kind: "manual" },
     });
+    const bareBlock = await requestJson(app, `/api/identity/goals/${blockedGoal.id}`, "PATCH", {
+      action: "block",
+      note: "bare block",
+    });
+    expect(bareBlock.status).toBe(400);
     const block = await requestJson(app, `/api/identity/goals/${blockedGoal.id}`, "PATCH", {
       action: "block",
       note: "blocked by test fixture",
+      attempt_status: "attempted_unavailable",
+      blocker: { kind: "until", until: blockedGoal.created_at + 60_000 },
     });
     expect(block.status).toBe(200);
     expect(await block.json()).toMatchObject({ id: blockedGoal.id, status: "blocked" });
@@ -2309,11 +2388,14 @@ describe("demo server", () => {
       { kind: "manual" },
       expect.objectContaining({ throughReview: true }),
     );
-    expect(goalStatusSpy).toHaveBeenCalledWith(
+    expect(goalBlockSpy).toHaveBeenCalledWith(
       blockedGoal.id,
-      "blocked",
+      expect.objectContaining({
+        attempt_status: "attempted_unavailable",
+        reason: "blocked by test fixture",
+        blocker: { kind: "until", until: expect.any(Number) },
+      }),
       { kind: "manual" },
-      expect.objectContaining({ throughReview: true }),
     );
     expect(goalProgressSpy).toHaveBeenCalledWith(
       progressGoal.id,
@@ -2876,7 +2958,7 @@ describe("demo server", () => {
     const review = internal.deps.reviewQueueRepository.enqueue({
       kind: "duplicate",
       refs: {
-        node_ids: ["sem_fixtureaaaaaaa1", "sem_fixtureaaaaaaa2"],
+        node_ids: ["semn_aaaaaaaaaaaaaaa1", "semn_aaaaaaaaaaaaaaa2"],
       },
       reason: "non-correction review fixture",
     });
@@ -2909,13 +2991,17 @@ describe("demo server", () => {
     const internal = borg as unknown as BorgTestInternals;
     const correctionReview = internal.deps.reviewQueueRepository.enqueue({
       kind: "correction",
-      refs: { target_type: "value", target_id: "val_fixture", patch: { description: "new" } },
+      refs: {
+        target_type: "value",
+        target_id: "val_aaaaaaaaaaaaaaaa",
+        patch: { description: "new" },
+      },
       reason: "queued correction fixture",
     });
     const duplicateReview = internal.deps.reviewQueueRepository.enqueue({
       kind: "duplicate",
       refs: {
-        node_ids: ["sem_fixtureaaaaaaa1", "sem_fixtureaaaaaaa2"],
+        node_ids: ["semn_aaaaaaaaaaaaaaa1", "semn_aaaaaaaaaaaaaaa2"],
       },
       reason: "duplicate review fixture",
     });
@@ -3071,10 +3157,20 @@ describe("demo server", () => {
     });
 
     expect(response.status).toBe(200);
-    const created = (await response.json()) as { id: string; source: string };
+    const created = (await response.json()) as {
+      id: string;
+      source: string;
+      disclosure?: string;
+      disclosure_label?: { disclosure_class?: string; origin_audience_entity_ids?: string[] };
+    };
     expect(created).toMatchObject({
       id: expect.stringMatching(/^cmt_/),
       source: "manual",
+      disclosure: expect.stringContaining("disclosure_class=relationship_private"),
+      disclosure_label: {
+        disclosure_class: "relationship_private",
+        origin_audience_entity_ids: expect.any(Array),
+      },
     });
 
     const list = await app.request("/api/commitments?audience=Alice&state=all");
@@ -3089,6 +3185,10 @@ describe("demo server", () => {
           made_to: "Tom",
           about: "Project Atlas",
           directive_family: "creator_guidance",
+          disclosure: expect.stringContaining("disclosure_class=relationship_private"),
+          disclosure_label: expect.objectContaining({
+            disclosure_class: "relationship_private",
+          }),
         }),
       ],
     });
@@ -4186,7 +4286,9 @@ describe("demo server", () => {
       },
     });
 
-    const response = await app.request(`/api/activity?day=${localDayString(defaultResult.timestamp)}`);
+    const response = await app.request(
+      `/api/activity?day=${localDayString(defaultResult.timestamp)}`,
+    );
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
       rows: Array<{ id: string; origin: string; trigger: string | null; excerpt: string | null }>;
@@ -4235,7 +4337,9 @@ describe("demo server", () => {
     }
 
     expect(firstSource).not.toBeNull();
-    const response = await app.request(`/api/activity?day=${localDayString(firstSource!.timestamp)}`);
+    const response = await app.request(
+      `/api/activity?day=${localDayString(firstSource!.timestamp)}`,
+    );
     expect(response.status).toBe(200);
     const body = (await response.json()) as { rows: unknown[]; truncated: boolean };
 
@@ -4603,7 +4707,7 @@ describe("demo server", () => {
     });
   });
 
-  it("broadcasts token frames between finalizer phase start and completion", async () => {
+  it("broadcasts the buffered unary finalizer text between phase start and completion", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-demo-server-"));
     tempDirs.push(tempDir);
     const llm = new FakeLLMClient({
@@ -4636,6 +4740,7 @@ describe("demo server", () => {
         (frame.data as { phase?: unknown } | undefined)?.phase === "final",
     );
     const tokenFrame = frames.findIndex((frame) => frame.type === "turn:token");
+    const flushFrame = frames.findIndex((frame) => frame.type === "turn:token:flush");
     const finalComplete = frames.findIndex(
       (frame) =>
         frame.type === "turn:phase:completed" &&
@@ -4644,12 +4749,18 @@ describe("demo server", () => {
 
     expect(finalStart).toBeGreaterThanOrEqual(0);
     expect(tokenFrame).toBeGreaterThan(finalStart);
-    expect(finalComplete).toBeGreaterThan(tokenFrame);
+    expect(flushFrame).toBeGreaterThan(tokenFrame);
+    expect(finalComplete).toBeGreaterThan(flushFrame);
     expect(frames[tokenFrame]).toMatchObject({
       type: "turn:token",
       phase: "final",
-      chunk_text: "ws ",
+      chunk_text: "ws token ok",
       sequence: 1,
+    });
+    expect(frames[flushFrame]).toMatchObject({
+      type: "turn:token:flush",
+      phase: "final",
+      full_text: "ws token ok",
     });
   });
 

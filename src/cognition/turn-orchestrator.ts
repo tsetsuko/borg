@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
+import type { OperatorAttentionRepository } from "../memory/operator-attention/index.js";
 import type {
   AttachmentRepository,
   AttachmentService,
@@ -13,6 +14,7 @@ import type { ExecutiveStepsRepository } from "../executive/index.js";
 import type { EmbeddingClient } from "../embeddings/index.js";
 import type { LLMClient } from "../llm/index.js";
 import { MoodRepository } from "../memory/affective/index.js";
+import type { SourceStreamAudienceDisclosureResolver } from "../memory/common/index.js";
 import type {
   ActivityRepository,
   LivedExperienceDaySummaryRepository,
@@ -55,7 +57,7 @@ import {
 import type { ToolDispatcher } from "../tools/dispatcher.js";
 import { SystemClock, type Clock } from "../util/clock.js";
 import { SessionBusyError } from "../util/errors.js";
-import { DEFAULT_SESSION_ID, type EntityId, type SessionId } from "../util/ids.js";
+import { DEFAULT_SESSION_ID, type EntityId, type GoalId, type SessionId } from "../util/ids.js";
 import type { ToolLoopCallRecord } from "./turn-action/index.js";
 import { TurnActionCoordinator } from "./turn-action/turn-action-coordinator.js";
 import { TurnActionStateService } from "./actions/turn-action-state-service.js";
@@ -96,6 +98,13 @@ import { TurnSelfContextBuilder } from "./self/turn-self-context.js";
 import { NOOP_TRACER, type TurnTerminalOutcome, type TurnTracer } from "../tracing/tracer.js";
 import type { TurnOrchestratorInput } from "./turn-input.js";
 import { isAutonomousLikeTurnOrigin, type CognitiveMode, type IntentRecord } from "./types.js";
+import {
+  associateTurnExecutionMetricsWithError,
+  createTurnExecutionMetrics,
+  observeTurnLlmClient,
+  snapshotTurnExecutionMetrics,
+  turnExecutionMetricsStorage,
+} from "./turn-execution-metrics.js";
 
 export type TurnResult = {
   turn_id: string;
@@ -116,6 +125,9 @@ export type TurnResult = {
   referencedEpisodeIds: string[];
   intents: IntentRecord[];
   toolCalls: ToolLoopCallRecord[];
+  finalizer_rounds: number;
+  stall_retries: number;
+  reflectionRetiredGoalIds?: GoalId[];
   agentMessageId?: string;
   outboundDelivery?: OutboundDeliveryReceipt;
 };
@@ -139,6 +151,7 @@ export type TurnOrchestratorOptions = {
   relationalSlotRepository: RelationalSlotRepository;
   entityRepository: EntityRepository;
   commitmentRepository: CommitmentRepository;
+  sourceStreamAudienceDisclosureResolver?: SourceStreamAudienceDisclosureResolver;
   creatorDirectiveRepository: CreatorDirectiveRepository;
   sharedStateRepository: SharedStateRepository;
   activityRepository?: ActivityRepository;
@@ -186,6 +199,7 @@ export type TurnOrchestratorOptions = {
   chatResponseWatermarkCoordinator?: ChatResponseWatermarkCoordinator;
   outboundDelivery?: Pick<OutboundDelivery, "deliver">;
   autonomousOutboundPolicy?: Pick<AutonomousOutboundPolicy, "promptContext">;
+  operatorAttentionRepository?: Pick<OperatorAttentionRepository, "snapshot">;
   autonomySchedulerStateProvider?: () => Promise<AutonomySchedulerDescription | null>;
   outboundSourceTypes?: readonly SessionSourceType[];
   affectiveSignalDetector?: typeof detectAffectiveSignal;
@@ -201,6 +215,7 @@ function stripTurnLockMode(input: TurnOrchestratorInput): TurnPhaseCoordinatorIn
 }
 
 export class TurnOrchestrator {
+  readonly postGenerationGuardRunner: TurnPostGenerationGuardRunner;
   private readonly clock: Clock;
   private readonly sessionLock: SessionLock;
   private readonly tracer: TurnTracer;
@@ -216,6 +231,7 @@ export class TurnOrchestrator {
       new SessionLock({
         dataDir: options.config.dataDir,
       });
+    const createObservedLlmClient = () => observeTurnLlmClient(options.llmFactory());
     const createStreamReader =
       options.createStreamReader ??
       ((sessionId: SessionId) =>
@@ -226,7 +242,7 @@ export class TurnOrchestrator {
         }));
     const perceptionGateway = new PerceptionGateway({
       config: options.config,
-      llmFactory: () => options.llmFactory(),
+      llmFactory: createObservedLlmClient,
       clock: this.clock,
       tracer: this.tracer,
       getAffectiveSignalDetector: () => options.affectiveSignalDetector,
@@ -245,11 +261,15 @@ export class TurnOrchestrator {
     });
     const turnRetrievalCoordinator = new TurnRetrievalCoordinator({
       commitmentRepository: options.commitmentRepository,
+      sourceStreamAudienceDisclosureResolver: options.sourceStreamAudienceDisclosureResolver,
       entityRepository: options.entityRepository,
       reviewQueueRepository: options.reviewQueueRepository,
       moodRepository: options.moodRepository,
       retrievalPipeline: options.retrievalPipeline,
       skillSelector: options.skillSelector,
+      ...(options.livedExperienceDaySummaryRepository === undefined
+        ? {}
+        : { livedExperienceDaySummaryRepository: options.livedExperienceDaySummaryRepository }),
       clock: this.clock,
       tracer: this.tracer,
     });
@@ -267,6 +287,7 @@ export class TurnOrchestrator {
       embeddingClient: options.embeddingClient,
       valuesRepository: options.valuesRepository,
       goalsRepository: options.goalsRepository,
+      sourceStreamAudienceDisclosureResolver: options.sourceStreamAudienceDisclosureResolver,
       traitsRepository: options.traitsRepository,
       autobiographicalRepository: options.autobiographicalRepository,
       growthMarkersRepository: options.growthMarkersRepository,
@@ -278,9 +299,11 @@ export class TurnOrchestrator {
       goalFollowupStaleMs: options.config.autonomy.triggers.goalFollowupDue.staleMs,
     });
     const correctivePreferenceTurnService = new CorrectivePreferenceTurnService({
-      model: options.config.anthropic.models.recallExpansion,
+      model: options.config.anthropic.models.correctivePreference,
       commitmentRepository: options.commitmentRepository,
+      sourceStreamAudienceDisclosureResolver: options.sourceStreamAudienceDisclosureResolver,
       identityService: options.identityService,
+      entityRepository: options.entityRepository,
       relationalSlotRepository: options.relationalSlotRepository,
       workingMemoryStore: options.workingMemoryStore,
       clock: this.clock,
@@ -293,6 +316,7 @@ export class TurnOrchestrator {
       tracer: this.tracer,
     });
     const turnActionStateService = new TurnActionStateService({
+      similarityConfig: options.config,
       model: options.config.anthropic.models.recallExpansion,
       actionRepository: options.actionRepository,
       embeddingClient: options.embeddingClient,
@@ -328,11 +352,13 @@ export class TurnOrchestrator {
       tracer: this.tracer,
     });
     const turnGoalPromotionService = new TurnGoalPromotionService({
+      similarityConfig: options.config,
       model: options.config.anthropic.models.recallExpansion,
       identityService: options.identityService,
       goalsRepository: options.goalsRepository,
       executiveStepsRepository: options.executiveStepsRepository,
       embeddingClient: options.embeddingClient,
+      entityRepository: options.entityRepository,
       clock: this.clock,
       tracer: this.tracer,
     });
@@ -351,12 +377,15 @@ export class TurnOrchestrator {
       clock: this.clock,
       tracer: this.tracer,
     });
+    this.postGenerationGuardRunner = postGenerationGuardRunner;
     const plannerContextCapture =
       options.config.deliberation.plannerContextCaptureSampleRate === 0
         ? undefined
         : new PlannerContextCapture({
             dataDir: options.config.dataDir,
             sampleRate: options.config.deliberation.plannerContextCaptureSampleRate,
+            maxFileBytes: options.config.deliberation.plannerContextCaptureMaxFileBytes,
+            rotationKeep: options.config.deliberation.contextCaptureRotationKeep,
             clock: this.clock,
             tracer: this.tracer,
           });
@@ -366,12 +395,15 @@ export class TurnOrchestrator {
         : new FinalizerContextCapture({
             dataDir: options.config.dataDir,
             sampleRate: options.config.deliberation.finalizerContextCaptureSampleRate,
+            maxFileBytes: options.config.deliberation.finalizerContextCaptureMaxFileBytes,
+            rotationKeep: options.config.deliberation.contextCaptureRotationKeep,
             clock: this.clock,
             tracer: this.tracer,
             attachmentResolver: (attachmentId) =>
               options.attachmentService.fetchImageForLlm(attachmentId),
           });
     const turnActionCoordinator = new TurnActionCoordinator({
+      similarityConfig: options.config,
       commitmentGuardRunner,
       postGenerationGuardRunner,
       embeddingClient: options.embeddingClient,
@@ -400,6 +432,7 @@ export class TurnOrchestrator {
       relationalSlotRepository: options.relationalSlotRepository,
       actionRepository: options.actionRepository,
       commitmentRepository: options.commitmentRepository,
+      sourceStreamAudienceDisclosureResolver: options.sourceStreamAudienceDisclosureResolver,
       creatorDirectiveRepository: options.creatorDirectiveRepository,
       sharedStateRepository: options.sharedStateRepository,
       activityRepository: options.activityRepository,
@@ -421,9 +454,10 @@ export class TurnOrchestrator {
       chatResponseWatermarkCoordinator: options.chatResponseWatermarkCoordinator,
       outboundDelivery: options.outboundDelivery,
       autonomousOutboundPolicy: options.autonomousOutboundPolicy,
+      operatorAttentionRepository: options.operatorAttentionRepository,
       autonomySchedulerStateProvider: options.autonomySchedulerStateProvider,
       outboundSourceTypes: options.outboundSourceTypes,
-      llmFactory: () => options.llmFactory(),
+      llmFactory: createObservedLlmClient,
       perceptionGateway,
       turnOpeningPersistence,
       attributionLifecycleService,
@@ -564,6 +598,7 @@ export class TurnOrchestrator {
     const streamWriter = this.options.createStreamWriter(sessionId);
     const terminalStartedWallMs = performance.now();
     let terminalOutcome: TurnTerminalOutcome = "error";
+    const executionMetrics = createTurnExecutionMetrics();
     const lifecycleTracker = new TurnLifecycleTracker({
       workingMemoryStore: this.options.workingMemoryStore,
       actionRepository: this.options.actionRepository,
@@ -577,38 +612,50 @@ export class TurnOrchestrator {
 
     try {
       try {
-        const result = await this.turnPhaseCoordinator.run({
-          input: phaseInput,
-          globalTurnCounter,
-          sessionId,
-          turnId,
-          streamWriter,
-          lifecycleTracker,
-        });
-        lifecycleTracker.commitTurnState();
-        terminalOutcome =
-          result.terminalOutcome ??
-          (result.path === "suppressed" ? "suppressed_action" : "reflected");
-        return result;
-      } catch (error) {
-        const rollbackFailures = await lifecycleTracker.cleanupAbortedTurnState({
-          turnId,
-          sessionId,
-        });
-        await this.appendFailureEvent(streamWriter, error, sessionId, turnId, rollbackFailures);
-        terminalOutcome = "aborted";
-        throw error;
+        try {
+          const result = await turnExecutionMetricsStorage.run(
+            executionMetrics,
+            () =>
+              this.turnPhaseCoordinator.run({
+                input: phaseInput,
+                globalTurnCounter,
+                sessionId,
+                turnId,
+                streamWriter,
+                lifecycleTracker,
+              }),
+          );
+          lifecycleTracker.commitTurnState();
+          terminalOutcome =
+            result.terminalOutcome ??
+            (result.path === "suppressed" ? "suppressed_action" : "reflected");
+          return {
+            ...result,
+            ...snapshotTurnExecutionMetrics(executionMetrics),
+          };
+        } catch (error) {
+          const rollbackFailures = await lifecycleTracker.cleanupAbortedTurnState({
+            turnId,
+            sessionId,
+          });
+          await this.appendFailureEvent(streamWriter, error, sessionId, turnId, rollbackFailures);
+          terminalOutcome = "aborted";
+          throw error;
+        } finally {
+          this.emitTerminalTurn({
+            turnId,
+            sessionId,
+            outcome: terminalOutcome,
+            startedWallMs: terminalStartedWallMs,
+          });
+        }
       } finally {
-        this.emitTerminalTurn({
-          turnId,
-          sessionId,
-          outcome: terminalOutcome,
-          startedWallMs: terminalStartedWallMs,
-        });
+        streamWriter.close();
+        await lease.release();
       }
-    } finally {
-      streamWriter.close();
-      await lease.release();
+    } catch (error) {
+      associateTurnExecutionMetricsWithError(error, executionMetrics);
+      throw error;
     }
   }
 }

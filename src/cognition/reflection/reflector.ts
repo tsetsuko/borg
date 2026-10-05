@@ -1,3 +1,8 @@
+import {
+  artifactReferenceSchema,
+  deliveredOutboundPostArtifactOutputSchema,
+} from "../../memory/common/artifact-reference.js";
+import { goalBlockStateFields } from "../../memory/self/goal-blocks.js";
 import type { RetrievalConfidence, RetrievedEpisode } from "../../retrieval/index.js";
 import {
   combineMemoryDisclosureLabels,
@@ -63,9 +68,11 @@ import {
   type ExecutiveStepId,
   type GoalId,
   type OpenQuestionId,
+  type ScheduledWakeId,
   type SessionId,
   type SkillId,
   type StreamEntryId,
+  scheduledWakeIdHelpers,
 } from "../../util/ids.js";
 import { IdentityCasMismatchError, LLMError } from "../../util/errors.js";
 import { z } from "zod";
@@ -88,6 +95,7 @@ import {
   memoryDisclosurePayloadFields,
   openQuestionMemoryDisclosureLabel,
 } from "../../memory/common/disclosure-serializers.js";
+import { OUTBOUND_POST_TOOL_NAME } from "../../tools/internal/outbound-post-name.js";
 export type ReflectionContext = {
   turnId?: string;
   sessionId?: SessionId;
@@ -113,6 +121,11 @@ export type ReflectionContext = {
   // (user_msg + agent_msg). Used as evidence for trait demonstrations
   // since the episode hasn't been extracted yet at reflection time.
   currentTurnStreamEntryIds?: readonly StreamEntryId[];
+  // Records written by the turn's terminal emission. They remain available
+  // as reflection evidence, but the emission itself is not a distinct act
+  // that can substantiate autonomous goal progress.
+  currentTurnProducedStreamEntryIds?: readonly StreamEntryId[];
+  currentTurnJournalEntryIds?: readonly number[];
 };
 
 export type ReflectionEffects = {
@@ -121,6 +134,7 @@ export type ReflectionEffects = {
   createdOpenQuestionIds: OpenQuestionId[];
   updatedExecutiveSteps: ExecutiveStep[];
   updatedGoals: GoalRecord[];
+  retiredGoalIds: GoalId[];
   resolvedOpenQuestions: OpenQuestion[];
   updatedEpisodeStats: EpisodeStats[];
 };
@@ -132,6 +146,10 @@ export type ReflectionResult = {
 
 const SURFACED_TTL_TURNS = 4;
 const REFLECTION_TOOL_NAME = "EmitTurnReflection";
+const JOURNAL_APPEND_TOOL_NAME = "tool.journal.append";
+const OPEN_QUESTION_CREATE_TOOL_NAME = "tool.openQuestions.create";
+const OPEN_QUESTION_RESOLVE_TOOL_NAME = "tool.openQuestions.resolve";
+const SCHEDULED_WAKE_CREATE_TOOL_NAME = "tool.scheduledWakes.create";
 const DEFAULT_REFLECTION_MAX_TOKENS = 768;
 const REFLECTION_GOAL_PROGRESS_NOTES_CHAR_BUDGET = 1_200;
 // Candidate labels can grow quickly; established traits are the stable vocabulary,
@@ -172,6 +190,45 @@ const resolvedOpenQuestionSchema = z.object({
   evidence_stream_entry_ids: z.array(streamEntryIdSchema).default([]),
 });
 
+const scheduledWakeIdSchema = z
+  .string()
+  .refine((value) => scheduledWakeIdHelpers.is(value), {
+    message: "Invalid scheduled wake id",
+  })
+  .transform((value) => value as ScheduledWakeId);
+
+const advancedGoalArtifactReferenceSchema = artifactReferenceSchema.describe(
+  "The artifact this turn produced through an act distinct from its terminal emission that constitutes the movement.",
+);
+
+type AdvancedGoalArtifactReference = z.infer<typeof advancedGoalArtifactReferenceSchema>;
+
+const journalAppendArtifactOutputSchema = z.object({
+  journalEntry: z.object({
+    id: z.number().int().positive(),
+  }),
+});
+
+const createdOpenQuestionArtifactOutputSchema = z.object({
+  openQuestion: z.object({
+    id: openQuestionIdSchema,
+  }),
+});
+
+const resolvedOpenQuestionArtifactOutputSchema = z.object({
+  status: z.literal("applied"),
+  openQuestion: z.object({
+    id: openQuestionIdSchema,
+    status: z.literal("resolved"),
+  }),
+});
+
+const scheduledWakeArtifactOutputSchema = z.object({
+  scheduledWake: z.object({
+    id: scheduledWakeIdSchema,
+  }),
+});
+
 const retiredGoalSchema = z.object({
   goal_id: goalIdSchema,
   disposition: z.enum(["satisfied", "no_longer_pursued"]),
@@ -201,10 +258,11 @@ const strictReflectionOutputSchema = z.object({
       z.object({
         goal_id: z.string().min(1),
         evidence: z.string().min(1),
+        artifact_reference: advancedGoalArtifactReferenceSchema.optional(),
       }),
     )
     .describe(
-      `Goals advanced by this turn. Mark only if the turn took a concrete step toward the goal, not just discussed it. The evidence is appended to goal progress_notes; for Borg-owned goals, apply this voice guidance: ${SELF_REFERENTIAL_MEMORY_VOICE_GUIDANCE}`,
+      `Goals advanced by this turn. Mark only when the turn made concrete movement toward the goal -- a decision made, a question resolved, a step completed, or an artifact produced -- not when it merely deliberated about the goal. The evidence is appended to goal progress_notes; for Borg-owned goals, apply this voice guidance: ${SELF_REFERENTIAL_MEMORY_VOICE_GUIDANCE}`,
     )
     .default([]),
   procedural_outcomes: z
@@ -312,9 +370,113 @@ function emptyReflectionEffects(): ReflectionEffects {
     createdOpenQuestionIds: [],
     updatedExecutiveSteps: [],
     updatedGoals: [],
+    retiredGoalIds: [],
     resolvedOpenQuestions: [],
     updatedEpisodeStats: [],
   };
+}
+
+function currentTurnArtifactReferences(
+  context: Pick<
+    ReflectionContext,
+    "actionResult" | "currentTurnJournalEntryIds" | "currentTurnProducedStreamEntryIds"
+  >,
+  effects?: Pick<ReflectionEffects, "resolvedOpenQuestions" | "updatedExecutiveSteps">,
+): AdvancedGoalArtifactReference[] {
+  const references: AdvancedGoalArtifactReference[] = [];
+
+  for (const toolCall of context.actionResult.tool_calls) {
+    if (!toolCall.ok) {
+      continue;
+    }
+
+    if (toolCall.name === JOURNAL_APPEND_TOOL_NAME) {
+      const parsed = journalAppendArtifactOutputSchema.safeParse(toolCall.output);
+
+      if (parsed.success) {
+        references.push({
+          kind: "journal_entry",
+          id: parsed.data.journalEntry.id,
+        });
+      }
+    } else if (toolCall.name === OPEN_QUESTION_CREATE_TOOL_NAME) {
+      const parsed = createdOpenQuestionArtifactOutputSchema.safeParse(toolCall.output);
+
+      if (parsed.success) {
+        references.push({
+          kind: "created_open_question",
+          id: parsed.data.openQuestion.id,
+        });
+      }
+    } else if (toolCall.name === OPEN_QUESTION_RESOLVE_TOOL_NAME) {
+      const parsed = resolvedOpenQuestionArtifactOutputSchema.safeParse(toolCall.output);
+
+      if (parsed.success) {
+        references.push({
+          kind: "resolved_open_question",
+          id: parsed.data.openQuestion.id,
+        });
+      }
+    } else if (toolCall.name === SCHEDULED_WAKE_CREATE_TOOL_NAME) {
+      const parsed = scheduledWakeArtifactOutputSchema.safeParse(toolCall.output);
+
+      if (parsed.success) {
+        references.push({
+          kind: "scheduled_wake",
+          id: parsed.data.scheduledWake.id,
+        });
+      }
+    } else if (toolCall.name === OUTBOUND_POST_TOOL_NAME) {
+      const parsed = deliveredOutboundPostArtifactOutputSchema.safeParse(toolCall.output);
+
+      if (parsed.success) {
+        references.push({
+          kind: "delivered_outbound_post",
+          id: parsed.data.outbound.delivery_outcome.agent_message_id,
+        });
+      }
+    }
+  }
+
+  if (effects !== undefined) {
+    references.push(
+      ...effects.resolvedOpenQuestions.map((question) => ({
+        kind: "resolved_open_question" as const,
+        id: question.id,
+      })),
+      ...effects.updatedExecutiveSteps.map((step) => ({
+        kind: "executive_step_outcome" as const,
+        id: step.id,
+      })),
+    );
+  }
+
+  const emissionJournalEntryIds = new Set(context.currentTurnJournalEntryIds ?? []);
+  const emissionStreamEntryIds = new Set(context.currentTurnProducedStreamEntryIds ?? []);
+
+  return references.filter((reference) => {
+    if (reference.kind === "journal_entry") {
+      return !emissionJournalEntryIds.has(reference.id);
+    }
+
+    if (reference.kind === "delivered_outbound_post" || reference.kind === "stream_entry") {
+      return !emissionStreamEntryIds.has(reference.id);
+    }
+
+    return true;
+  });
+}
+
+function includesArtifactReference(
+  references: readonly AdvancedGoalArtifactReference[],
+  candidate: AdvancedGoalArtifactReference | undefined,
+): boolean {
+  return (
+    candidate !== undefined &&
+    references.some(
+      (reference) => reference.kind === candidate.kind && reference.id === candidate.id,
+    )
+  );
 }
 
 function buildReflectionProvenance(retrievedEpisodes: readonly RetrievedEpisode[]) {
@@ -535,8 +697,11 @@ function summarizeExecutiveFocusForReflection(focus: ExecutiveFocus | null | und
     selected_goal: {
       goal_id: focus.selected_goal.id,
       description: focus.selected_goal.description,
+      status: focus.selected_goal.status,
+      ...goalBlockStateFields(focus.selected_goal),
       terminal_condition: focus.selected_goal.terminal_condition ?? null,
       progress_notes: renderGoalProgressNotesForReflection(focus.selected_goal.progress_notes),
+      counterparty_entity_id: focus.selected_goal.counterparty_entity_id ?? null,
       ...memoryDisclosurePayloadFields(selectedGoalDisclosureLabel),
     },
     next_step:
@@ -658,11 +823,42 @@ export class Reflector {
     const retiredGoalIds = new Set(
       reflectionOutput.retired_goals.map((retirement) => retirement.goal_id),
     );
-    const advancedGoals = isAutonomousTurn
-      ? []
-      : reflectionOutput.advanced_goals.filter(
-          (advancedGoal) => !retiredGoalIds.has(advancedGoal.goal_id as GoalRecord["id"]),
-        );
+
+    const retrievedEpisodeIdSet = new Set(
+      context.retrievedEpisodes.map((result) => result.episode.id),
+    );
+
+    await this.applyResolvedOpenQuestions(
+      context,
+      reflectionOutput.resolved_open_questions,
+      effects,
+    );
+
+    const availableArtifactReferences = currentTurnArtifactReferences(context, effects);
+    const advancedGoals: ReflectionOutput["advanced_goals"] = [];
+
+    for (const advancedGoal of reflectionOutput.advanced_goals) {
+      if (
+        isAutonomousTurn &&
+        !includesArtifactReference(availableArtifactReferences, advancedGoal.artifact_reference)
+      ) {
+        await this.appendReflectorInternalEvent(streamWriter, {
+          hook: "reflector_advanced_goal_dropped",
+          goal_id: advancedGoal.goal_id,
+          reason: "no this-turn artifact distinct from the emission",
+          ...(advancedGoal.artifact_reference === undefined
+            ? {}
+            : { artifact_reference: advancedGoal.artifact_reference }),
+        });
+        continue;
+      }
+
+      if (retiredGoalIds.has(advancedGoal.goal_id as GoalRecord["id"])) {
+        continue;
+      }
+
+      advancedGoals.push(advancedGoal);
+    }
 
     for (const advancedGoal of advancedGoals) {
       const goal = activeGoalsById.get(advancedGoal.goal_id as GoalRecord["id"]);
@@ -671,9 +867,16 @@ export class Reflector {
         continue;
       }
 
+      // advanced_goals can name the same goal more than once in a single
+      // reflection output. The base for the appended note therefore has to come
+      // from storage rather than the pre-loop snapshot: composing every note
+      // against the same snapshot makes each write a full replacement, so the
+      // later note overwrites the earlier one instead of following it.
+      const stored = this.options.goalsRepository.get(goal.id);
+      const progressNotesBase = stored === null ? goal.progress_notes : stored.progress_notes;
       const evidence = advancedGoal.evidence.trim();
       const note = `[${this.clock.now()}] ${evidence}`;
-      const nextProgress = goal.progress_notes === null ? note : `${goal.progress_notes}\n${note}`;
+      const nextProgress = progressNotesBase === null ? note : `${progressNotesBase}\n${note}`;
       const patch = {
         progress_notes: nextProgress,
         last_progress_ts: this.clock.now(),
@@ -689,7 +892,8 @@ export class Reflector {
       }
 
       const result =
-        reflectionOrigin === "user" && isProgressOnlyGoalPatch(patch)
+        (reflectionOrigin === "user" || reflectionOrigin === "autonomous") &&
+        isProgressOnlyGoalPatch(patch)
           ? this.options.identityService.updateGoalProgressFromReflection(
               goal.id,
               patch,
@@ -710,16 +914,6 @@ export class Reflector {
     }
 
     this.applyRetiredGoals(context, reflectionOutput.retired_goals, effects);
-
-    const retrievedEpisodeIdSet = new Set(
-      context.retrievedEpisodes.map((result) => result.episode.id),
-    );
-
-    await this.applyResolvedOpenQuestions(
-      context,
-      reflectionOutput.resolved_open_questions,
-      effects,
-    );
 
     for (const result of context.retrievedEpisodes) {
       const stats = this.options.episodicRepository.getStats(result.episode.id);
@@ -1632,6 +1826,7 @@ export class Reflector {
           { expectedVersion: snapshotGoal.record_version },
         );
         effects.updatedGoals.push(current);
+        effects.retiredGoalIds.push(snapshotGoal.id);
         this.emitGoalRetirementAttempt(context, {
           goalId: retirement.goal_id,
           disposition: retirement.disposition,
@@ -1927,10 +2122,12 @@ export class Reflector {
                     goal_id: goal.id,
                     description: goal.description,
                     status: goal.status,
+                    ...goalBlockStateFields(goal),
                     terminal_condition: goal.terminal_condition ?? null,
                     progress_notes: renderGoalProgressNotesForReflection(goal.progress_notes),
                     audience_entity_id: goal.audience_entity_id,
                     owner_entity_id: goal.owner_entity_id ?? null,
+                    counterparty_entity_id: goal.counterparty_entity_id ?? null,
                     ...memoryDisclosurePayloadFields(goalMemoryDisclosureLabel(goal)),
                   })),
                   executive_focus: executiveFocusForReflection,
@@ -1951,6 +2148,7 @@ export class Reflector {
                     ...memoryDisclosurePayloadFields(openQuestionMemoryDisclosureLabel(question)),
                   })),
                   current_turn_stream_entry_ids: context.currentTurnStreamEntryIds ?? [],
+                  current_turn_artifact_references: currentTurnArtifactReferences(context),
                   available_evidence_episodes: context.retrievedEpisodes.map((result) => ({
                     id: result.episode.id,
                     title: result.episode.title,

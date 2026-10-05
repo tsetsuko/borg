@@ -1,3 +1,9 @@
+import { similarityThresholds } from "../../config/similarity.js";
+import {
+  collectProtectedEpisodeTokenLines,
+  consolidationEmbeddingInputSchema,
+} from "../../memory/episodic/protected-lines.js";
+
 import { z } from "zod";
 
 import {
@@ -41,6 +47,7 @@ import {
 import { BudgetExceededError, StorageError } from "../../util/errors.js";
 import {
   GENERIC_SELF_ENTITY_VOICE_ANCHOR,
+  MEMORY_SOURCE_LANGUAGE_GUIDANCE,
   SELF_REFERENTIAL_MEMORY_VOICE_GUIDANCE,
 } from "../../util/self-memory-voice.js";
 
@@ -87,6 +94,7 @@ const serializableEpisodeSchema = z.object({
   episode_kind: episodeKindSchema.optional(),
   consolidation_family_id: consolidationFamilyIdSchema.nullable().optional(),
   consolidation_coverage_hash: z.string().min(1).nullable().optional(),
+  consolidation_embedding_input: consolidationEmbeddingInputSchema.nullable().optional(),
   embedding: z.array(z.number().finite()),
   created_at: z.number().finite(),
   updated_at: z.number().finite(),
@@ -137,7 +145,11 @@ const TIER_ORDER: Record<EpisodeTier, number> = {
 };
 
 type MergeSelfEntity = Pick<EntityRecord, "id" | "canonical_name">;
-type ConsolidatorConfig = OfflineContext["config"]["offline"]["consolidator"];
+type ConsolidatorConfig = OfflineContext["config"]["offline"]["consolidator"] & {
+  similarityThreshold: number;
+  maxClusterDiameter: number;
+  highSimilarityTemporalBypassThreshold: number;
+};
 
 type RawEpisodeWithStats = {
   episode: Episode;
@@ -167,15 +179,19 @@ function compareTier(left: EpisodeTier, right: EpisodeTier): number {
   return TIER_ORDER[left] - TIER_ORDER[right];
 }
 
+function compareStableIds(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function compareEpisodesOldestFirst(left: Episode, right: Episode): number {
-  return left.created_at - right.created_at || left.id.localeCompare(right.id);
+  return left.created_at - right.created_at || compareStableIds(left.id, right.id);
 }
 
 function compareRawRowsNewestFirst(left: RawEpisodeWithStats, right: RawEpisodeWithStats): number {
   return (
     right.episode.updated_at - left.episode.updated_at ||
     right.episode.created_at - left.episode.created_at ||
-    left.episode.id.localeCompare(right.episode.id)
+    compareStableIds(left.episode.id, right.episode.id)
   );
 }
 
@@ -339,6 +355,7 @@ function buildMergePrompt(
     "Any complete raw narrative line containing an OUTCOME fp= or decision= token, or beginning with ticket=<X> action=<Y> or action=teams_card, is an opaque dedup record. I copy that complete line verbatim; I never paraphrase, extend, normalize, or omit it.",
     selfEntityGuidance,
     `${SELF_REFERENTIAL_MEMORY_VOICE_GUIDANCE} I apply this to the merged narrative. I keep the title topic-neutral and scannable rather than first-person narration.`,
+    MEMORY_SOURCE_LANGUAGE_GUIDANCE,
     ...previousContext,
     "New raw evidence:",
     ...candidate.newRawEpisodes.map((episode) =>
@@ -381,7 +398,11 @@ function buildCompleteLinkClusters(
         cohesion: pairCohesion(seed.episode, candidate.episode, config),
       }))
       .filter((candidate) => candidate.cohesion.eligible)
-      .sort((left, right) => right.cohesion.similarity - left.cohesion.similarity);
+      .sort(
+        (left, right) =>
+          right.cohesion.similarity - left.cohesion.similarity ||
+          compareRawRowsNewestFirst(left.candidate, right.candidate),
+      );
     const cluster = [seed];
 
     for (const { candidate } of candidates) {
@@ -414,7 +435,8 @@ function buildCompleteLinkClusters(
   return clusters.sort(
     (left, right) =>
       right.rows.length - left.rows.length ||
-      (right.rows[0]?.episode.updated_at ?? 0) - (left.rows[0]?.episode.updated_at ?? 0),
+      (right.rows[0]?.episode.updated_at ?? 0) - (left.rows[0]?.episode.updated_at ?? 0) ||
+      compareStableIds(left.rows[0]?.episode.id ?? "", right.rows[0]?.episode.id ?? ""),
   );
 }
 
@@ -481,7 +503,8 @@ function attachmentAnchorsForRow(
     .sort(
       (left, right) =>
         right.similarity - left.similarity ||
-        right.family.family.updated_at - left.family.family.updated_at,
+        right.family.family.updated_at - left.family.family.updated_at ||
+        compareStableIds(left.family.family.family_id, right.family.family.family_id),
     )
     .map((candidate) => candidate.family);
 }
@@ -568,7 +591,13 @@ async function collectConsolidationCandidates(
   ctx: OfflineContext,
   statsById: ReadonlyMap<EpisodeId, EpisodeStats>,
 ): Promise<ConsolidationCandidate[]> {
-  const config = ctx.config.offline.consolidator;
+  const thresholds = similarityThresholds(ctx.config);
+  const config: ConsolidatorConfig = {
+    ...ctx.config.offline.consolidator,
+    similarityThreshold: thresholds.consolidationSimilarity,
+    maxClusterDiameter: thresholds.consolidationDiameter,
+    highSimilarityTemporalBypassThreshold: thresholds.consolidationTemporalBypass,
+  };
   const activeFamilies = await loadActiveFamilyAnchors(ctx);
   const visibleRawRows = (await ctx.episodicRepository.listEffectivelyVisible())
     .filter((episode) => (episode.episode_kind ?? "raw") === "raw")
@@ -658,7 +687,11 @@ async function collectConsolidationCandidates(
         Number(left.previousCurrentVersionEpisodeId === null) -
           Number(right.previousCurrentVersionEpisodeId === null) ||
         right.newRawEpisodes.length - left.newRawEpisodes.length ||
-        (right.newRawEpisodes[0]?.updated_at ?? 0) - (left.newRawEpisodes[0]?.updated_at ?? 0),
+        (right.newRawEpisodes[0]?.updated_at ?? 0) - (left.newRawEpisodes[0]?.updated_at ?? 0) ||
+        compareStableIds(
+          left.newRawEpisodes[0]?.id ?? left.familyId,
+          right.newRawEpisodes[0]?.id ?? right.familyId,
+        ),
     )
     .slice(0, config.maxClustersPerRun);
 }
@@ -753,6 +786,12 @@ async function buildMergedEpisode(
       episode_kind: "consolidation_version",
       consolidation_family_id: candidate.familyId,
       consolidation_coverage_hash: candidate.coverageHash,
+      consolidation_embedding_input: {
+        synthesized_narrative: merged.narrative,
+        protected_source_lines: collectProtectedEpisodeTokenLines(
+          rawEpisodes.map((episode) => episode.narrative),
+        ),
+      },
       embedding,
       created_at: nowMs,
       updated_at: nowMs,

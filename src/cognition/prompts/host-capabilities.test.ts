@@ -54,6 +54,39 @@ describe("buildHostCapabilitiesSection", () => {
     expect(section).toContain("tool.outbound.post");
     expect(section).toContain("Host-wired outbound capabilities available now:");
     expect(section).toContain("Targets without a wired connector are not transportable");
+    expect(section).toContain(
+      "A wired connector means the host can attempt the post, not that the far side accepts it",
+    );
+    expect(section).toContain("is not evidence it was carried");
+    expect(section).toContain("A post the connector accepted appends no event of its own");
+    expect(section).toContain("their absence is not evidence that nothing was delivered");
+    expect(section).toContain(
+      "the cross-session activity record for a post is written only when the connector accepted it",
+    );
+    // The withholding gate is one reader among several, and the one that matters most to a wake is
+    // the classifier: `turnEmittedHeadway` reads the same delivery state (pinned in
+    // src/autonomy/scheduler.test.ts), so headway-versus-silence can turn on the connector rather
+    // than on the emission. Both halves are asserted here because the line claims both.
+    expect(section).toContain("that outcome has several readers and only one of them withholds");
+    expect(section).toContain(
+      "the action record for the attempt is written either way and carries the refusal in its state",
+    );
+    expect(section).toContain(
+      "counts that wake as headway even when I emitted nothing else, and a refusal leaves it counted as silence",
+    );
+    // A hand-counted census of readers, written into prose that is never recomputed, goes false
+    // silently the next time one is added -- which is how this line came to tell the entity that
+    // the classifier it is describing could not exist. The block states the shape and no count.
+    expect(section).not.toContain("read in exactly one place");
+    expect(section).toContain(
+      "autobiographical recall re-reads that result into an outbound_attempt row bearing the delivery outcome",
+    );
+    expect(section).toContain(
+      "its absence from that section is not evidence that no attempt was made",
+    );
+    // The block asserted this before the outbound_attempt row was traced back to its source. The
+    // tool result carries the connector's verdict and recall renders it, so the negative was false.
+    expect(section).not.toContain("no surface renders the outcome");
     expect(section).not.toContain(
       "Capabilities NOT available unless the host has declared them otherwise:\n- Proactive outbound messaging via wired source_type connector(s): demo",
     );

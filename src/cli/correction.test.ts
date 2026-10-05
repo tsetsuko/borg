@@ -12,6 +12,7 @@ import { FixedClock } from "../util/clock.js";
 import { runCli } from "./app.js";
 
 class CliEmbeddingClient implements EmbeddingClient {
+  readonly profile = { model: "fake-embed", dimensions: 4 };
   async embed(): Promise<Float32Array> {
     return Float32Array.from([1, 0, 0, 0]);
   }
@@ -59,6 +60,8 @@ function openCorrectionBorg(tempDir: string, llm = new FakeLLMClient()) {
           background: "haiku",
           extraction: "haiku",
           recallExpansion: "haiku",
+          correctivePreference: "sonnet",
+          sharedStateCompiler: "sonnet",
           creatorDirective: "sonnet",
           imagePerception: "haiku",
         },

@@ -1,4 +1,8 @@
-import { computeExecutiveContextFits, selectExecutiveFocus } from "../../executive/index.js";
+import {
+  computeExecutiveContextFits,
+  selectExecutiveFocus,
+  topExecutiveCandidateGoalIds,
+} from "../../executive/index.js";
 import type { ExecutiveFocus, ExecutiveStepsRepository } from "../../executive/index.js";
 import type { EmbeddingClient } from "../../embeddings/index.js";
 import type {
@@ -24,19 +28,23 @@ import {
   memoryDisclosureLabelFromMetadata,
   memoryDisclosurePayloadFields,
 } from "../../memory/common/disclosure-serializers.js";
+import type { SourceStreamAudienceDisclosureResolver } from "../../memory/common/index.js";
 import type { SelfSnapshot } from "../deliberation/deliberator.js";
 import type { TurnTracer } from "../../tracing/tracer.js";
 import type { PerceptionResult } from "../types.js";
-import { listActiveGoalsForCognition as listActiveGoalRecordsForCognition } from "./active-goals.js";
+import { listUnfinishedGoalsForCognition as listActiveGoalRecordsForCognition } from "./active-goals.js";
+import { PLANNER_GOAL_EXPANSION_LIMIT } from "../deliberation/constants.js";
 
 export type TurnSelfContextOptions = {
   embeddingClient: EmbeddingClient;
-  valuesRepository: Pick<ValuesRepository, "list">;
-  goalsRepository: Pick<GoalsRepository, "list">;
-  traitsRepository: Pick<TraitsRepository, "list">;
+  valuesRepository: Pick<ValuesRepository, "list"> & Partial<Pick<ValuesRepository, "count">>;
+  goalsRepository: Pick<GoalsRepository, "list"> &
+    Partial<Pick<GoalsRepository, "reconcileBlocks">>;
+  sourceStreamAudienceDisclosureResolver?: SourceStreamAudienceDisclosureResolver;
+  traitsRepository: Pick<TraitsRepository, "list"> & Partial<Pick<TraitsRepository, "count">>;
   autobiographicalRepository?: Pick<AutobiographicalRepository, "currentPeriod">;
   growthMarkersRepository?: Pick<GrowthMarkersRepository, "list">;
-  executiveStepsRepository: Pick<ExecutiveStepsRepository, "topOpen">;
+  executiveStepsRepository: Pick<ExecutiveStepsRepository, "topOpenForGoals">;
   clock: Clock;
   tracer: TurnTracer;
   goalFocusThreshold: number;
@@ -160,9 +168,18 @@ export class TurnSelfContextBuilder {
   constructor(private readonly options: TurnSelfContextOptions) {}
 
   async buildSelfSnapshot(_audienceEntityId: EntityId | null): Promise<SelfSnapshot> {
-    const goals = listActiveGoalRecordsForCognition(this.options.goalsRepository);
+    this.options.goalsRepository.reconcileBlocks?.();
+    const rawGoals = listActiveGoalRecordsForCognition(this.options.goalsRepository);
+    const goals =
+      this.options.sourceStreamAudienceDisclosureResolver?.resolve({ goals: rawGoals }).goals ??
+      rawGoals;
     const values = this.options.valuesRepository.list();
     const traits = this.options.traitsRepository.list();
+    // Counted by their own statements, not by measuring the draws above, so a
+    // renderer can check "I printed all of them" against a number the draw did
+    // not produce.
+    const valuesStoredTotal = this.options.valuesRepository.count?.();
+    const traitsStoredTotal = this.options.traitsRepository.count?.();
     const currentPeriod = this.options.autobiographicalRepository?.currentPeriod() ?? null;
     const recentGrowthMarkers = this.options.growthMarkersRepository?.list({ limit: 3 }) ?? [];
 
@@ -170,13 +187,17 @@ export class TurnSelfContextBuilder {
       values,
       goals,
       traits,
+      valuesStoredTotal,
+      traitsStoredTotal,
       currentPeriod,
       recentGrowthMarkers,
     };
   }
 
   async listActiveGoalsForCognition(_audienceEntityId: EntityId | null): Promise<GoalRecord[]> {
-    return listActiveGoalRecordsForCognition(this.options.goalsRepository);
+    this.options.goalsRepository.reconcileBlocks?.();
+    const goals = listActiveGoalRecordsForCognition(this.options.goalsRepository);
+    return this.options.sourceStreamAudienceDisclosureResolver?.resolve({ goals }).goals ?? goals;
   }
 
   async build(input: TurnSelfContextInput): Promise<TurnSelfContext> {
@@ -257,25 +278,49 @@ export class TurnSelfContextBuilder {
       selfFeatures: selfScoringFeatures,
       primaryGoalId: executiveFocus.selected_goal?.id ?? null,
     });
-    const executiveFocusWithStep =
-      executiveFocus.selected_goal === null
-        ? executiveFocus
-        : {
-            ...executiveFocus,
-            next_step: (() => {
-              const step = this.options.executiveStepsRepository.topOpen(
-                executiveFocus.selected_goal.id,
-              );
-              const disclosureLabel = disclosureLabelsByGoalId.get(executiveFocus.selected_goal.id);
+    const expandedCandidateGoalIds = topExecutiveCandidateGoalIds({
+      candidates: executiveFocus.candidates,
+      eligibleGoalIds: new Set(selfSnapshot.goals.map((goal) => goal.id)),
+      limit: PLANNER_GOAL_EXPANSION_LIMIT,
+    });
+    const selectedGoalId = executiveFocus.selected_goal?.id ?? null;
+    const queriedGoalIds =
+      selectedGoalId === null || expandedCandidateGoalIds.includes(selectedGoalId)
+        ? expandedCandidateGoalIds
+        : [...expandedCandidateGoalIds, selectedGoalId];
+    const topOpenByGoalId = new Map(
+      this.options.executiveStepsRepository
+        .topOpenForGoals(queriedGoalIds)
+        .map((result) => [result.goal_id, result]),
+    );
+    const annotateStep = (goalId: GoalId) => {
+      const step = topOpenByGoalId.get(goalId)?.step ?? null;
+      const disclosureLabel = disclosureLabelsByGoalId.get(goalId);
 
-              return step === null || disclosureLabel === undefined
-                ? step
-                : {
-                    ...step,
-                    ...memoryDisclosurePayloadFields(disclosureLabel),
-                  };
-            })(),
+      return step === null || disclosureLabel === undefined
+        ? step
+        : {
+            ...step,
+            ...memoryDisclosurePayloadFields(disclosureLabel),
           };
+    };
+    const candidateTopOpenSteps = expandedCandidateGoalIds.flatMap((goalId) => {
+      const step = annotateStep(goalId);
+      return step === null ? [] : [step];
+    });
+    const omittedCandidateOpenStepCount = expandedCandidateGoalIds.reduce(
+      (count, goalId) =>
+        count + Math.max(0, (topOpenByGoalId.get(goalId)?.open_step_count ?? 0) - 1),
+      0,
+    );
+    const executiveFocusWithStep: ExecutiveFocus = {
+      ...executiveFocus,
+      next_step: selectedGoalId === null ? null : annotateStep(selectedGoalId),
+      candidate_steps: {
+        top_open_steps: candidateTopOpenSteps,
+        omitted_open_step_count: omittedCandidateOpenStepCount,
+      },
+    };
 
     return {
       selfSnapshot,

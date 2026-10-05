@@ -14,7 +14,9 @@ import type {
   SessionsRepository,
 } from "../../sessions/index.js";
 import type {
+  StreamConversation,
   StreamEntry,
+  StreamEntryMetadata,
   StreamEntryIndexRecord,
   StreamEntryIndexRepository,
   StreamSourceMessageKey,
@@ -22,7 +24,8 @@ import type {
 } from "../../stream/index.js";
 import { streamSourceMessageKeySchema } from "../../stream/index.js";
 import type { Clock } from "../../util/clock.js";
-import { CognitionError, StreamError } from "../../util/errors.js";
+import { CognitionError } from "../../util/errors.js";
+import { repairPoisonedSessionBeforeDedup } from "./repair-before-dedup.js";
 import type { EntityId, SessionId, StreamEntryId } from "../../util/ids.js";
 import {
   ENQUEUED_USER_CONTACT_ACTIVITY_STATUS,
@@ -35,6 +38,9 @@ export type BorgEnqueueMessageInput = {
   senderEntityId: EntityId;
   sourceMessageKey: StreamSourceMessageKey;
   arrivedAt?: number;
+  observedAt?: number;
+  conversation?: StreamConversation;
+  metadata?: StreamEntryMetadata;
   audience?: string;
   audienceEntityId?: EntityId | null;
   attachments?: readonly TurnInputAttachment[];
@@ -88,7 +94,10 @@ export class MessageEnqueuer {
 
     return this.runForSession(session.session_id, async () => {
       if (this.options.entryIndex.isPoisoned(session.session_id)) {
-        await this.repairPoisonedSessionBeforeDedup(session.session_id);
+        await repairPoisonedSessionBeforeDedup(
+          session.session_id,
+          this.options.repairSessionStreamEntryIndex,
+        );
       }
 
       const duplicate = this.options.entryIndex.lookupBySourceMessageKey(sourceMessageKey);
@@ -113,6 +122,9 @@ export class MessageEnqueuer {
             streamWriter: writer,
             userMessage: input.userMessage,
             sourceMessageKey,
+            observedAt: input.observedAt,
+            conversation: input.conversation,
+            metadata: input.metadata,
             activityOccurredAt: arrivedAt,
             activityStatus: ENQUEUED_USER_CONTACT_ACTIVITY_STATUS,
             audience: input.audience,
@@ -184,17 +196,6 @@ export class MessageEnqueuer {
     }
   }
 
-  private async repairPoisonedSessionBeforeDedup(sessionId: SessionId): Promise<void> {
-    try {
-      await this.options.repairSessionStreamEntryIndex(sessionId);
-    } catch (error) {
-      throw new StreamError(`Stream entry index is poisoned for committed session ${sessionId}`, {
-        cause: error,
-        code: "STREAM_INDEX_POISONED",
-      });
-    }
-  }
-
   private async recoverPendingDuplicateReceipt(context: {
     record: StreamEntryIndexRecord;
     input: BorgEnqueueMessageInput;
@@ -227,7 +228,8 @@ export class MessageEnqueuer {
             attachments: context.attachments,
             streamWriter: writer,
             parentEntry: this.parentEntryFromDuplicateRecord(context),
-            audienceEntityId: context.input.audienceEntityId ?? context.session.audience_entity_id ?? null,
+            audienceEntityId:
+              context.input.audienceEntityId ?? context.session.audience_entity_id ?? null,
           });
         } finally {
           writer.close();
@@ -303,6 +305,11 @@ export class MessageEnqueuer {
       sender_entity_id: context.record.sender_entity_id ?? context.input.senderEntityId,
       reply_target_entity_id: null,
       source_message_key: context.input.sourceMessageKey,
+      ...(context.input.observedAt === undefined ? {} : { observed_at: context.input.observedAt }),
+      ...(context.input.conversation === undefined
+        ? {}
+        : { conversation: context.input.conversation }),
+      ...(context.input.metadata === undefined ? {} : { metadata: context.input.metadata }),
       session_id: context.record.session_id,
       compressed: false,
     };

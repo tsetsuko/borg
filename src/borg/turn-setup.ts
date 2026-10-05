@@ -1,5 +1,6 @@
 // Wires the per-turn cognitive orchestrator and its session-scoped dependencies.
 
+import type { OperatorAttentionRepository } from "../memory/operator-attention/index.js";
 import type {
   ChatResponseWatermarkCoordinator,
   StreamIngestionCoordinator,
@@ -17,6 +18,7 @@ import type { Config } from "../config/index.js";
 import type { ExecutiveStepsRepository } from "../executive/index.js";
 import type { LLMClient } from "../llm/index.js";
 import type { MoodRepository } from "../memory/affective/index.js";
+import type { SourceStreamAudienceDisclosureResolver } from "../memory/common/index.js";
 import type {
   ActivityRepository,
   LivedExperienceDaySummaryRepository,
@@ -69,6 +71,7 @@ export type BuildTurnOrchestratorOptions = {
   semanticNodeRepository: SemanticNodeRepository;
   entityRepository: EntityRepository;
   commitmentRepository: CommitmentRepository;
+  sourceStreamAudienceDisclosureResolver: SourceStreamAudienceDisclosureResolver;
   creatorDirectiveRepository: CreatorDirectiveRepository;
   sharedStateRepository: SharedStateRepository;
   activityRepository: ActivityRepository;
@@ -101,6 +104,7 @@ export type BuildTurnOrchestratorOptions = {
   chatResponseWatermarkCoordinator?: ChatResponseWatermarkCoordinator;
   outboundDelivery?: Pick<OutboundDelivery, "deliver">;
   autonomousOutboundPolicy?: Pick<AutonomousOutboundPolicy, "promptContext">;
+  operatorAttentionRepository?: Pick<OperatorAttentionRepository, "snapshot">;
   autonomySchedulerStateProvider?: () => Promise<AutonomySchedulerDescription | null>;
   outboundSourceTypes?: readonly SessionSourceType[];
   createStreamWriter: BorgStreamWriterFactory;
@@ -124,6 +128,7 @@ export function buildTurnOrchestrator(options: BuildTurnOrchestratorOptions): Tu
     semanticNodeRepository: options.semanticNodeRepository,
     entityRepository: options.entityRepository,
     commitmentRepository: options.commitmentRepository,
+    sourceStreamAudienceDisclosureResolver: options.sourceStreamAudienceDisclosureResolver,
     creatorDirectiveRepository: options.creatorDirectiveRepository,
     sharedStateRepository: options.sharedStateRepository,
     activityRepository: options.activityRepository,
@@ -191,6 +196,7 @@ export function buildTurnOrchestrator(options: BuildTurnOrchestratorOptions): Tu
     ...(options.autonomousOutboundPolicy === undefined
       ? {}
       : { autonomousOutboundPolicy: options.autonomousOutboundPolicy }),
+    operatorAttentionRepository: options.operatorAttentionRepository,
     ...(options.autonomySchedulerStateProvider === undefined
       ? {}
       : { autonomySchedulerStateProvider: options.autonomySchedulerStateProvider }),

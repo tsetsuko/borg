@@ -352,7 +352,7 @@ describe("reflector process", () => {
     expect(String(result.changes[0]?.targets.cluster)).toContain("deploy+部署");
   });
 
-  it("labels active goals in the model-facing reflection prompt", async () => {
+  it("labels unfinished goals in the model-facing reflection prompt", async () => {
     const llm = new FakeLLMClient();
     const harness = await createOfflineTestHarness({
       llmClient: llm,
@@ -366,10 +366,12 @@ describe("reflector process", () => {
     });
     cleanup.push(harness.cleanup);
     const audience = createEntityId();
+    const counterparty = createEntityId();
     const goal = harness.goalsRepository.add({
       description: "Keep the private launch goal grounded",
       priority: 7,
       audienceEntityId: audience,
+      counterpartyEntityId: counterparty,
       provenance: { kind: "manual" },
     });
     const episodes = [10_000, 20_000, 30_000].map((timestamp, index) =>
@@ -407,12 +409,84 @@ describe("reflector process", () => {
     await process.plan(harness.createContext());
 
     const prompt = String(llm.requests[0]?.messages[0]?.content ?? "");
-    const activeGoalsLine = prompt.split("\n").find((line) => line.startsWith("Active goals: "));
+    const activeGoalsLine = prompt
+      .split("\n")
+      .find((line) => line.startsWith("Unfinished goals (including blocked): "));
 
+    // Hedge preservation lands in the preamble, i.e. the full prompt, not the
+    // goals line (prod 2026-08-27: an insight asserted a declined hypothesis as fact).
+    expect(prompt).toContain("never restate a declined hypothesis as fact");
+    expect(prompt).toContain(
+      "A hypothesis the source hedges or explicitly does not confirm stays hedged",
+    );
     expect(activeGoalsLine).toContain(goal.description);
     expect(activeGoalsLine).toContain('"disclosure_label"');
     expect(activeGoalsLine).toContain('"disclosure_class":"relationship_private"');
     expect(activeGoalsLine).toContain(audience);
+    expect(activeGoalsLine).toContain(`"counterparty_entity_id":"${counterparty}"`);
+    expect(activeGoalsLine).not.toContain(`private-to=${counterparty}`);
+    expect(prompt).toContain(
+      "counterparty_entity_id is the participant the responsibility runs toward, not an owner or an audience",
+    );
+  });
+
+  it("bounds each cluster prompt to the newest episodes and says how many were omitted", async () => {
+    const llm = new FakeLLMClient();
+    const harness = await createOfflineTestHarness({
+      llmClient: llm,
+      embeddingClient: new TestEmbeddingClient(
+        new Map([
+          ["cap-tag", [1, 0, 0, 0]],
+          ["Cap insight", [1, 0, 0, 0]],
+          ["Cap insight\nOnly the newest evidence was read.", [1, 0, 0, 0]],
+        ]),
+      ),
+      configOverrides: {
+        offline: { reflector: { minSupport: 2, maxEpisodesPerCluster: 3 } },
+      },
+    });
+    cleanup.push(harness.cleanup);
+    const episodes = [10_000, 20_000, 30_000, 40_000, 50_000].map((timestamp, index) =>
+      createEpisodeFixture(
+        {
+          title: `Cap episode ${index}`,
+          narrative: `Cap evidence ${index}.`,
+          tags: ["cap-tag"],
+          created_at: timestamp,
+          updated_at: timestamp,
+        },
+        [1, 0, 0, 0],
+      ),
+    );
+    llm.pushResponse(
+      createReflectorResponse({
+        label: "Cap insight",
+        description: "Only the newest evidence was read.",
+        confidence: 0.6,
+        source_episode_ids: episodes.slice(2).map((episode) => episode.id),
+      }),
+    );
+    for (const episode of episodes) {
+      await harness.episodicRepository.createEpisode(episode);
+    }
+    const process = new ReflectorProcess({
+      semanticNodeRepository: harness.semanticNodeRepository,
+      semanticEdgeRepository: harness.semanticEdgeRepository,
+      reviewQueueRepository: harness.reviewQueueRepository,
+      registry: harness.registry,
+    });
+    await process.plan(harness.createContext());
+    const prompt = String(llm.requests[0]?.messages[0]?.content ?? "");
+
+    // Newest three present, oldest two absent.
+    expect(prompt).toContain('"title":"Cap episode 4"');
+    expect(prompt).toContain('"title":"Cap episode 3"');
+    expect(prompt).toContain('"title":"Cap episode 2"');
+    expect(prompt).not.toContain('"title":"Cap episode 1"');
+    expect(prompt).not.toContain('"title":"Cap episode 0"');
+    expect(prompt).toContain(
+      "These are the 3 most recent episodes of this cluster; 2 older episodes are omitted for length.",
+    );
   });
 
   it("keeps existing insight updates pending until review acceptance and restores snapshots", async () => {

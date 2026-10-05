@@ -1,4 +1,14 @@
+import { logSimilarityProfile } from "../config/similarity.js";
+import {
+  requireEmbeddingClientProfile,
+  acquireEmbeddingBankAccess,
+  assertBankNotFenced,
+  assertEmbeddingProfilesMatch,
+  guardBankEmbeddingProfile,
+} from "../embeddings/bank-profile.js";
 // Borg.open composition root: orders storage, repositories, tools, offline work, turns, and autonomy.
+import { AgentDeliveryRepository } from "../cognition/ingestion/agent-deliveries.js";
+import { TaskEventService } from "../cognition/ingestion/task-events.js";
 
 import { SystemClock } from "../util/clock.js";
 import {
@@ -13,6 +23,7 @@ import {
   ChatResponseBacklogPrefixBuilder,
   ChatResponseCatchUpWorker,
   ChatResponseWatermarkCoordinator,
+  BacklogTerminalService,
   MessageEnqueuer,
   type ChatResponseCatchUpWorkerConfig,
 } from "../cognition/ingestion/index.js";
@@ -50,6 +61,7 @@ import { buildToolDispatcher } from "./tools-setup.js";
 import { buildTurnOrchestrator } from "./turn-setup.js";
 import type { BorgDependencies, BorgOpenOptions } from "./types.js";
 import type { SessionId } from "../util/ids.js";
+import { createActivityFacade } from "./facade.js";
 
 const CHAT_RESPONSE_CATCH_UP_BACKOFF_CONFIG = {
   backoffBaseMs: 1_000,
@@ -62,20 +74,40 @@ export async function openBorgDependencies(
   const clock = options.clock ?? new SystemClock();
   let sqlite: SqliteDatabase | undefined;
   let lance: LanceDbStore | undefined;
+  let releaseEmbeddingBankAccess: (() => Promise<void>) | undefined;
+  const pendingStartupTasks: Promise<unknown>[] = [];
   let catchUpWorker: ChatResponseCatchUpWorker | undefined;
 
   try {
     const resolvedConfig = resolveBorgConfig(options);
+    assertBankNotFenced(resolvedConfig.dataDir);
+    const embeddingClient = options.embeddingClient ?? createEmbeddingClient(resolvedConfig);
+    const effectiveEmbeddingProfile = requireEmbeddingClientProfile(embeddingClient);
+    if (options.embeddingProfile !== undefined)
+      assertEmbeddingProfilesMatch(effectiveEmbeddingProfile, options.embeddingProfile);
+    if (options.embeddingDimensions !== undefined)
+      assertEmbeddingProfilesMatch(effectiveEmbeddingProfile, {
+        ...effectiveEmbeddingProfile,
+        dimensions: options.embeddingDimensions,
+      });
+    releaseEmbeddingBankAccess = await acquireEmbeddingBankAccess(resolvedConfig.dataDir);
+    await guardBankEmbeddingProfile(resolvedConfig.dataDir, effectiveEmbeddingProfile);
     const outboundConnectorRegistry = new MessageConnectorRegistry(
       options.outboundConnectors ?? [],
     );
     const config = {
       ...resolvedConfig,
+      embedding: {
+        ...resolvedConfig.embedding,
+        model: effectiveEmbeddingProfile.model,
+        dims: effectiveEmbeddingProfile.dimensions,
+      },
       host_capabilities: withDerivedOutboundCapabilities({
         hostCapabilities: resolvedConfig.host_capabilities,
         outboundSourceTypes: outboundConnectorRegistry.sourceTypes(),
       }),
     };
+    logSimilarityProfile(config, "borg open");
     const tracer = compositeTracer([
       createTurnTracer({
         tracerPath: options.tracerPath,
@@ -89,7 +121,7 @@ export async function openBorgDependencies(
     lance = storage.lance;
     const tables: BorgLanceTables = await openBorgLanceTables({
       lance,
-      embeddingDimensions: options.embeddingDimensions ?? config.embedding.dims,
+      embeddingDimensions: effectiveEmbeddingProfile.dimensions,
     });
     const attachmentRepository = new AttachmentRepository(sqlite);
     const entryIndex = new StreamEntryIndexRepository({
@@ -115,7 +147,6 @@ export async function openBorgDependencies(
       lifecycle: imageAttachmentLifecycleService,
       tracer,
     });
-    const embeddingClient = options.embeddingClient ?? createEmbeddingClient(config);
     const llmFactory = createLlmFactory(
       config,
       options.llmClient,
@@ -132,6 +163,7 @@ export async function openBorgDependencies(
       }
     };
     const repositories = await buildBorgRepositories({
+      pendingStartupTasks,
       config,
       sqlite,
       episodesTable: tables.episodesTable,
@@ -173,6 +205,7 @@ export async function openBorgDependencies(
     const toolDispatcher = buildToolDispatcher({
       dataDir: config.dataDir,
       entryIndex: repositories.entryIndex,
+      sourceStreamAudienceDisclosureResolver: repositories.sourceStreamAudienceDisclosureResolver,
       retrievalPipeline: repositories.retrievalPipeline,
       episodicRepository: repositories.episodicRepository,
       semanticNodeRepository: repositories.semanticNodeRepository,
@@ -180,6 +213,7 @@ export async function openBorgDependencies(
       commitmentRepository: repositories.commitmentRepository,
       entityRepository: repositories.entityRepository,
       goalsRepository: repositories.goalsRepository,
+      openQuestionsRepository: repositories.openQuestionsRepository,
       identityService: repositories.identityService,
       skillRepository: repositories.skillRepository,
       trainOfThoughtRepository: repositories.trainOfThoughtRepository,
@@ -213,6 +247,7 @@ export async function openBorgDependencies(
       embeddingClient,
       lazyLlmClient,
       entryIndex: repositories.entryIndex,
+      sourceStreamAudienceDisclosureResolver: repositories.sourceStreamAudienceDisclosureResolver,
       episodicRepository: repositories.episodicRepository,
       semanticNodeRepository: repositories.semanticNodeRepository,
       semanticEdgeRepository: repositories.semanticEdgeRepository,
@@ -251,6 +286,7 @@ export async function openBorgDependencies(
       lazyLlmClient,
       entityRepository: repositories.entityRepository,
       commitmentRepository: repositories.commitmentRepository,
+      sourceStreamAudienceDisclosureResolver: repositories.sourceStreamAudienceDisclosureResolver,
       identityService: repositories.identityService,
       identityEventRepository: repositories.identityEventRepository,
       relationalSlotRepository: repositories.relationalSlotRepository,
@@ -276,6 +312,33 @@ export async function openBorgDependencies(
         entryIndex: repositories.entryIndex,
         attachmentRepository,
       });
+    const backlogTerminalService = new BacklogTerminalService({
+      dataDir: config.dataDir,
+      entryIndex: repositories.entryIndex,
+      createStreamReader: (sessionId) =>
+        new StreamReader({
+          dataDir: config.dataDir,
+          sessionId,
+          entryIndex: repositories.entryIndex,
+        }),
+      createStreamWriter: repositories.createStreamWriter,
+      coordinator: chatResponseWatermarkCoordinator,
+      ...(streamIngestionCoordinator === undefined ? {} : { streamIngestionCoordinator }),
+      ...(options.inbox?.onTerminalCommitted === undefined
+        ? {}
+        : { onTerminalCommitted: options.inbox.onTerminalCommitted }),
+    });
+    const taskEventService = new TaskEventService({
+      dataDir: config.dataDir,
+      entryIndex: repositories.entryIndex,
+      repairSessionStreamEntryIndex,
+      createStreamWriter: repositories.createStreamWriter,
+    });
+    const agentDeliveries = new AgentDeliveryRepository({
+      db: sqlite,
+      clock,
+      onAvailable: options.inbox?.onDeliveryAvailable,
+    });
     const messageEnqueuer = new MessageEnqueuer({
       sessionsRepository: repositories.sessionsRepository,
       entityRepository: repositories.entityRepository,
@@ -340,8 +403,10 @@ export async function openBorgDependencies(
       semanticNodeRepository: repositories.semanticNodeRepository,
       entityRepository: repositories.entityRepository,
       commitmentRepository: repositories.commitmentRepository,
+      sourceStreamAudienceDisclosureResolver: repositories.sourceStreamAudienceDisclosureResolver,
       creatorDirectiveRepository: repositories.creatorDirectiveRepository,
       sharedStateRepository: repositories.sharedStateRepository,
+      operatorAttentionRepository: repositories.operatorAttentionRepository,
       activityRepository: repositories.activityRepository,
       livedExperienceDaySummaryRepository: repositories.livedExperienceDaySummaryRepository,
       selfDecisionRepository: repositories.selfDecisionRepository,
@@ -413,22 +478,78 @@ export async function openBorgDependencies(
           entryIndex: repositories.entryIndex,
         }),
     });
+    const configuredRunner = options.inbox?.runner;
+    const catchUpRunner =
+      typeof configuredRunner === "function"
+        ? configuredRunner({
+            terminal: backlogTerminalService,
+            entityRepository: repositories.entityRepository,
+            sessions: repositories.sessionsRepository,
+            activity: createActivityFacade({
+              sqlite,
+              activityRepository: repositories.activityRepository,
+              sessionsRepository: repositories.sessionsRepository,
+            }),
+          })
+        : configuredRunner;
+    const taskEventRunner = options.inbox?.taskEventRunner?.({
+      terminal: backlogTerminalService,
+      taskEvents: taskEventService,
+      deliveries: agentDeliveries,
+      entityRepository: repositories.entityRepository,
+      sessions: repositories.sessionsRepository,
+      activity: createActivityFacade({
+        sqlite,
+        activityRepository: repositories.activityRepository,
+        sessionsRepository: repositories.sessionsRepository,
+      }),
+      tracer,
+    });
     catchUpWorker = new ChatResponseCatchUpWorker({
+      ...(taskEventRunner === undefined
+        ? {}
+        : {
+            taskEvents: { service: taskEventService, runner: taskEventRunner },
+          }),
       coordinator: chatResponseWatermarkCoordinator,
       prefixBuilder: chatResponseBacklogPrefixBuilder,
       entryIndex: repositories.entryIndex,
       repairSessionStreamEntryIndex,
-      turnOrchestrator,
+      ...(catchUpRunner === undefined ? { turnOrchestrator } : { runner: catchUpRunner }),
+      ...(options.inbox?.sessionPredicate === undefined
+        ? {}
+        : {
+            sessionPredicate: (sessionId: SessionId) =>
+              options.inbox!.sessionPredicate!(repositories.sessionsRepository.get(sessionId)),
+          }),
+      ...(options.inbox?.acquireLease === undefined
+        ? {}
+        : { acquireLease: options.inbox.acquireLease }),
+      ...(options.inbox?.onTerminalCommitted === undefined
+        ? {}
+        : {
+            onReconcileAdvance: ({ sessionId, advancedThrough }) => {
+              const result = backlogTerminalService.findTerminalCoveringEntry({
+                sessionId,
+                entryId: advancedThrough.entryId,
+              });
+              if (result.status === "found") {
+                options.inbox!.onTerminalCommitted!(result.terminalEntry);
+              }
+            },
+          }),
       clock,
       config: {
-        quietWindowMs: config.streamIngestion.settle.settleMs,
-        maxWaitMs: config.streamIngestion.settle.maxSettleMs,
+        quietWindowMs: options.inbox?.settleMs ?? config.streamIngestion.settle.settleMs,
+        maxWaitMs: options.inbox?.maxSettleMs ?? config.streamIngestion.settle.maxSettleMs,
         ...CHAT_RESPONSE_CATCH_UP_BACKOFF_CONFIG,
       },
     });
     const autonomyScheduler = buildAutonomyScheduler({
+      entryIndex: repositories.entryIndex,
       config,
       commitmentRepository: repositories.commitmentRepository,
+      sourceStreamAudienceDisclosureResolver: repositories.sourceStreamAudienceDisclosureResolver,
       episodicRepository: repositories.episodicRepository,
       embeddingClient,
       goalsRepository: repositories.goalsRepository,
@@ -465,6 +586,7 @@ export async function openBorgDependencies(
       sqlite,
       lance,
       entryIndex: repositories.entryIndex,
+      sourceStreamAudienceDisclosureResolver: repositories.sourceStreamAudienceDisclosureResolver,
       attachmentRepository,
       attachmentService,
       imagePerceptionRepository: repositories.imagePerceptionRepository,
@@ -498,6 +620,7 @@ export async function openBorgDependencies(
       commitmentRepository: repositories.commitmentRepository,
       creatorDirectiveRepository: repositories.creatorDirectiveRepository,
       sharedStateRepository: repositories.sharedStateRepository,
+      operatorAttentionRepository: repositories.operatorAttentionRepository,
       activityRepository: repositories.activityRepository,
       livedExperienceDaySummaryRepository: repositories.livedExperienceDaySummaryRepository,
       correctionService: repositories.correctionService,
@@ -519,6 +642,9 @@ export async function openBorgDependencies(
       maintenanceScheduler,
       streamIngestionCoordinator,
       chatResponseWatermarkCoordinator,
+      backlogTerminalService,
+      taskEventService,
+      agentDeliveries,
       chatResponseCatchUpWorker: catchUpWorker,
       messageEnqueuer,
       auditLog: offline.auditLog,
@@ -527,11 +653,15 @@ export async function openBorgDependencies(
       createStreamWriter: repositories.createStreamWriter,
       llmFactory,
       embeddingClient,
+      releaseEmbeddingBankAccess,
+      pendingStartupTasks,
       tracer,
       clock,
     };
   } catch (error) {
+    await Promise.allSettled(pendingStartupTasks);
     await closeBestEffort(sqlite, lance);
+    await releaseEmbeddingBankAccess?.();
     throw error;
   }
 }
