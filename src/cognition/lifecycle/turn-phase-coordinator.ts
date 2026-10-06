@@ -1429,6 +1429,8 @@ export class TurnPhaseCoordinator {
     return runPostGenerationPhase({
       options: this.options,
       appendHookFailureEvent: appendHookFailure,
+      onReplyPersisted:
+        "onReplyPersisted" in rawTurnInput ? rawTurnInput.onReplyPersisted : undefined,
       llmClient,
       sessionId,
       sessionSourceType: sessionRecord?.source_type ?? null,

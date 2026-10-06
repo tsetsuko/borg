@@ -74,6 +74,17 @@ export type SingleMessageTurnInput = TurnInputBase & {
    * the newest gets a full turn. User origin only.
    */
   assessOnly?: boolean;
+  /**
+   * Called once, with the final reply text, as soon as a message emission is
+   * persisted -- after every guard that can change or withhold it, and before
+   * the post-reply work (the post-response shared-state compile, reflection,
+   * action closing). A transport uses it to post the reply without waiting for
+   * that work, which cannot change the text. The turn still awaits the callback
+   * and keeps the session lock until it returns, so the post-reply work and the
+   * next turn stay ordered. Not called for silence or observation. A throw is
+   * recorded as a hook failure and does not fail the turn.
+   */
+  onReplyPersisted?: (reply: { text: string }) => Promise<void>;
 };
 
 export type TurnInput = SingleMessageTurnInput;

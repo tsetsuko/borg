@@ -499,6 +499,7 @@ function archiveInactiveParticipantActions(input: {
 export async function runPostGenerationPhase(input: {
   options: TurnPhaseCoordinatorOptions;
   appendHookFailureEvent: AppendHookFailureEvent;
+  onReplyPersisted?: (reply: { text: string }) => Promise<void>;
   llmClient: LLMClient;
   sessionId: SessionId;
   sessionSourceType: SessionSourceType | null;
@@ -636,6 +637,16 @@ export async function runPostGenerationPhase(input: {
     completedSub: (result) => `entry=${result.entry.kind}`,
   });
   const persistedAgentEntry = persistedEmission.entry;
+  // The reply is final here: every guard that can rewrite or withhold it has run.
+  // Handing it out now lets the transport post it while the post-reply work below
+  // runs, instead of after it.
+  if (actionEmission.kind === "message" && input.onReplyPersisted !== undefined) {
+    try {
+      await input.onReplyPersisted({ text: actionResult.response });
+    } catch (error) {
+      await input.appendHookFailureEvent(input.streamWriter, "reply_persisted_callback", error);
+    }
+  }
   advanceChatResponseWatermark({
     options: input.options,
     sessionId: input.sessionId,
