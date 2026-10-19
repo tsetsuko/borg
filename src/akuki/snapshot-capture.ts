@@ -8,8 +8,10 @@
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { DatabaseSync, backup } from "node:sqlite";
 
 import { EMBEDDING_ACCESS_FILE, readBankEmbeddingProfile } from "../embeddings/bank-profile.js";
+import { BANK_DB_FILENAME } from "../borg/storage-setup.js";
 import { Borg, FakeEmbeddingClient } from "../index.js";
 import { FakeLLMClient } from "../llm/test-support/fake-client.js";
 import { buildAkukiSnapshot, type AkukiSnapshot } from "./snapshot.js";
@@ -64,7 +66,21 @@ export async function captureAkukiSnapshot(
   let borg: Borg | null = null;
 
   try {
-    cpSync(options.dataDir, copiedDir, { recursive: true, dereference: true });
+    // borg.db is skipped by the file copy and taken through SQLite's backup API
+    // instead. The snapshot runs nightly beside the live service, and a byte copy
+    // of a database plus its WAL taken mid-write can pair a main file with a log
+    // from a different moment. The backup API reads one consistent state.
+    cpSync(options.dataDir, copiedDir, {
+      recursive: true,
+      dereference: true,
+      filter: (source) => !basename(source).startsWith(BANK_DB_FILENAME),
+    });
+    const live = new DatabaseSync(join(options.dataDir, BANK_DB_FILENAME), { readOnly: true });
+    try {
+      await backup(live, join(copiedDir, BANK_DB_FILENAME));
+    } finally {
+      live.close();
+    }
     // The bank lease names whoever holds the live tenant, usually the running
     // service; in the copy it would make Borg.open wait on a holder it can never
     // outlast. The copy has no holder, so its lease goes.
