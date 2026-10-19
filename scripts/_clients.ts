@@ -158,6 +158,7 @@ export class ScriptedDebugLLM implements LLMClient {
         reason: "No durable correction detected in the scripted debug prompt.",
         confidence: 0,
         supersedes_commitment_id: null,
+        directive_target: null,
         retires_commitment_id: null,
       });
     }

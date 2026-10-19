@@ -107,6 +107,7 @@ export type TurnTraceEventName =
   | "extraction.commitments.transitioned"
   | "commitment_classification.downgraded"
   | "corrective_preference.candidate_rejected_ungrounded"
+  | "corrective_preference.candidate_rejected_not_for_self"
   | "corrective_preference.cross_audience_scope"
   | "corrective_preference.cross_audience_creator_deferred"
   | "corrective_preference.ingestion.completed"

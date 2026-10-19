@@ -1126,6 +1126,7 @@ export class TurnPhaseCoordinator {
           sessionId,
           turnInput,
           isUserTurn,
+          assessOnly,
           cognitionInput,
           perception,
           workingMemory,

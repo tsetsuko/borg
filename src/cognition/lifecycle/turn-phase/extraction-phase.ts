@@ -108,6 +108,9 @@ export async function runExtractionPhase(input: {
   sessionId: SessionId;
   turnInput: TurnPhaseInput;
   isUserTurn: boolean;
+  // A message heard in a queue but not answered. Durable corrections are taken
+  // only from a message Akuki actually answers.
+  assessOnly: boolean;
   cognitionInput: string;
   perception: PerceptionResult;
   workingMemory: WorkingMemory;
@@ -219,7 +222,7 @@ export async function runExtractionPhase(input: {
     predictions,
     domainTrust,
   ] = await Promise.all([
-      input.currentTurnFrameAnomaly === null
+      input.currentTurnFrameAnomaly === null && !input.assessOnly
         ? input.options.correctivePreferenceTurnService.extractAndApply({
             llmClient: input.llmClient,
             turnId: input.turnId,

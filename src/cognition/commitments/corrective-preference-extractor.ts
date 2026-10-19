@@ -96,6 +96,12 @@ const correctivePreferenceSchema = z
       .describe(
         "Use corrective_preference only when the user is asking Borg to change durable future response behavior; use retire_commitment when the user is standing down a supplied active commitment; use none for ordinary conversation, venting, task requests, or one-turn remarks.",
       ),
+    directive_target: z
+      .enum(["self", "speaker", "other_participant"])
+      .nullable()
+      .describe(
+        "Whose future behavior the attributed source asks to change. self: the source is asking or telling Borg (self_identity) to change how Borg itself answers in future turns, including a participant stating how they want Borg to treat them. speaker: the source describes, corrects, or resolves the source's own practice. other_participant: the rule is about how someone other than Borg and the source should behave. Use null when classification is retire_commitment or none.",
+      ),
     type: commitmentTypeSchema
       .exclude(["promise"])
       .nullable()
@@ -122,7 +128,7 @@ const correctivePreferenceSchema = z
       .string()
       .nullable()
       .describe(
-        "A concise first-person operational directive Borg can enforce when drafting or revising responses. Use null when classification is retire_commitment or none.",
+        "A concise operational directive Borg can enforce when drafting or revising responses, written in Borg's own first person (\"I\" is Borg, never the source). Use null when classification is retire_commitment or none.",
       ),
     directive_source_stream_entry_id: correctivePreferenceStreamEntryIdSchema
       .nullable()
@@ -337,11 +343,36 @@ function traceClassificationDowngrade(options: {
   });
 }
 
+function traceTargetRejection(options: {
+  tracer?: TurnTracer;
+  turnId?: string;
+  sessionId?: SessionId;
+  directiveTarget: CorrectivePreferenceToolInput["directive_target"];
+}): void {
+  if (options.tracer?.enabled !== true || options.turnId === undefined) {
+    return;
+  }
+
+  options.tracer.emit("corrective_preference.candidate_rejected_not_for_self", {
+    turnId: options.turnId,
+    ...(options.sessionId !== undefined ? { session_id: options.sessionId } : {}),
+    directive_target: options.directiveTarget,
+  });
+}
+
 function toCandidate(
   input: CorrectivePreferenceToolInput,
   traceOptions: Pick<CorrectivePreferenceExtractorOptions, "tracer" | "turnId" | "sessionId"> = {},
 ): CorrectivePreferenceCandidate | null {
   if (input.classification !== "corrective_preference" || input.confidence < CONFIDENCE_THRESHOLD) {
+    return null;
+  }
+
+  // A participant's rule about their own behavior, or about a third party's, is not a
+  // rule for Borg. The judgment is the model's own field; this only reads it, the same
+  // way the classification above is read.
+  if (input.directive_target !== "self") {
+    traceTargetRejection({ ...traceOptions, directiveTarget: input.directive_target });
     return null;
   }
 

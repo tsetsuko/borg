@@ -794,6 +794,7 @@ function createCorrectivePreferenceResponse(input: {
           reason: input.reason ?? "The current user turn corrected future response behavior.",
           confidence: input.confidence ?? 0.9,
           supersedes_commitment_id: input.supersedes_commitment_id ?? null,
+          directive_target: input.classification === "corrective_preference" ? "self" : null,
           retires_commitment_id: input.retires_commitment_id ?? null,
           slot_negations: input.slot_negations ?? [],
         },

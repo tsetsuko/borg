@@ -141,6 +141,7 @@ function createNoCorrectivePreferenceResponse() {
           reason: "No durable correction detected.",
           confidence: 0,
           supersedes_commitment_id: null,
+          directive_target: null,
           retires_commitment_id: null,
           slot_negations: [],
         },

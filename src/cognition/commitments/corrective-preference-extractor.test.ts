@@ -22,6 +22,7 @@ import {
 
 function correctivePreferenceResponse(input: {
   classification: "corrective_preference" | "retire_commitment" | "none";
+  directive_target?: "self" | "speaker" | "other_participant" | null;
   type?: "preference" | "rule" | "boundary" | null;
   kind?: "audience_rule" | "participant_preference" | "boundary" | "process_norm" | null;
   enforcement_class?: "critical" | "advisory" | null;
@@ -54,6 +55,12 @@ function correctivePreferenceResponse(input: {
         name: "EmitCorrectivePreference",
         input: {
           classification: input.classification,
+          directive_target:
+            input.directive_target !== undefined
+              ? input.directive_target
+              : input.classification === "corrective_preference"
+                ? "self"
+                : null,
           type: input.type ?? null,
           kind:
             input.kind ??
@@ -797,6 +804,49 @@ describe("CorrectivePreferenceExtractor", () => {
     });
     expect(prompt.relational_slots[0]?.disclosure).toContain(
       "disclosure_class=relationship_private",
+    );
+  });
+
+  it("drops a participant's rule about their own behavior instead of storing it as Borg's", async () => {
+    const emit = vi.fn();
+    const tracer = {
+      enabled: true,
+      includePayloads: true,
+      emit,
+    } satisfies TurnTracer;
+    const llm = new FakeLLMClient({
+      responses: [
+        correctivePreferenceResponse({
+          classification: "corrective_preference",
+          directive_target: "speaker",
+          type: "rule",
+          directive: "When I (Sol) revise a claim, I mark what was too broad.",
+          directive_family: "mark_revisions",
+          closure_pressure_relevance: "neutral",
+          priority: 5,
+          reason: "Sol corrects his own earlier claim.",
+          confidence: 0.95,
+        }),
+      ],
+    });
+    const extractor = new CorrectivePreferenceExtractor({
+      llmClient: llm,
+      model: "haiku",
+      tracer,
+      turnId: "turn-self-description",
+    });
+
+    await expect(
+      extractor.extract({
+        userMessage: "Correction to what I said last week: that was too broad.",
+        recentHistory: [],
+        audienceEntityId: null,
+        activeCommitments: [],
+      }),
+    ).resolves.toBeNull();
+    expect(emit).toHaveBeenCalledWith(
+      "corrective_preference.candidate_rejected_not_for_self",
+      expect.objectContaining({ directive_target: "speaker" }),
     );
   });
 

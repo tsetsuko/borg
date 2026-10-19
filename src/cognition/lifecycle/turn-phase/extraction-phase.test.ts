@@ -44,6 +44,7 @@ function baseExtractionPhaseInput(input: {
     sessionId: input.sessionId,
     turnInput: { userMessage: "message", origin: "user" } as never,
     isUserTurn: true,
+    assessOnly: false,
     cognitionInput: "message",
     perception: {
       mode: "relational",
@@ -107,6 +108,7 @@ describe("runExtractionPhase", () => {
         origin: "directed_outbound",
       },
       isUserTurn: false,
+      assessOnly: false,
       cognitionInput: "Internal outbound composition instruction",
       perception: {
         mode: "relational",
@@ -202,6 +204,7 @@ describe("runExtractionPhase", () => {
         origin: "user",
       },
       isUserTurn: true,
+      assessOnly: false,
       cognitionInput: "<inbound_batch>...</inbound_batch>",
       perception: {
         mode: "relational",
@@ -250,6 +253,21 @@ describe("runExtractionPhase", () => {
         currentSenderDisplayName: null,
       }),
     );
+  });
+
+  it("takes durable corrections only from a message that is answered", async () => {
+    const sessionId = createSessionId();
+    const workingMemory = createWorkingMemory(sessionId, 1_000);
+    const extractActionState = vi.fn(async () => []);
+
+    const answered = baseExtractionPhaseInput({ sessionId, workingMemory, extractActionState });
+    await runExtractionPhase(answered);
+    expect(answered.options.correctivePreferenceTurnService.extractAndApply).toHaveBeenCalledTimes(1);
+
+    const assessed = baseExtractionPhaseInput({ sessionId, workingMemory, extractActionState });
+    const result = await runExtractionPhase({ ...assessed, assessOnly: true });
+    expect(assessed.options.correctivePreferenceTurnService.extractAndApply).not.toHaveBeenCalled();
+    expect(result.correctiveCommitment).toBeNull();
   });
 
   it("names the one-to-one sender as the action-state speaker", async () => {
@@ -496,6 +514,7 @@ describe("runExtractionPhase", () => {
         origin: "user",
       },
       isUserTurn: true,
+      assessOnly: false,
       cognitionInput: "<inbound_batch>...</inbound_batch>",
       perception: {
         mode: "relational",
