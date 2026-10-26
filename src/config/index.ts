@@ -183,6 +183,10 @@ const sharedStateLedgerDeltaConfigSchema = z
   .prefault({});
 const sharedStateConfigSchema = z
   .object({
+    // Off: the compiler never runs and no artifact reaches the prompt. For a
+    // deployment whose conversations do not need a per-partner board of standing
+    // agreements, where the two compile calls per turn cost more than they return.
+    enabled: z.boolean().default(true),
     maxActiveEntries: z.number().int().positive().default(40),
     maxLiveEntriesPerKey: z.number().int().positive().default(2),
     recentTurnThreshold: z.number().int().positive().default(5),
@@ -258,6 +262,9 @@ const generationCognitionConfigSchema = z
 const actionLifecycleConfigSchema = z
   .object({
     archiveStaleAfterInactiveTurns: z.number().int().nonnegative().default(20),
+    // Off: no action-state extraction per turn, so no new action records and,
+    // downstream, nothing for the pending-action judge to judge.
+    extractionEnabled: z.boolean().default(true),
   })
   .strict()
   .prefault({});

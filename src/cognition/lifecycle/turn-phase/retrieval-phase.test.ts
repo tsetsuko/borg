@@ -3043,6 +3043,64 @@ describe("compileSharedStateArtifactForEvidenceLedgerResult", () => {
     }
   });
 
+  it.each(["pre_answer", "post_response"] as const)(
+    "never calls the compiler in %s when shared state is off",
+    async (pass) => {
+      const llmClient = new FakeLLMClient();
+      const get = vi.fn();
+      const options = {
+        config: {
+          ...DEFAULT_CONFIG,
+          generation: {
+            ...DEFAULT_CONFIG.generation,
+            evidenceLedger: {
+              ...DEFAULT_CONFIG.generation.evidenceLedger,
+              decisionArtifact: {
+                ...DEFAULT_CONFIG.generation.evidenceLedger.decisionArtifact,
+                enabled: false,
+              },
+            },
+          },
+        },
+        llmClient,
+        tracer: { enabled: false, includePayloads: false, emit: vi.fn() },
+        clock: new FixedClock(10_000),
+        sharedStateRepository: { get },
+      } as unknown as TurnPhaseCoordinatorOptions;
+      const currentUserEntry = {
+        id: createStreamEntryId(),
+        kind: "user_msg",
+        content: "message",
+        timestamp: 10_000,
+        session_id: DEFAULT_SESSION_ID,
+        compressed: false,
+        sender_entity_id: null,
+        reply_target_entity_id: null,
+      } as StreamEntry;
+
+      const result = await compileSharedStateArtifactForEvidenceLedgerResult({
+        options,
+        compilePass: pass,
+        input: {
+          sessionId: DEFAULT_SESSION_ID,
+          turnId: "turn-shared-state-off",
+          audienceEntityId: createEntityId(),
+          currentUserMessage: "message",
+          currentUserEntry,
+          isUserTurn: true,
+        } as never,
+        ledger: {} as never,
+        promptVisibleLedger: "",
+        assistantResponse:
+          pass === "post_response" ? { streamEntryId: createStreamEntryId(), text: "reply" } : null,
+      });
+
+      expect(result).toEqual({ artifact: null, appliedOperationCount: 0 });
+      expect(llmClient.requests).toHaveLength(0);
+      expect(get).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["pre_answer", "post_response"] as const)("uses compiler model in %s", async (pass) => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-retrieval-phase-"));
     cleanup.push(() => rmSync(tempDir, { recursive: true, force: true }));

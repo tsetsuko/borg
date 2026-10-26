@@ -212,6 +212,7 @@ describe("config", () => {
       },
       sectionOptions: {},
       decisionArtifact: {
+        enabled: true,
         maxActiveEntries: 40,
         maxLiveEntriesPerKey: 2,
         kindSoftCaps: {
@@ -263,6 +264,7 @@ describe("config", () => {
     });
     expect(config.cognition.actionLifecycle).toEqual({
       archiveStaleAfterInactiveTurns: 20,
+      extractionEnabled: true,
     });
     expect(config.generation.activeParticipantLimit).toBe(8);
     expect(config.generation.postGenerationGuards).toEqual({

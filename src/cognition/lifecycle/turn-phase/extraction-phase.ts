@@ -222,132 +222,135 @@ export async function runExtractionPhase(input: {
     predictions,
     domainTrust,
   ] = await Promise.all([
-      input.currentTurnFrameAnomaly === null && !input.assessOnly
-        ? input.options.correctivePreferenceTurnService.extractAndApply({
-            llmClient: input.llmClient,
-            turnId: input.turnId,
-            isUserTurn: input.isUserTurn,
-            userMessage: input.turnInput.userMessage,
-            persistedUserEntryId: input.persistedUserEntryId,
-            sourceUserEntries: input.sourceUserEntries,
-            sourceUserEntryIds: input.sourceUserEntryIds,
-            senderAttribution: input.senderAttribution,
-            recentHistory: input.recentHistory,
-            audienceEntityId: input.audienceEntityId,
-            committedByEntityId: actionSpeaker.entityId,
-            currentSenderEntityId: authoritySenderEntityId,
-            currentSenderBorgRole: authoritySenderBorgRole,
-            sessionAudienceRole: input.sessionAudienceRole,
-            speakerDisplayName: actionSpeaker.displayName,
-            participantRoster: input.participantRoster,
-            crossAudienceTargeting: {
-              allowed: crossAudienceAllowed,
-              candidateAudiences: crossAudienceCandidateAudiences,
-            },
-            sessionId: input.sessionId,
-            onHookFailure: (hook, error, details) =>
-              input.appendHookFailureEvent(input.streamWriter, hook, error, details),
-            trackAppliedSlotNegation: input.trackAppliedSlotNegation,
-          })
-        : Promise.resolve({
-            commitment: null,
-            commitmentSupersession: null,
-            commitmentRetirement: null,
-            workingMemory: input.workingMemory,
-          }),
-      input.options.turnActionStateService.extract({
-        llmClient: input.llmClient,
-        turnId: input.turnId,
-        isUserTurn: input.isUserTurn,
-        userMessage: input.turnInput.userMessage,
-        persistedUserEntryId: input.persistedUserEntryId,
-        sourceUserEntryIds: input.sourceUserEntryIds,
-        senderAttribution: input.senderAttribution,
-        recentHistory: input.recentHistory,
-        audienceEntityId: input.audienceEntityId,
-        sessionId: input.sessionId,
-        speakerEntityId: actionSpeaker.entityId,
-        speakerDisplayName: actionSpeaker.displayName,
-        senderDisplayNameById: (entityId) =>
-          input.options.entityRepository.get(entityId)?.canonical_name ?? null,
-        goalId: actionLinkGoalId,
-        turnCounter: input.turnInput.globalTurnCounter ?? input.workingMemory.turn_counter,
-        frameAnomaly: input.currentTurnFrameAnomaly,
-      }),
-      input.currentTurnFrameAnomaly === null
-        ? input.options.turnGoalPromotionService.extractAndPersist({
-            llmClient: input.llmClient,
-            turnId: input.turnId,
-            sessionId: input.sessionId,
-            isUserTurn: input.isUserTurn,
-            userMessage: input.turnInput.userMessage,
-            recentHistory: input.recentHistory,
-            sourceUserEntries: input.sourceUserEntries,
-            senderAttribution: input.senderAttribution,
-            audienceEntityId: input.audienceEntityId,
-            speakerEntityId: actionSpeaker.entityId,
-            speakerDisplayName: actionSpeaker.displayName,
-            temporalCue: input.perception.temporalCue,
-            activeGoals: activeGoalsForPromotion,
-            persistedUserEntryId: input.persistedUserEntryId,
-            sourceUserEntryIds: input.sourceUserEntryIds,
-            onHookFailure: (hook, error, details) =>
-              input.appendHookFailureEvent(input.streamWriter, hook, error, details),
-          })
-        : Promise.resolve({
-            goalIds: [],
-            executiveStepIds: [],
-          }),
-      input.options.creatorDirectiveTurnService.extractAndPersist({
-        llmClient: input.llmClient,
-        turnId: input.turnId,
-        isUserTurn: input.isUserTurn,
-        userMessage: input.turnInput.userMessage,
-        audienceEntityId: input.audienceEntityId,
-        currentSenderEntityId: authoritySenderEntityId,
-        currentSenderBorgRole: authoritySenderBorgRole,
-        currentSenderDisplayName: authoritySenderDisplayName,
-        sourceSessionId: input.sessionId,
-        persistedUserEntryId: input.persistedUserEntryId,
-        sourceUserEntryIds: input.sourceUserEntryIds,
-        recentHistory: input.recentHistory,
-        sessionId: input.sessionId,
-        sessionAudienceRole: input.sessionAudienceRole,
-        participantRoster: input.participantRoster,
-      }),
-      // Post-turn prediction reflection: reconcile open expectations this turn
-      // resolved (with the model's own surprise appraisal) and record new ones.
-      // Extract-only -- it reads the turn and writes the ledger, never the reply.
-      input.currentTurnFrameAnomaly === null && input.options.predictionTurnService !== undefined
-        ? input.options.predictionTurnService.extractAndReconcile({
-            llmClient: input.llmClient,
-            turnId: input.turnId,
-            isUserTurn: input.isUserTurn,
-            userMessage: input.turnInput.userMessage,
-            recentHistory: input.recentHistory,
-            sessionId: input.sessionId,
-            sourceStreamEntryIds:
-              input.sourceUserEntryIds ??
-              (input.persistedUserEntryId === undefined ? [] : [input.persistedUserEntryId]),
-            currentTurnCounter:
-              input.turnInput.globalTurnCounter ?? input.workingMemory.turn_counter,
-          })
-        : Promise.resolve(EMPTY_PREDICTION_RESULT),
-      // Post-turn trust appraisal: did this partner turn out to be responsive,
-      // and about what? Folds into their per-domain Beta posteriors. Attributed
-      // to the resolved speaker when the turn has one, else the audience.
-      input.currentTurnFrameAnomaly === null && input.options.domainTrustTurnService !== undefined
-        ? input.options.domainTrustTurnService.extract({
-            llmClient: input.llmClient,
-            turnId: input.turnId,
-            isUserTurn: input.isUserTurn,
-            userMessage: input.turnInput.userMessage,
-            recentHistory: input.recentHistory,
-            sessionId: input.sessionId,
-            partnerEntityId: actionSpeaker.entityId ?? input.audienceEntityId,
-          })
-        : Promise.resolve(EMPTY_DOMAIN_TRUST_RESULT),
-    ]);
+    input.currentTurnFrameAnomaly === null && !input.assessOnly
+      ? input.options.correctivePreferenceTurnService.extractAndApply({
+          llmClient: input.llmClient,
+          turnId: input.turnId,
+          isUserTurn: input.isUserTurn,
+          userMessage: input.turnInput.userMessage,
+          persistedUserEntryId: input.persistedUserEntryId,
+          sourceUserEntries: input.sourceUserEntries,
+          sourceUserEntryIds: input.sourceUserEntryIds,
+          senderAttribution: input.senderAttribution,
+          recentHistory: input.recentHistory,
+          audienceEntityId: input.audienceEntityId,
+          committedByEntityId: actionSpeaker.entityId,
+          currentSenderEntityId: authoritySenderEntityId,
+          currentSenderBorgRole: authoritySenderBorgRole,
+          sessionAudienceRole: input.sessionAudienceRole,
+          speakerDisplayName: actionSpeaker.displayName,
+          participantRoster: input.participantRoster,
+          crossAudienceTargeting: {
+            allowed: crossAudienceAllowed,
+            candidateAudiences: crossAudienceCandidateAudiences,
+          },
+          sessionId: input.sessionId,
+          onHookFailure: (hook, error, details) =>
+            input.appendHookFailureEvent(input.streamWriter, hook, error, details),
+          trackAppliedSlotNegation: input.trackAppliedSlotNegation,
+        })
+      : Promise.resolve({
+          commitment: null,
+          commitmentSupersession: null,
+          commitmentRetirement: null,
+          workingMemory: input.workingMemory,
+        }),
+    !input.options.config.cognition.actionLifecycle.extractionEnabled
+      ? Promise.resolve([])
+      : input.options.turnActionStateService.extract({
+          llmClient: input.llmClient,
+          turnId: input.turnId,
+          isUserTurn: input.isUserTurn,
+          userMessage: input.turnInput.userMessage,
+          persistedUserEntryId: input.persistedUserEntryId,
+          sourceUserEntryIds: input.sourceUserEntryIds,
+          senderAttribution: input.senderAttribution,
+          recentHistory: input.recentHistory,
+          audienceEntityId: input.audienceEntityId,
+          sessionId: input.sessionId,
+          speakerEntityId: actionSpeaker.entityId,
+          speakerDisplayName: actionSpeaker.displayName,
+          senderDisplayNameById: (entityId) =>
+            input.options.entityRepository.get(entityId)?.canonical_name ?? null,
+          goalId: actionLinkGoalId,
+          turnCounter: input.turnInput.globalTurnCounter ?? input.workingMemory.turn_counter,
+          frameAnomaly: input.currentTurnFrameAnomaly,
+        }),
+    // Like corrective preferences: a goal is promoted only from a message that
+    // is answered, never from one the turn only assesses.
+    input.currentTurnFrameAnomaly === null && !input.assessOnly
+      ? input.options.turnGoalPromotionService.extractAndPersist({
+          llmClient: input.llmClient,
+          turnId: input.turnId,
+          sessionId: input.sessionId,
+          isUserTurn: input.isUserTurn,
+          userMessage: input.turnInput.userMessage,
+          recentHistory: input.recentHistory,
+          sourceUserEntries: input.sourceUserEntries,
+          senderAttribution: input.senderAttribution,
+          audienceEntityId: input.audienceEntityId,
+          speakerEntityId: actionSpeaker.entityId,
+          speakerDisplayName: actionSpeaker.displayName,
+          temporalCue: input.perception.temporalCue,
+          activeGoals: activeGoalsForPromotion,
+          persistedUserEntryId: input.persistedUserEntryId,
+          sourceUserEntryIds: input.sourceUserEntryIds,
+          onHookFailure: (hook, error, details) =>
+            input.appendHookFailureEvent(input.streamWriter, hook, error, details),
+        })
+      : Promise.resolve({
+          goalIds: [],
+          executiveStepIds: [],
+        }),
+    input.options.creatorDirectiveTurnService.extractAndPersist({
+      llmClient: input.llmClient,
+      turnId: input.turnId,
+      isUserTurn: input.isUserTurn,
+      userMessage: input.turnInput.userMessage,
+      audienceEntityId: input.audienceEntityId,
+      currentSenderEntityId: authoritySenderEntityId,
+      currentSenderBorgRole: authoritySenderBorgRole,
+      currentSenderDisplayName: authoritySenderDisplayName,
+      sourceSessionId: input.sessionId,
+      persistedUserEntryId: input.persistedUserEntryId,
+      sourceUserEntryIds: input.sourceUserEntryIds,
+      recentHistory: input.recentHistory,
+      sessionId: input.sessionId,
+      sessionAudienceRole: input.sessionAudienceRole,
+      participantRoster: input.participantRoster,
+    }),
+    // Post-turn prediction reflection: reconcile open expectations this turn
+    // resolved (with the model's own surprise appraisal) and record new ones.
+    // Extract-only -- it reads the turn and writes the ledger, never the reply.
+    input.currentTurnFrameAnomaly === null && input.options.predictionTurnService !== undefined
+      ? input.options.predictionTurnService.extractAndReconcile({
+          llmClient: input.llmClient,
+          turnId: input.turnId,
+          isUserTurn: input.isUserTurn,
+          userMessage: input.turnInput.userMessage,
+          recentHistory: input.recentHistory,
+          sessionId: input.sessionId,
+          sourceStreamEntryIds:
+            input.sourceUserEntryIds ??
+            (input.persistedUserEntryId === undefined ? [] : [input.persistedUserEntryId]),
+          currentTurnCounter: input.turnInput.globalTurnCounter ?? input.workingMemory.turn_counter,
+        })
+      : Promise.resolve(EMPTY_PREDICTION_RESULT),
+    // Post-turn trust appraisal: did this partner turn out to be responsive,
+    // and about what? Folds into their per-domain Beta posteriors. Attributed
+    // to the resolved speaker when the turn has one, else the audience.
+    input.currentTurnFrameAnomaly === null && input.options.domainTrustTurnService !== undefined
+      ? input.options.domainTrustTurnService.extract({
+          llmClient: input.llmClient,
+          turnId: input.turnId,
+          isUserTurn: input.isUserTurn,
+          userMessage: input.turnInput.userMessage,
+          recentHistory: input.recentHistory,
+          sessionId: input.sessionId,
+          partnerEntityId: actionSpeaker.entityId ?? input.audienceEntityId,
+        })
+      : Promise.resolve(EMPTY_DOMAIN_TRUST_RESULT),
+  ]);
 
   return {
     actionLinkSelfContext,

@@ -335,7 +335,12 @@ async function compilePostResponseSharedState(input: {
   closureLoopAssessment?: ClosureLoopAssessment | null;
   activeParticipants?: readonly ActiveParticipant[];
 }): Promise<void> {
-  if (input.audienceEntityId === null || !input.options.config.generation.evidenceLedger.enabled) {
+  const evidenceLedgerConfig = input.options.config.generation.evidenceLedger;
+  if (
+    input.audienceEntityId === null ||
+    !evidenceLedgerConfig.enabled ||
+    !evidenceLedgerConfig.decisionArtifact.enabled
+  ) {
     return;
   }
 

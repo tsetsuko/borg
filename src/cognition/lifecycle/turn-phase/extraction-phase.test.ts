@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { DEFAULT_CONFIG } from "../../../config/index.js";
 import { createWorkingMemory, type WorkingMemory } from "../../../memory/working/index.js";
 import type { StreamEntry } from "../../../stream/index.js";
 import { createEntityId, createSessionId, createStreamEntryId } from "../../../util/ids.js";
@@ -20,6 +21,7 @@ function baseExtractionPhaseInput(input: {
 }): Parameters<typeof runExtractionPhase>[0] {
   return {
     options: {
+      config: DEFAULT_CONFIG,
       selfContextBuilder: {
         build: vi.fn(async () => ({ executiveFocus: { selected_goal: null } })),
         listActiveGoalsForCognition: vi.fn(async () => []),
@@ -89,6 +91,7 @@ describe("runExtractionPhase", () => {
         correctivePreferenceTurnService: {
           extractAndApply,
         },
+        config: DEFAULT_CONFIG,
         turnActionStateService: {
           extract: extractActionState,
         },
@@ -185,6 +188,7 @@ describe("runExtractionPhase", () => {
         correctivePreferenceTurnService: {
           extractAndApply,
         },
+        config: DEFAULT_CONFIG,
         turnActionStateService: {
           extract: extractActionState,
         },
@@ -262,12 +266,55 @@ describe("runExtractionPhase", () => {
 
     const answered = baseExtractionPhaseInput({ sessionId, workingMemory, extractActionState });
     await runExtractionPhase(answered);
-    expect(answered.options.correctivePreferenceTurnService.extractAndApply).toHaveBeenCalledTimes(1);
+    expect(answered.options.correctivePreferenceTurnService.extractAndApply).toHaveBeenCalledTimes(
+      1,
+    );
 
     const assessed = baseExtractionPhaseInput({ sessionId, workingMemory, extractActionState });
     const result = await runExtractionPhase({ ...assessed, assessOnly: true });
     expect(assessed.options.correctivePreferenceTurnService.extractAndApply).not.toHaveBeenCalled();
     expect(result.correctiveCommitment).toBeNull();
+  });
+
+  it("promotes goals only from a message that is answered", async () => {
+    const sessionId = createSessionId();
+    const workingMemory = createWorkingMemory(sessionId, 1_000);
+    const extractActionState = vi.fn(async () => []);
+
+    const answered = baseExtractionPhaseInput({ sessionId, workingMemory, extractActionState });
+    await runExtractionPhase(answered);
+    expect(answered.options.turnGoalPromotionService.extractAndPersist).toHaveBeenCalledTimes(1);
+
+    const assessed = baseExtractionPhaseInput({ sessionId, workingMemory, extractActionState });
+    await runExtractionPhase({ ...assessed, assessOnly: true });
+    expect(assessed.options.turnGoalPromotionService.extractAndPersist).not.toHaveBeenCalled();
+  });
+
+  it("skips action-state extraction when the config turns it off", async () => {
+    const sessionId = createSessionId();
+    const workingMemory = createWorkingMemory(sessionId, 1_000);
+    const extractActionState = vi.fn(async () => []);
+    const base = baseExtractionPhaseInput({ sessionId, workingMemory, extractActionState });
+
+    const result = await runExtractionPhase({
+      ...base,
+      options: {
+        ...base.options,
+        config: {
+          ...DEFAULT_CONFIG,
+          cognition: {
+            ...DEFAULT_CONFIG.cognition,
+            actionLifecycle: {
+              ...DEFAULT_CONFIG.cognition.actionLifecycle,
+              extractionEnabled: false,
+            },
+          },
+        },
+      },
+    });
+
+    expect(extractActionState).not.toHaveBeenCalled();
+    expect(result.createdActionIds).toEqual([]);
   });
 
   it("names the one-to-one sender as the action-state speaker", async () => {
@@ -495,6 +542,7 @@ describe("runExtractionPhase", () => {
         correctivePreferenceTurnService: {
           extractAndApply,
         },
+        config: DEFAULT_CONFIG,
         turnActionStateService: {
           extract: extractActionState,
         },

@@ -1183,8 +1183,9 @@ async function buildEvidenceLedgerFinalizerContextInternal(input: {
   input: EvidenceLedgerFinalizerBuildInput;
 }): Promise<EvidenceLedgerFinalizerContext> {
   const config = input.options.config.generation.evidenceLedger;
+  const sharedStateEnabled = config.decisionArtifact.enabled;
   const previousSharedState =
-    input.input.audienceEntityId === null
+    input.input.audienceEntityId === null || !sharedStateEnabled
       ? null
       : input.options.sharedStateRepository.get(input.input.audienceEntityId);
   const priorUserTurnCount = await countPriorUserTurnsForSession({
@@ -1219,11 +1220,12 @@ async function buildEvidenceLedgerFinalizerContextInternal(input: {
     };
   }
 
-  const sharedStateRecall =
-    input.options.sharedStateRepository.listRecentEntriesForCognition?.({
-      excludeAudienceEntityId: input.input.audienceEntityId,
-      limit: SHARED_STATE_COGNITION_RECALL_LIMIT,
-    }) ?? [];
+  const sharedStateRecall = !sharedStateEnabled
+    ? []
+    : (input.options.sharedStateRepository.listRecentEntriesForCognition?.({
+        excludeAudienceEntityId: input.input.audienceEntityId,
+        limit: SHARED_STATE_COGNITION_RECALL_LIMIT,
+      }) ?? []);
   const finalizerInput: EvidenceLedgerFinalizerBuildInput = {
     ...input.input,
     sharedStateRecall,
@@ -1884,7 +1886,10 @@ async function compileSharedStateArtifactForEvidenceLedgerResultInternal(input: 
 }): Promise<SharedStateArtifactForEvidenceLedgerResult> {
   const audienceEntityId = input.input.audienceEntityId;
 
-  if (audienceEntityId === null) {
+  if (
+    audienceEntityId === null ||
+    !input.options.config.generation.evidenceLedger.decisionArtifact.enabled
+  ) {
     return { artifact: null, appliedOperationCount: 0 };
   }
 
