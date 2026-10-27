@@ -1218,6 +1218,40 @@ describe("runFinalizer emission tools", () => {
     );
   });
 
+  it.each([true, false])(
+    "traces the rendered size of each dynamic block and base section (dynamic cache %s)",
+    async (cacheEnabled) => {
+      const tracer = { enabled: true, includePayloads: false, emit: vi.fn() };
+      const regenerationSection = {
+        blockId: "borg_commitment_regeneration_instruction",
+        text: "Regeneration fixture.",
+      };
+
+      await runEmissionFinalizer(createAnsweringLlm("toolu_block_sizes"), tempDirs, {
+        tracer,
+        turnId: "turn-block-sizes",
+        additionalPromptSections: [regenerationSection],
+        finalizerDynamicPromptCacheEnabled: cacheEnabled,
+        cacheableSystemPrompt: {
+          staticPrefix: "Stable static prompt.",
+          dynamicContent: "Base dynamic prompt.",
+          dynamicSectionChars: { self_context: 1234 },
+        },
+      });
+
+      const event = tracer.emit.mock.calls.find(
+        ([name]) => name === "deliberation.finalizer_context.completed",
+      )?.[1] as Record<string, unknown> | undefined;
+
+      expect(event?.dynamic_block_chars).toEqual({
+        finalizer_base_dynamic_prompt: "Base dynamic prompt.".length,
+        borg_finalizer_tool_availability: USER_ACTIVE_TOOL_AVAILABILITY.length,
+        borg_commitment_regeneration_instruction: regenerationSection.text.length,
+      });
+      expect(event?.base_dynamic_section_chars).toEqual({ self_context: 1234 });
+    },
+  );
+
   it("restores the original two-block request when dynamic prompt caching is disabled", async () => {
     const llm = createAnsweringLlm("toolu_uncached_regeneration");
     const regenerationSection = {

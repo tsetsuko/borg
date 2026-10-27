@@ -762,6 +762,26 @@ export function renderPromptSurface(
   return rendered.length === 0 ? null : rendered.join("\n\n");
 }
 
+// Rendered size of each block on a surface, keyed by block id. Trace-only: the
+// prompt itself is rendered by renderPromptSurface, and this never feeds back
+// into it.
+export function measurePromptSurfaceBlocks(
+  surface: PromptSurface,
+  context: PromptSurfaceRenderContext,
+): Record<string, number> {
+  const sizes: Record<string, number> = {};
+
+  for (const entry of promptSurfaceBlocksForSurface(surface)) {
+    const rendered = entry.render(context);
+
+    if (rendered !== null) {
+      sizes[entry.id] = rendered.length;
+    }
+  }
+
+  return sizes;
+}
+
 export function renderPromptSurfaceAdditionalBlock(
   blockId: string,
   sections: readonly PromptSurfaceAdditionalSection[] | null | undefined,

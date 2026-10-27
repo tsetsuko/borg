@@ -37,6 +37,7 @@ import {
 import {
   PROMPT_SURFACES,
   renderPromptSurfaceAdditionalBlock,
+  measurePromptSurfaceBlocks,
   renderPromptSurface,
   type PromptSurfaceAdditionalSection,
   type PromptSurfaceRenderContext,
@@ -386,6 +387,7 @@ export const FINALIZER_REGENERATION_PROMPT_BLOCK_IDS = [
 export type CacheableFinalizerSystemPrompt = {
   staticPrefix: string;
   dynamicContent: string;
+  dynamicSectionChars?: Readonly<Record<string, number>>;
 };
 
 export function resolveFinalizerSurfaceVariant(
@@ -573,9 +575,10 @@ function buildStaticSystemPrompt(options: RunFinalizerOptions): string {
 }
 
 function legacyFinalizerTraceSummary(
-  path: RunFinalizerOptions["path"],
+  options: RunFinalizerOptions,
   system: readonly LLMSystemBlock[],
 ): FinalizerContextTraceSummary {
+  const path = options.path;
   const staticText = system[0]?.text ?? "";
   const turnText = system
     .slice(1)
@@ -620,6 +623,13 @@ function legacyFinalizerTraceSummary(
     rowCount: 0,
     truncationCount: 0,
     omissionCount: 0,
+    dynamicBlockChars: measurePromptSurfaceBlocks(
+      PROMPT_SURFACES.finalizerDynamicSystem,
+      createFinalizerPromptSurfaceRenderContext(options),
+    ),
+    ...(options.cacheableSystemPrompt?.dynamicSectionChars === undefined
+      ? {}
+      : { baseDynamicSectionChars: { ...options.cacheableSystemPrompt.dynamicSectionChars } }),
   };
 }
 
@@ -705,7 +715,7 @@ export function buildFinalizerSystemPrompt(options: RunFinalizerOptions): {
     ];
     return {
       system,
-      traceSummary: legacyFinalizerTraceSummary(options.path, system),
+      traceSummary: legacyFinalizerTraceSummary(options, system),
     };
   }
 
@@ -734,7 +744,7 @@ export function buildFinalizerSystemPrompt(options: RunFinalizerOptions): {
   ];
   return {
     system,
-    traceSummary: legacyFinalizerTraceSummary(options.path, system),
+    traceSummary: legacyFinalizerTraceSummary(options, system),
   };
 }
 
@@ -1087,6 +1097,12 @@ function emitFinalizerContextTrace(
     row_count: summary.rowCount,
     truncation_count: summary.truncationCount,
     omission_count: summary.omissionCount,
+    ...(summary.dynamicBlockChars === undefined
+      ? {}
+      : { dynamic_block_chars: toTraceJsonValue(summary.dynamicBlockChars) }),
+    ...(summary.baseDynamicSectionChars === undefined
+      ? {}
+      : { base_dynamic_section_chars: toTraceJsonValue(summary.baseDynamicSectionChars) }),
     message_count: options.initialMessages.length,
     message_chars: options.initialMessages.reduce(
       (sum, message) =>

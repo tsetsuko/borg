@@ -88,6 +88,10 @@ export type FinalizerContextTraceSummary = {
   rowCount: number;
   truncationCount: number;
   omissionCount: number;
+  /** Rendered chars per finalizer dynamic-surface block (legacy layout only). */
+  dynamicBlockChars?: Record<string, number>;
+  /** Rendered chars per base prompt section inside the dynamic block. */
+  baseDynamicSectionChars?: Record<string, number>;
 };
 
 export type CompactFinalizerSystemPrompt = {

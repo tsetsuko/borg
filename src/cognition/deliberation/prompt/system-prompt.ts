@@ -173,6 +173,8 @@ export type CacheableBaseSystemPromptParts = {
   staticPrefix: string;
   staticPrefixSections: readonly string[];
   dynamicContent: string;
+  /** Rendered chars of each base prompt section, for the finalizer trace only. */
+  dynamicSectionChars: Readonly<Record<string, number>>;
 };
 
 export type CacheableStaticPrefixSection = {
@@ -1446,7 +1448,24 @@ export function buildCacheableBaseSystemPromptParts(
       )
       .map((section) => section.label),
     dynamicContent: renderPromptSurface(PROMPT_SURFACES.cacheableDynamic, renderContext) ?? "",
+    dynamicSectionChars: measurePromptSections(sections.promptSectionsById),
   };
+}
+
+function measurePromptSections(
+  sections: ReadonlyMap<string, PromptSection>,
+): Record<string, number> {
+  const sizes: Record<string, number> = {};
+
+  for (const [id, section] of sections) {
+    const rendered = renderPromptSection(section);
+
+    if (rendered !== null) {
+      sizes[id] = rendered.length;
+    }
+  }
+
+  return sizes;
 }
 
 export function createAssembledFramingPreviewContext(nowMs: number): DeliberationContext {
@@ -2177,9 +2196,7 @@ export function summarizeAutonomySchedulerState(
   // The span line after it answers a question the count cannot: the same number
   // of silences scattered across the window and consecutive within it are a
   // different fact, and only the second has the shape of a chosen quiet.
-  lines.push(
-    ...renderWakeSilentReasonLines(brake.window_silent_reasons, brake.window_silent_span),
-  );
+  lines.push(...renderWakeSilentReasonLines(brake.window_silent_reasons, brake.window_silent_span));
   // The only prospective field the scheduler produces, and the last one that
   // stopped at the evidence boundary. Everything above is retrospective or about
   // the loop's own health: what has fired, what the window has spent, how far
