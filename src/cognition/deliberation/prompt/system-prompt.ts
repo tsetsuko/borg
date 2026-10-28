@@ -1104,16 +1104,89 @@ export function buildStandingWithAudienceSection(context: DeliberationContext): 
   const lines = [
     openTag,
     "  <interpretation>My standing with the current audience: who I am to this addressee, what conduct applies, what creator-authorized facts or boundaries may be used or disclosed, and what other-session activity may be visible to them. This block gathers already-resolved outputs; it does not widen memory visibility or directive disclosure.</interpretation>",
-    ...renderAudienceIdentityLines(context, "  "),
-    ...renderAuthorityContextLines(context, "  "),
-    ...renderCreatorDirectiveDisclosureLines(context.creatorDirectiveBriefing ?? null, "  "),
-    ...renderCommitmentsAndConductLines(context, "  "),
-    ...renderRelationalIdentityLines(context, "  "),
-    ...renderCrossSessionAwarenessLines(context, "  "),
+    ...standingWithAudienceParts(context).flatMap(([, partLines]) => partLines),
     "</borg_standing_with_audience>",
   ];
 
   return lines.join("\n");
+}
+
+function standingWithAudienceParts(
+  context: DeliberationContext,
+): Array<[string, readonly string[]]> {
+  return [
+    ["audience_identity", renderAudienceIdentityLines(context, "  ")],
+    ["authority_context", renderAuthorityContextLines(context, "  ")],
+    [
+      "creator_directive_disclosure",
+      renderCreatorDirectiveDisclosureLines(context.creatorDirectiveBriefing ?? null, "  "),
+    ],
+    ["commitments_and_conduct", renderCommitmentsAndConductLines(context, "  ")],
+    ["relational_identity", renderRelationalIdentityLines(context, "  ")],
+    ["cross_session_awareness", renderCrossSessionAwarenessLines(context, "  ")],
+  ];
+}
+
+// Rendered chars of each part of borg_standing_with_audience, and of the entry
+// groups inside the three parts that grow with memory. Keys are prefixed with the
+// section id. Trace only: the section text is built by
+// buildStandingWithAudienceSection.
+export function measureStandingWithAudienceParts(
+  context: DeliberationContext,
+): Record<string, number> {
+  const standing = context.evidenceLedger?.audienceStanding;
+  const size = (lines: readonly string[]) => lines.join("\n").length;
+  const sizes: Record<string, number> = {};
+
+  for (const [name, partLines] of standingWithAudienceParts(context)) {
+    sizes[`borg_standing_with_audience.${name}`] = size(partLines);
+  }
+
+  const groups: Array<[string, readonly string[]]> = [
+    [
+      "commitments_and_conduct.commitment_ledger_entries",
+      renderStandingEntryGroupLines({
+        tag: "commitment_ledger_entries",
+        entryTag: "commitment_entry",
+        entries: standing?.commitmentEntries,
+        indent: "    ",
+      }),
+    ],
+    [
+      "relational_identity.relational_ledger_entries",
+      renderStandingEntryGroupLines({
+        tag: "relational_ledger_entries",
+        entryTag: "relational_entry",
+        entries: standing?.relationalEntries,
+        indent: "    ",
+      }),
+    ],
+    [
+      "cross_session_awareness.session_status_snapshot",
+      renderSessionStatusSnapshotLines(context.operatorSessionSnapshot ?? null, "    "),
+    ],
+    [
+      "cross_session_awareness.recent_lived_experience",
+      renderRecentLivedExperienceLines({
+        entries: standing?.recentLivedExperienceEntries,
+        render: standing?.renderRecentLivedExperience,
+        indent: "    ",
+      }),
+    ],
+    [
+      "cross_session_awareness.social_memory_entries",
+      renderSocialMemoryEntryGroupLines({
+        entries: standing?.observedEventIntrospectionEntries,
+        indent: "    ",
+      }),
+    ],
+  ];
+
+  for (const [name, groupLines] of groups) {
+    sizes[`borg_standing_with_audience.${name}`] = size(groupLines);
+  }
+
+  return sizes;
 }
 
 function buildUntrustedBasePromptSections(
@@ -1448,7 +1521,13 @@ export function buildCacheableBaseSystemPromptParts(
       )
       .map((section) => section.label),
     dynamicContent: renderPromptSurface(PROMPT_SURFACES.cacheableDynamic, renderContext) ?? "",
-    dynamicSectionChars: measurePromptSections(sections.promptSectionsById),
+    dynamicSectionChars: {
+      ...measurePromptSections(sections.promptSectionsById),
+      ...(renderPromptSection(sections.promptSectionsById.get("borg_standing_with_audience")) ===
+      null
+        ? {}
+        : measureStandingWithAudienceParts(context)),
+    },
   };
 }
 

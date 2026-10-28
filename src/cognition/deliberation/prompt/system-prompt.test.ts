@@ -1383,46 +1383,44 @@ describe("buildBaseSystemPrompt", () => {
       rawPreservedUserTranscriptEntryCount: 0,
       estimatedTokens: 0,
     } satisfies EvidenceLedger;
-    const prompt = buildBaseSystemPrompt(
-      makeContext({
-        audienceEntityId: audienceId,
-        entityRepository: {
-          get: (id: typeof audienceId) =>
-            id === audienceId
-              ? {
-                  id: audienceId,
-                  canonical_name: "Sam",
-                  aliases: [],
-                  kind: "person",
-                  borg_role: null,
-                  name_provenance: "user_declared",
-                  created_at: NOW_MS,
-                }
-              : null,
-        } as never,
-        creatorDirectiveBriefing: {
-          directives: [
-            {
-              renderMode: "content",
-              kind: "subject_fact",
-              subjectKind: "entity",
-              subjectLabel: "Sam",
-              semanticSlot: null,
-              semanticValue: null,
-              canonicalFact: "Sam may be told the launch codename.",
-              operationalDirective: null,
-              mentionPolicy: "answer_if_asked",
-              priority: 10,
-              createdAt: NOW_MS,
-            },
-          ],
-        },
-        applicableCommitments: [commitment],
-        operatorSessionSnapshot: makeOperatorSessionSnapshot(),
-        evidenceLedger,
-      }),
-      PROMPT_OPTIONS,
-    );
+    const context = makeContext({
+      audienceEntityId: audienceId,
+      entityRepository: {
+        get: (id: typeof audienceId) =>
+          id === audienceId
+            ? {
+                id: audienceId,
+                canonical_name: "Sam",
+                aliases: [],
+                kind: "person",
+                borg_role: null,
+                name_provenance: "user_declared",
+                created_at: NOW_MS,
+              }
+            : null,
+      } as never,
+      creatorDirectiveBriefing: {
+        directives: [
+          {
+            renderMode: "content",
+            kind: "subject_fact",
+            subjectKind: "entity",
+            subjectLabel: "Sam",
+            semanticSlot: null,
+            semanticValue: null,
+            canonicalFact: "Sam may be told the launch codename.",
+            operationalDirective: null,
+            mentionPolicy: "answer_if_asked",
+            priority: 10,
+            createdAt: NOW_MS,
+          },
+        ],
+      },
+      applicableCommitments: [commitment],
+      operatorSessionSnapshot: makeOperatorSessionSnapshot(),
+      evidenceLedger,
+    });
+    const prompt = buildBaseSystemPrompt(context, PROMPT_OPTIONS);
     const block = extractBlock(prompt, "borg_standing_with_audience");
 
     expect(block).toContain(`audience_entity_id="${audienceId}"`);
@@ -1444,6 +1442,36 @@ describe("buildBaseSystemPrompt", () => {
     expect(prompt).not.toContain("<borg_commitment_records>");
     expect(prompt).not.toContain("<borg_relational_slot_constraints>");
     expect(prompt).not.toContain("<borg_session_status_snapshot");
+
+    const sizes = buildCacheableBaseSystemPromptParts(context, PROMPT_OPTIONS).dynamicSectionChars;
+    const partNames = [
+      "audience_identity",
+      "authority_context",
+      "creator_directive_disclosure",
+      "commitments_and_conduct",
+      "relational_identity",
+      "cross_session_awareness",
+    ];
+    const partTotal = partNames.reduce(
+      (sum, name) => sum + (sizes[`borg_standing_with_audience.${name}`] ?? 0),
+      0,
+    );
+    const blockLines = block.split("\n");
+    const wrapperChars =
+      (blockLines[0]?.length ?? 0) +
+      (blockLines[1]?.length ?? 0) +
+      (blockLines.at(-1)?.length ?? 0);
+
+    // Open tag, interpretation, the six parts and the close tag, joined by eight newlines,
+    // are the whole section.
+    expect(partTotal + wrapperChars + partNames.length + 2).toBe(block.length);
+    expect(sizes.borg_standing_with_audience).toBe(block.length);
+    expect(
+      sizes["borg_standing_with_audience.commitments_and_conduct.commitment_ledger_entries"],
+    ).toBeGreaterThan(0);
+    expect(
+      sizes["borg_standing_with_audience.cross_session_awareness.recent_lived_experience"],
+    ).toBeGreaterThan(0);
   });
 
   it("renders made-to commitments in self-audience cognition with disclosure scope", () => {
@@ -5506,9 +5534,7 @@ describe("buildBaseSystemPrompt", () => {
       "borg_affective_trajectory",
     );
 
-    expect(block).toContain(
-      "a subset of what was scored rather than a prefix of it",
-    );
+    expect(block).toContain("a subset of what was scored rather than a prefix of it");
     expect(block).toContain(
       "a trigger that opens with a transport tag instead of with text is a row written before that source changed",
     );
