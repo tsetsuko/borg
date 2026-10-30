@@ -11,7 +11,7 @@ over time.
 ![node](https://img.shields.io/badge/node-%E2%89%A522-339933?style=flat-square&logo=node.js&logoColor=white)
 ![typescript](https://img.shields.io/badge/TypeScript-strict-3178C6?style=flat-square&logo=typescript&logoColor=white)
 ![status](https://img.shields.io/badge/status-experimental-e8a317?style=flat-square)
-![targets](https://img.shields.io/badge/cognition-Opus%204.8-d97757?style=flat-square)
+![targets](https://img.shields.io/badge/targets-Opus%204.6-d97757?style=flat-square)
 
 </div>
 
@@ -119,6 +119,23 @@ is reversible wherever a reverser is registered.
 
 Scheduled offline enablement is controlled by `maintenance.lightProcesses` and
 `maintenance.heavyProcesses`; remove a process from both lists to disable it.
+
+Self-narration admits at most 150 newest episodes and 60,000 estimated episode-row tokens
+per run, within a separate 250,000 estimated token limit for the complete prompt (system,
+tools, prior narrative and all growth markers included). One packing pass keeps a contiguous
+newest suffix and renders it chronologically. It reports omitted count/time coverage and
+the limiting bound; if minimum support cannot fit, the model call is explicitly skipped.
+Offline reflection bounds each cluster to 120 episodes / 40,000 estimated row tokens,
+with its minimum-support exception. These are input bounds; output ceilings remain distinct:
+live reflection 16,000, semantic-revision judge 4,000, overseer 8,000 (configurable),
+self-narrator 8,000, and ruminator 4,000. Estimates use chars/4, not provider tokenization.
+
+Each open bank holds an exclusive access lease through startup, admitted work, background
+embedding work and orderly shutdown. A forced close or failed cleanup retains the lease
+until process exit. Existing vector banks require an explicit model/dimensions profile;
+there is no automatic legacy adoption. See [embedding migration](docs/embedding-migration.md)
+for offline source labeling and fences. The sidecar entry point requires `EMBEDDING_MODEL`
+and `EMBEDDING_DIMS`; ordinary Borg/demo config still supplies defaults.
 
 ## Quickstart
 
@@ -251,10 +268,45 @@ See [similarity calibration](docs/similarity-calibration.md) for model-specific 
   either side with `BORG_ANTHROPIC_AUTH=api-key|oauth`; run `borg auth status`
   to see what resolves.
 
-The being's cognition targets **Opus 4.8**. Background and extraction remain
-on Opus 5. The substrate co-produces identity with the cognition model, so the
-design accepts drift when migrating to a successor rather than chasing
-model-swap conformance.
+Embedding routing options can be supplied as an optional `embedding.provider` JSON
+object in `config.json`, or through `BORG_EMBEDDING_PROVIDER`:
+
+```sh
+export BORG_EMBEDDING_PROVIDER='{"data_collection":"deny","ignore":["SiliconFlow"]}'
+```
+
+Borg sends this object unchanged as `provider` in every embedding request body.
+When absent, requests contain no `provider` field. The environment object replaces
+the entire file value (including when set to `{}`); malformed JSON, blank values,
+and non-object JSON fail with `ConfigError`. `borg config` displays routing options
+and continues to redact the embedding API key.
+
+Set optional `embedding.maxInputBytes` or `BORG_EMBEDDING_MAX_INPUT_BYTES=32000`
+to cap each embedding input by UTF-8 bytes at a code-point boundary. The environment
+value must be a positive decimal integer and overrides the file value. Without a
+cap, input is unchanged. Truncation affects only the transport copy; stored text,
+hashes, and cache keys retain original content. Use the same cap and routing
+options for [embedding migration](docs/embedding-migration.md).
+
+Raw vector recall uses `retrieval.rawQueryMaxBytes` (default **6144 bytes**, or
+6 KiB). Override it with the positive integer
+`BORG_RETRIEVAL_RAW_QUERY_MAX_BYTES`; the environment value takes precedence over
+`config.json`. Short queries are unchanged. When a query exceeds the budget,
+a live batch supplies whole source messages newest-first until the next older
+message no longer fits, counting separators in the budget. An oversized newest
+message uses its UTF-8-safe tail. Callers with only a query string use that string's
+UTF-8-safe tail. This keeps the raw vector focused on recent input with a
+language-independent budget well below the 32000-byte embedding transport cap.
+
+The full original query still goes to recall expansion; its existing internal
+4000-character prompt-focus limit remains in effect. The `retrieval.raw_query`
+trace event records whether bounding occurred, its mode, byte counts, and message
+counts once per recall, including time-range fallback, without adding query
+content. Stored messages and the other recall intents are unchanged.
+
+The being targets **Opus 4.6**. The substrate co-produces identity with the
+model, so the design accepts drift when migrating to a successor rather than
+chasing model-swap conformance.
 
 Shared-state compilation uses `anthropic.models.sharedStateCompiler`, defaulting
 to `claude-sonnet-5`. Override it with `BORG_MODEL_SHARED_STATE_COMPILER`; both
@@ -263,6 +315,12 @@ pre-answer and post-response compiles use this slot independently of
 stated timing and corrects existing entries through `supersede` or `update`,
 including locked entries. Contradiction and evidence of a completed act remain
 model judgments.
+
+Action-state extraction and goal-promotion extraction use the optional
+`anthropic.models.preTurnExtraction` slot (`BORG_MODEL_PRE_TURN_EXTRACTION`).
+When omitted, it follows the configured `anthropic.models.recallExpansion` value.
+The action-state service uses this slot for both pre-turn extraction and
+post-generation self-performed-action closes.
 
 ## Development
 

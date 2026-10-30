@@ -52,6 +52,7 @@ import type {
 import type { SemanticExtractor } from "../memory/semantic/index.js";
 import type { SocialRepository } from "../memory/social/index.js";
 import type { LanceDbOptimizeStorageResult } from "../storage/lancedb/index.js";
+import type { LanceDbMemoryStats, LanceDbTableStats } from "../storage/lancedb/diagnostics.js";
 import type { TrainOfThoughtRepository } from "../memory/train-of-thought/index.js";
 import type { WorkingMemory, WorkingMemoryStore } from "../memory/working/index.js";
 import type {
@@ -124,6 +125,7 @@ export type BorgStreamFacade = {
     streamEntryIds: readonly StreamEntryId[],
     options?: { budgetMs?: number; activeOnly?: boolean },
   ) => Promise<Map<StreamEntryId, StreamEntry>>;
+  lookupSessionIds: (streamEntryIds: readonly StreamEntryId[]) => Map<StreamEntryId, SessionId>;
 };
 
 export type BorgEpisodicFacade = {
@@ -155,6 +157,9 @@ export type BorgEpisodicFacade = {
   listRecentForSession: (
     ...args: Parameters<EpisodicRepository["listRecentForSessionForDisclosure"]>
   ) => ReturnType<EpisodicRepository["listRecentForSessionForDisclosure"]>;
+  listRecentForSessionForCognition: (
+    ...args: Parameters<EpisodicRepository["listRecentForSessionForCognition"]>
+  ) => ReturnType<EpisodicRepository["listRecentForSessionForCognition"]>;
   getStats: (
     ...args: Parameters<EpisodicRepository["getStats"]>
   ) => ReturnType<EpisodicRepository["getStats"]>;
@@ -341,6 +346,9 @@ export type BorgSocialFacade = {
 };
 
 export type BorgEntitiesFacade = {
+  resolveAudienceLabel: (
+    ...args: Parameters<EntityRepository["resolveAudienceLabel"]>
+  ) => ReturnType<EntityRepository["resolveAudienceLabel"]>;
   resolve: (
     ...args: Parameters<EntityRepository["resolve"]>
   ) => ReturnType<EntityRepository["resolve"]>;
@@ -655,7 +663,10 @@ export type BorgAutonomyFacade = {
 };
 
 export type BorgMaintenanceFacade = {
+  status(): { active: boolean; cadence: "light" | "heavy" | null; started_at: number | null };
   scheduler: MaintenanceScheduler;
+  storageMemoryStats(): LanceDbMemoryStats;
+  storageTableStats(): Promise<LanceDbTableStats[]>;
   optimizeStorage: (options?: {
     runId?: MaintenanceRunId;
   }) => Promise<LanceDbOptimizeStorageResult>;

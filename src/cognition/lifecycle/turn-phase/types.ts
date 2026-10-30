@@ -126,8 +126,10 @@ export type TurnPhaseCoordinatorOptions = {
   semanticNodeRepository?: Pick<
     SemanticNodeRepository,
     "searchByVector" | "markSuperseded" | "markContradicted"
-  >;
+  > &
+    Partial<Pick<SemanticNodeRepository, "getMany">>;
   workingMemoryStore: WorkingMemoryStore;
+  sessionLock?: import("../../../memory/working/index.js").PendingActionSessionLock;
   entityRepository: EntityRepository;
   socialRepository: SocialRepository;
   // Optional so partial test harnesses that omit it still typecheck; production
@@ -172,7 +174,7 @@ export type TurnPhaseCoordinatorOptions = {
   autobiographicalRepository?: Pick<AutobiographicalRepository, "listPeriods">;
   openQuestionsRepository: Pick<
     OpenQuestionsRepository,
-    "findByHandles" | "get" | "list" | "resolve"
+    "findByHandles" | "get" | "list" | "resolve" | "countRuminations" | "countByStatus"
   >;
   toolDispatcher: ToolDispatcher;
   createStreamReader: (sessionId: SessionId) => StreamReader;

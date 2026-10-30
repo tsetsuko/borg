@@ -38,6 +38,7 @@ import { DEFAULT_SESSION_ID } from "../util/ids.js";
 import type { BorgStreamWriterFactory } from "./types.js";
 
 export type BuildAutonomySchedulerOptions = {
+  maintenancePassStartedAt?: () => number | null;
   entryIndex?: Pick<
     import("../stream/index.js").StreamEntryIndexRepository,
     "describeAnsweredWindow"
@@ -240,10 +241,12 @@ export function buildAutonomyScheduler(options: BuildAutonomySchedulerOptions): 
         : (sessionId, observedAt) =>
             options.entryIndex!.describeAnsweredWindow(sessionId, observedAt),
     beforeTick: () => options.goalsRepository.reconcileBlocks(),
+    maintenancePassStartedAt: options.maintenancePassStartedAt,
     enabled: options.config.autonomy.enabled,
     intervalMs: options.config.autonomy.intervalMs,
     prepToolTimeoutMs: options.config.autonomy.prepToolTimeoutMs,
     maxWakesPerWindow: options.config.autonomy.maxWakesPerWindow,
+    maxWakesPerWindowBySource: options.config.autonomy.maxWakesPerWindowBySource,
     goalWakeBatchMax: options.config.autonomy.goalWakeBatchMax,
     budgetWindowMs: options.config.autonomy.budgetWindowMs,
     reservedContemplativeWakesPerWindow:

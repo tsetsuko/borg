@@ -201,19 +201,11 @@ export type SelfSnapshotGoal = GoalRecord & {
 };
 
 export type SelfSnapshot = {
+  /** Scheduling handles captured alongside the rows, never recomputed after prompt preparation. */
+  goalPresentations?: readonly import("../../executive/goal-presentation.js").GoalPresentation[];
   values: ValueRecord[];
   goals: SelfSnapshotGoal[];
   traits: TraitRecord[];
-  /**
-   * Stored row counts, read from the values/traits stores by their own
-   * COUNT statements rather than from the draws above. A renderer that wants
-   * to claim it printed every value and trait has to check that claim against
-   * a number the draw did not produce; when these are absent the claim is
-   * unmeasured rather than true. Optional because synthetic snapshots (tests,
-   * fixtures, replays) have no store behind them.
-   */
-  valuesStoredTotal?: number;
-  traitsStoredTotal?: number;
   /**
    * The being's current autobiographical period (label + narrative). Phase
    * F wires this into the deliberator prompt so the being has a glimpse of
@@ -242,6 +234,8 @@ export type DeliberationContext = {
   operatorSessionSnapshot?: OperatorSessionSnapshot | null;
   turnId?: string;
   turnOrigin?: TurnOrigin;
+  autonomyTriggerPresentation?: import("../autonomy-trigger.js").RenderedAutonomyTriggerContext;
+  goalPresentations?: readonly import("../../executive/goal-presentation.js").GoalPresentation[];
   audience?: string;
   isSelfAudience?: boolean;
   audienceEntityId?: EntityId | null;
@@ -282,6 +276,7 @@ export type DeliberationContext = {
   selectedSkill?: SkillSelectionResult | null;
   entityRepository?: EntityRepository;
   workingMemory: WorkingMemory;
+  pendingActionProjection?: import("../../memory/working/index.js").PendingActionProjectionResult;
   turnMechanismEvidence?: TurnMechanismEvidence;
   recentCompletedActions?: readonly ActionRecord[];
   /**
@@ -387,6 +382,7 @@ export type DeliberationResult = {
   emissionRecommendation?: EmissionRecommendation;
   thoughtStreamEntryIds?: readonly StreamEntryId[];
   thoughts: string[];
+  /** Nonterminal call outcomes in execution order across all finalizer attempts. */
   tool_calls: ToolLoopCallRecord[];
   usage: DeliberationUsage;
   decision_reason: string;
@@ -398,6 +394,7 @@ export type DeliberationResult = {
 };
 
 export type DeliberatorOptions = {
+  goalPresentation?: import("../../executive/goal-presentation.js").GoalPresentationStore;
   llmClient: LLMClient;
   toolDispatcher: ToolDispatcher;
   cognitionModel: string;

@@ -862,6 +862,53 @@ describe("MaintenanceScheduler", () => {
     expect(timeouts.activeTimers().map((timer) => timer.delayMs)).toEqual([0, 10_000]);
   });
 
+  it.each(["heavy", "light"] as const)(
+    "anchors %s cadence without changing boot catch-up grace",
+    async (cadence) => {
+      const clock = new ManualClock(1_000);
+      const watermarks = createFakeCadenceWatermarks(clock);
+      const timeouts = createManualTimeouts();
+      const spy = createFakeOrchestrator();
+      const run = vi.spyOn(spy.orchestrator, "run");
+      run.mockImplementationOnce(async () => {
+        clock.advance(30_000);
+        return {
+          run_id: "mrun_fake",
+          dryRun: false,
+          results: [],
+          changes: [],
+          tokens_used: 0,
+          errors: [],
+        } as unknown as OrchestratorResult;
+      });
+      watermarks.set(cadence === "heavy" ? "light" : "heavy", clock.now());
+      const scheduler = new MaintenanceScheduler(
+        withSchedulerDefaults({
+          enabled: true,
+          lightIntervalMs: 60_000,
+          heavyIntervalMs: 60_000,
+          lightProcesses: ["consolidator"],
+          heavyProcesses: ["reflector"],
+          orchestrator: spy.orchestrator,
+          processRegistry: createFakeProcessRegistry(),
+          cadenceWatermarkRepository: watermarks.repo,
+          startupGraceMs: 500,
+          clock,
+          setTimeoutFn: timeouts.setTimeoutFn,
+          clearTimeoutFn: timeouts.clearTimeoutFn,
+        }),
+      );
+      scheduler.start();
+      const bootTimer = timeouts.activeTimers().find((timer) => timer.delayMs === 500);
+      expect(bootTimer).toBeDefined();
+      clock.advance(500);
+      await timeouts.fire(bootTimer);
+      expect(watermarks.get(cadence)?.lastTs).toBe(cadence === "heavy" ? 1_500 : 31_500);
+      expect(timeouts.activeTimers().at(-1)?.delayMs).toBe(cadence === "heavy" ? 30_000 : 60_000);
+      await scheduler.stop();
+    },
+  );
+
   it("advances the heavy marker after a successful storage-only heavy tick", async () => {
     const clock = new ManualClock(1_000);
     const spy = createFakeOrchestrator();
@@ -1057,7 +1104,7 @@ describe("MaintenanceScheduler", () => {
     expect(timeouts.activeTimers().map((timer) => timer.delayMs)).toEqual([0, 500]);
   });
 
-  it("rejects overlapping light and heavy process sets", () => {
+  it("rejects duplicates within a cadence", () => {
     const clock = new ManualClock(1_000);
     const spy = createFakeOrchestrator();
 
@@ -1068,14 +1115,46 @@ describe("MaintenanceScheduler", () => {
             enabled: true,
             lightIntervalMs: 10_000,
             heavyIntervalMs: 60_000,
-            lightProcesses: ["consolidator", "reflector"],
+            lightProcesses: ["reflector", "reflector"],
             heavyProcesses: ["reflector"],
             orchestrator: spy.orchestrator,
             processRegistry: createFakeProcessRegistry(),
             clock,
           }),
         ),
-    ).toThrow(/overlapping processes: reflector/);
+    ).toThrow(/must not contain duplicates/);
+  });
+
+  it("passes cadence budgets and overrides while allowing resolver overlap", async () => {
+    const spy = createFakeOrchestrator();
+    const scheduler = new MaintenanceScheduler(
+      withSchedulerDefaults({
+        enabled: true,
+        lightIntervalMs: 1000,
+        heavyIntervalMs: 2000,
+        lightProcesses: ["review-resolver"],
+        heavyProcesses: ["review-resolver"],
+        lightBudget: 1200,
+        heavyBudget: 3400,
+        processOverrides: {
+          light: { "review-resolver": { budget: 900, params: { maxItemsPerPass: 3 } } },
+        },
+        orchestrator: spy.orchestrator,
+        processRegistry: createFakeProcessRegistry(),
+      }),
+    );
+    await scheduler.tick("light");
+    await scheduler.tick("heavy");
+    expect(spy.runCalls).toMatchObject([
+      {
+        cadence: "light",
+        opts: {
+          budget: 1200,
+          processOverrides: { "review-resolver": { budget: 900, params: { maxItemsPerPass: 3 } } },
+        },
+      },
+      { cadence: "heavy", opts: { budget: 3400, processOverrides: undefined } },
+    ]);
   });
 
   it("coalesces same-cadence concurrent ticks without dropping different cadences", async () => {
@@ -1131,7 +1210,7 @@ describe("MaintenanceScheduler", () => {
     expect(heavyResult).not.toBe(light1Result);
   });
 
-  it("does not run light and heavy maintenance process applies concurrently", async () => {
+  it("serializes light and heavy passes even when the same process is in both", async () => {
     const harness = await createOfflineTestHarness();
     cleanup.push(harness.cleanup);
 
@@ -1212,7 +1291,7 @@ describe("MaintenanceScheduler", () => {
         lightIntervalMs: 10_000,
         heavyIntervalMs: 60_000,
         lightProcesses: ["curator"],
-        heavyProcesses: ["reflector"],
+        heavyProcesses: ["curator"],
         orchestrator,
         processRegistry,
         clock: harness.clock,
@@ -1240,7 +1319,7 @@ describe("MaintenanceScheduler", () => {
     releases[0]?.();
     await waitForReleaseCount(2);
 
-    expect(events).toEqual(["curator:start", "curator:end", "reflector:start"]);
+    expect(events).toEqual(["curator:start", "curator:end", "curator:start"]);
     expect(maxActiveApplies).toBe(1);
 
     releases[1]?.();
@@ -1249,7 +1328,7 @@ describe("MaintenanceScheduler", () => {
 
     expect(lightResult.status).toBe("ok");
     expect(heavyResult.status).toBe("ok");
-    expect(events).toEqual(["curator:start", "curator:end", "reflector:start", "reflector:end"]);
+    expect(events).toEqual(["curator:start", "curator:end", "curator:start", "curator:end"]);
     expect(maxActiveApplies).toBe(1);
   });
 

@@ -1,5 +1,17 @@
 import type { EmbeddingClient } from "../embeddings/index.js";
 import type { GoalRecord, ValueRecord } from "../memory/self/index.js";
+import type { TurnTracer } from "../tracing/tracer.js";
+import { toWellFormedUtf16 } from "../util/utf16-boundary.js";
+import { utf8SafePrefix, utf8SafeSuffix } from "../util/utf8-boundary.js";
+
+export const GOAL_SCORING_ELISION_TRACE_MAX_ENTRIES = 1_000;
+// Shared across scans and turns. FIFO eviction bounds process memory; an evicted
+// tuple can be reported again. Only structural ids and byte counts are retained.
+const reportedGoalScoringElisions = new Set<string>();
+
+export function clearGoalScoringElisionTraceCache(): void {
+  reportedGoalScoringElisions.clear();
+}
 
 export type RetrievalScoringFeatures = {
   goalVectors: readonly Float32Array[];
@@ -30,8 +42,34 @@ export function selectActiveScoringValues(
   return [...established, ...candidates];
 }
 
-function goalScoringText(goal: Pick<GoalRecord, "description" | "progress_notes">): string {
-  return `${goal.description}\n${goal.progress_notes ?? ""}`.trim();
+export function goalScoringText(
+  goal: Pick<GoalRecord, "description" | "progress_notes">,
+  maxBytes = Number.POSITIVE_INFINITY,
+) {
+  const description = toWellFormedUtf16(goal.description);
+  const notes = toWellFormedUtf16(goal.progress_notes ?? "");
+  // The description has priority. If it alone exceeds the budget, keep its
+  // UTF-8-safe prefix and no notes. Notes are an opaque chronological string:
+  // retain the newest suffix, without inferring or parsing note boundaries.
+  const descriptionText = utf8SafePrefix(description, maxBytes);
+  const descriptionBytes = Buffer.byteLength(descriptionText, "utf8");
+  const notesText =
+    Buffer.byteLength(description, "utf8") > maxBytes
+      ? ""
+      : utf8SafeSuffix(notes, Math.max(0, maxBytes - descriptionBytes - 1));
+  const text = notesText.length === 0 ? descriptionText : `${descriptionText}\n${notesText}`;
+  const originalBytes =
+    Buffer.byteLength(description, "utf8") +
+    (notes.length === 0 ? 0 : 1 + Buffer.byteLength(notes, "utf8"));
+  const renderedBytes = Buffer.byteLength(text, "utf8");
+  return {
+    text,
+    originalBytes,
+    renderedBytes,
+    elidedBytes: originalBytes - renderedBytes,
+    descriptionElidedBytes: Buffer.byteLength(description, "utf8") - descriptionBytes,
+    progressElidedBytes: Buffer.byteLength(notes, "utf8") - Buffer.byteLength(notesText, "utf8"),
+  };
 }
 
 function valueScoringText(value: Pick<ValueRecord, "label" | "description">): string {
@@ -42,6 +80,9 @@ export async function buildSelfScoringFeatureSet(input: {
   embeddingClient: EmbeddingClient;
   goals: readonly GoalRecord[];
   activeValues: readonly Pick<ValueRecord, "label" | "description">[];
+  maxInputBytes?: number | undefined;
+  tracer?: (Pick<TurnTracer, "emit"> & Partial<Pick<TurnTracer, "enabled">>) | undefined;
+  turnId?: string;
 }): Promise<SelfScoringFeatureSet> {
   const activeGoals = input.goals.filter((goal) => goal.status === "active");
   const texts: string[] = [];
@@ -49,7 +90,26 @@ export async function buildSelfScoringFeatureSet(input: {
   const valueIndexes: number[] = [];
 
   for (const goal of activeGoals) {
-    const text = goalScoringText(goal);
+    const maxInputBytes = input.maxInputBytes ?? input.embeddingClient.maxInputBytes;
+    const { text, ...budget } = goalScoringText(goal, maxInputBytes);
+    if (budget.elidedBytes > 0 && input.tracer !== undefined && input.tracer.enabled !== false) {
+      const traceKey = JSON.stringify([goal.id, budget.originalBytes, budget.renderedBytes]);
+      if (!reportedGoalScoringElisions.has(traceKey)) {
+        input.tracer.emit("retrieval.degraded", {
+          turnId: input.turnId ?? "scoring_features",
+          subsystem: "scoring_features",
+          reason: "goal_scoring_text_elided",
+          goal_id: goal.id,
+          max_input_bytes: maxInputBytes,
+          ...budget,
+        });
+        reportedGoalScoringElisions.add(traceKey);
+        if (reportedGoalScoringElisions.size > GOAL_SCORING_ELISION_TRACE_MAX_ENTRIES) {
+          const oldestKey = reportedGoalScoringElisions.values().next().value;
+          if (oldestKey !== undefined) reportedGoalScoringElisions.delete(oldestKey);
+        }
+      }
+    }
 
     if (text.length === 0) {
       continue;

@@ -18,6 +18,7 @@ import {
   summarizeToolResponseShape,
   traceLlmCallResponse,
   traceLlmCallRetryHook,
+  traceLlmToolChoiceTranslationHook,
   traceLlmCallStarted,
 } from "../../tracing/llm-call-trace.js";
 import { intentRecordSchema, type TurnOrigin } from "../types.js";
@@ -141,6 +142,7 @@ export type RunS2PlannerOptions = {
   turnOrigin?: TurnOrigin;
   plannerSurface?: { variant: "legacy" } | ({ variant: "compact" } & CompactPlannerSystemPrompt);
   onRequestPrepared?: (request: S2PlannerRequestSnapshot) => void;
+  onPromptPresented?: () => void;
   onOutcome?: (outcome: S2PlannerOutcome) => void;
 };
 
@@ -404,14 +406,16 @@ export async function runS2Planner(options: RunS2PlannerOptions): Promise<S2Plan
   let usage = result.usage;
 
   if (result.extraction.plan === null) {
-    // Retry forces the plan tool (which precludes thinking) so a plan is
-    // guaranteed even when the thinking-mode first attempt emitted no tool call.
+    // Retry requests the plan tool without explicit thinking. On models that
+    // cannot force tool use, the shared client translates this request to auto
+    // and supplies its one-shot tool reminder if needed. Preserve effort across
+    // the conversation for prompt caching; omitted effort defaults centrally to high.
     const firstResult = result;
     attempts = 2;
 
     try {
       result = await callPlannerAttempt(
-        { ...options, thinking: undefined, effort: undefined },
+        { ...options, thinking: undefined },
         systemPrompt,
         traceSummary,
         [
@@ -544,6 +548,12 @@ async function callPlannerAttempt(
     sessionId: options.sessionId,
     label: "s2_planner",
   });
+  const onToolChoiceTranslated = traceLlmToolChoiceTranslationHook({
+    tracer: options.tracer,
+    turnId: options.turnId,
+    sessionId: options.sessionId,
+    label: "s2_planner",
+  });
   const callOptions = request.callOptions;
   const completeOptions = {
     model: callOptions.model,
@@ -555,11 +565,13 @@ async function callPlannerAttempt(
     ...(callOptions.thinking === undefined ? {} : { thinking: callOptions.thinking }),
     ...(callOptions.effort === undefined ? {} : { effort: callOptions.effort }),
     ...(onTransportRetry === undefined ? {} : { onTransportRetry }),
+    ...(onToolChoiceTranslated === undefined ? {} : { onToolChoiceTranslated }),
     timeoutMs: callOptions.timeoutMs,
     budget: callOptions.budget,
   } satisfies LLMCompleteOptions;
   options.onRequestPrepared?.(request);
   const planner = await options.llmClient.complete(completeOptions);
+  options.onPromptPresented?.();
   const extraction = extractTurnPlan(planner.tool_calls, options.turnOrigin);
 
   if (options.tracer?.enabled === true && options.turnId !== undefined) {

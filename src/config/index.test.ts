@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import solDemoConfigKeys from "./fixtures/sol-demo-config-keys.json";
+
 import { DEFAULT_PLAN_REQUESTED_VERIFICATION_MEMBERSHIP_TOKEN_BUDGET } from "../cognition/deliberation/constants.js";
 import { OFFLINE_PROCESS_NAMES } from "../contracts/offline-process.js";
 import { writeJsonFileAtomic } from "../util/atomic-write.js";
@@ -25,6 +27,46 @@ describe("config", () => {
     }
   });
 
+  it("accepts the documented Sol demo config keys without sidecar embedding environment variables", () => {
+    // Hand-authored from the accepted merge plan; never read the live bank/config.
+    const config = configSchema.parse(solDemoConfigKeys);
+    expect(config.anthropic.models.preTurnExtraction).toBe("claude-sonnet-5");
+    expect(config.frameAnomaly).toEqual(solDemoConfigKeys.frameAnomaly);
+    expect(config.internalIdentifierGuard).toEqual(solDemoConfigKeys.internalIdentifierGuard);
+    expect(config.embedding.model).toBe(solDemoConfigKeys.embedding.model);
+    expect(config.embedding.dims).toBe(4096);
+    expect(config.offline.selfNarrator).toMatchObject({
+      maxEpisodesPerRun: 150,
+      maxInputTokensPerRun: 60_000,
+      maxPromptTokens: 250_000,
+    });
+    expect(config.offline.reflector).toMatchObject({
+      maxEpisodesPerCluster: 120,
+      maxClusterInputTokens: 40_000,
+    });
+    expect(similarityThresholds(config)).toEqual(similarityThresholds(DEFAULT_CONFIG));
+  });
+
+  it.each([
+    { open_question_dormant: 12 },
+    { invalid_source: 12 },
+    { open_question_dormant: 0 },
+    { open_question_dormant: 1.5 },
+  ])("loads and validates source wake caps: %j", (caps) => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-source-caps-"));
+    tempDirs.push(tempDir);
+    writeJsonFileAtomic(join(tempDir, "config.json"), {
+      autonomy: { maxWakesPerWindowBySource: caps },
+    });
+    if (caps.open_question_dormant === 12) {
+      expect(loadConfig({ dataDir: tempDir, env: {} }).autonomy.maxWakesPerWindowBySource).toEqual(
+        caps,
+      );
+    } else {
+      expect(() => loadConfig({ dataDir: tempDir, env: {} })).toThrow(ConfigError);
+    }
+  });
+
   it("loads defaults without requiring API keys", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
     tempDirs.push(tempDir);
@@ -40,9 +82,9 @@ describe("config", () => {
     expect(config.anthropic.auth).toBe("auto");
     expect(config.anthropic.apiKey).toBeUndefined();
     expect(config.anthropic.models).toEqual({
-      cognition: "claude-opus-4-8",
-      background: "claude-opus-5",
-      extraction: "claude-opus-5",
+      cognition: "claude-opus-5-5",
+      background: "claude-opus-5-5",
+      extraction: "claude-opus-5-5",
       recallExpansion: "claude-haiku-4-5-20251001",
       correctivePreference: "claude-sonnet-5",
       sharedStateCompiler: "claude-sonnet-5",
@@ -71,6 +113,7 @@ describe("config", () => {
     expect(config.offline.curator.episodeHeatHalfLifeDays).toBe(7);
     expect(config.offline.curator.traitHalfLifeDays).toBe(30);
     expect(config.offline.curator.retrievalLogRetentionDays).toBe(90);
+    expect(config.offline.selfNarrator.maxPromptTokens).toBe(250_000);
     expect(config.offline.semanticExtractor).toEqual({
       maxEpisodesPerRun: 8,
       maxInputTokensPerRun: 150_000,
@@ -105,6 +148,7 @@ describe("config", () => {
       "consolidator",
       "semantic-extractor",
       "curator",
+      "review-resolver",
     ]);
     expect(config.maintenance.optimizeStorage).toBe(true);
     expect(config.maintenance.lightBudget).toBeNull();
@@ -133,7 +177,8 @@ describe("config", () => {
     ).toBe(OFFLINE_PROCESS_NAMES.length);
     expect(config.executive.goalFocusThreshold).toBe(0.45);
     expect(config.autonomy.maxWakesPerWindow).toBe(6);
-    expect(config.autonomy.prepToolTimeoutMs).toBe(30_000);
+    expect(config.autonomy.maxWakesPerWindowBySource).toEqual({});
+    expect(config.autonomy.prepToolTimeoutMs).toBe(90_000);
     expect(config.autonomy.goalWakeBatchMax).toBe(5);
     expect(config.autonomy.budgetWindowMs).toBe(24 * 60 * 60 * 1_000);
     expect(config.autonomy.reservedContemplativeWakesPerWindow).toBe(1);
@@ -583,6 +628,45 @@ describe("config", () => {
     ).toThrow();
   });
 
+  it("defaults raw recall queries to 6 KiB and lets env override the file budget", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    expect(DEFAULT_CONFIG.retrieval.rawQueryMaxBytes).toBe(6144);
+    expect(loadConfig({ dataDir: tempDir, env: {} }).retrieval.rawQueryMaxBytes).toBe(6144);
+    writeJsonFileAtomic(join(tempDir, "config.json"), {
+      retrieval: { rawQueryMaxBytes: 8192, recallExpansionTimeoutMs: 4500 },
+    });
+    expect(loadConfig({ dataDir: tempDir, env: {} }).retrieval.rawQueryMaxBytes).toBe(8192);
+    const config = loadConfig({
+      dataDir: tempDir,
+      env: { BORG_RETRIEVAL_RAW_QUERY_MAX_BYTES: "4096" },
+    });
+    expect(config.retrieval.rawQueryMaxBytes).toBe(4096);
+    expect(config.retrieval.recallExpansionTimeoutMs).toBe(4500);
+    expect(redactConfig(config).retrieval.rawQueryMaxBytes).toBe(4096);
+  });
+
+  it.each(["0", "-1", "1.5", "NaN", "Infinity", "many", "9007199254740992"])(
+    "rejects an invalid raw recall query byte budget from env: %s",
+    (value) => {
+      const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+      tempDirs.push(tempDir);
+      expect(() =>
+        loadConfig({
+          dataDir: tempDir,
+          env: { BORG_RETRIEVAL_RAW_QUERY_MAX_BYTES: value },
+        }),
+      ).toThrow(ConfigError);
+    },
+  );
+
+  it.each([0, -1, 1.5, "4096", null, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects an invalid raw recall query byte budget in config: %j",
+    (rawQueryMaxBytes) => {
+      expect(configSchema.safeParse({ retrieval: { rawQueryMaxBytes } }).success).toBe(false);
+    },
+  );
+
   it("loads the recall-expansion timeout from the environment and defaults it to 2000ms", () => {
     const overrideDir = mkdtempSync(join(tmpdir(), "borg-"));
     const disabledDir = mkdtempSync(join(tmpdir(), "borg-"));
@@ -780,6 +864,25 @@ describe("config", () => {
     expect(() => loadConfig({ dataDir: tempDir, env: { [name]: value } })).toThrow(ConfigError);
   });
 
+  it("loads and validates the self-narrator prompt cap", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    expect(
+      loadConfig({
+        dataDir: tempDir,
+        env: { BORG_OFFLINE_SELF_NARRATOR_MAX_PROMPT_TOKENS: "120000" },
+      }).offline.selfNarrator.maxPromptTokens,
+    ).toBe(120_000);
+    for (const value of ["0", "-1", "1.5"]) {
+      expect(() =>
+        loadConfig({
+          dataDir: tempDir,
+          env: { BORG_OFFLINE_SELF_NARRATOR_MAX_PROMPT_TOKENS: value },
+        }),
+      ).toThrow(ConfigError);
+    }
+  });
+
   it("loads the trait decay interval from the environment", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
     tempDirs.push(tempDir);
@@ -949,6 +1052,119 @@ describe("config", () => {
     expect(config.host_capabilities).toBe(hostCapabilities);
     expect(config.host_capabilities).not.toContain("Proactive outbound messaging");
   });
+
+  it("leaves the input byte cap absent by default and loads a file cap", () => {
+    expect(DEFAULT_CONFIG.embedding).not.toHaveProperty("maxInputBytes");
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    writeJsonFileAtomic(join(tempDir, "config.json"), {
+      embedding: { maxInputBytes: 32000 },
+    });
+    expect(loadConfig({ dataDir: tempDir, env: {} }).embedding.maxInputBytes).toBe(32000);
+  });
+
+  it.each(["1", "32000", " 32000 ", "0032000"])(
+    "lets the input byte cap environment value %j override the file",
+    (value) => {
+      const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+      tempDirs.push(tempDir);
+      writeJsonFileAtomic(join(tempDir, "config.json"), {
+        embedding: { maxInputBytes: 64000, model: "file-model" },
+      });
+      const config = loadConfig({
+        dataDir: tempDir,
+        env: { BORG_EMBEDDING_MAX_INPUT_BYTES: value },
+      });
+      expect(config.embedding.maxInputBytes).toBe(Number(value));
+      expect(config.embedding.model).toBe("file-model");
+    },
+  );
+
+  it.each([
+    "",
+    "  ",
+    "0",
+    "-1",
+    "1.5",
+    "32000.0",
+    "32e3",
+    "0x7d00",
+    "+32000",
+    "32000bytes",
+    "Infinity",
+    "NaN",
+    "9007199254740992",
+  ])("rejects invalid BORG_EMBEDDING_MAX_INPUT_BYTES %j with ConfigError", (value) => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    const load = () =>
+      loadConfig({ dataDir: tempDir, env: { BORG_EMBEDDING_MAX_INPUT_BYTES: value } });
+    expect(load).toThrow(ConfigError);
+    expect(load).toThrow("BORG_EMBEDDING_MAX_INPUT_BYTES must be a positive integer");
+  });
+
+  it.each([0, -1, 1.5, "32000", null, true, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid input byte cap config %j",
+    (maxInputBytes) => {
+      expect(configSchema.safeParse({ embedding: { maxInputBytes } }).success).toBe(false);
+    },
+  );
+
+  it("preserves arbitrary embedding provider JSON from the config file", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    const provider = {
+      data_collection: "deny",
+      ignore: ["SiliconFlow"],
+      future_option: { nested: [null, true, 1.25, "étiquette", { enabled: false }] },
+    };
+    writeJsonFileAtomic(join(tempDir, "config.json"), { embedding: { provider } });
+
+    expect(loadConfig({ dataDir: tempDir, env: {} }).embedding.provider).toEqual(provider);
+    expect(DEFAULT_CONFIG.embedding).not.toHaveProperty("provider");
+  });
+
+  it.each([{}, { data_collection: "deny", ignore: ["SiliconFlow"] }])(
+    "replaces the complete file provider object with the env object %j",
+    (provider) => {
+      const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+      tempDirs.push(tempDir);
+      writeJsonFileAtomic(join(tempDir, "config.json"), {
+        embedding: {
+          model: "file-model",
+          provider: { data_collection: "allow", order: ["file-provider"] },
+        },
+      });
+
+      const config = loadConfig({
+        dataDir: tempDir,
+        env: { BORG_EMBEDDING_PROVIDER: JSON.stringify(provider) },
+      });
+
+      expect(config.embedding.provider).toEqual(provider);
+      expect(config.embedding.model).toBe("file-model");
+    },
+  );
+
+  it.each(["", "  ", "{", "undefined", "null", "[]", '"router"', "42", "true", "false"])(
+    "rejects invalid or non-object BORG_EMBEDDING_PROVIDER %j with ConfigError",
+    (provider) => {
+      const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+      tempDirs.push(tempDir);
+      const load = () =>
+        loadConfig({ dataDir: tempDir, env: { BORG_EMBEDDING_PROVIDER: provider } });
+
+      expect(load).toThrow(ConfigError);
+      expect(load).toThrow("BORG_EMBEDDING_PROVIDER must be a JSON object");
+    },
+  );
+
+  it.each([null, [], "router", 42, true, new Date(0), { nested: undefined }, { nested: Infinity }])(
+    "rejects non-object or non-JSON embedding provider config %j",
+    (provider) => {
+      expect(configSchema.safeParse({ embedding: { provider } }).success).toBe(false);
+    },
+  );
 
   it("merges config file values with environment overrides", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
@@ -1220,9 +1436,9 @@ describe("config", () => {
 
   it("defaults recall expansion to the dedicated Haiku slot", () => {
     expect(DEFAULT_CONFIG.anthropic.models).toEqual({
-      cognition: "claude-opus-4-8",
-      background: "claude-opus-5",
-      extraction: "claude-opus-5",
+      cognition: "claude-opus-5-5",
+      background: "claude-opus-5-5",
+      extraction: "claude-opus-5-5",
       recallExpansion: "claude-haiku-4-5-20251001",
       correctivePreference: "claude-sonnet-5",
       sharedStateCompiler: "claude-sonnet-5",
@@ -1242,6 +1458,30 @@ describe("config", () => {
 
     expect(config.anthropic.models.correctivePreference).toBe("claude-sonnet-5");
     expect(config.anthropic.models.recallExpansion).toBe("custom-recall");
+  });
+
+  it("keeps pre-turn extraction optional and loads its file and environment overrides", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    const omitted = loadConfig({
+      dataDir: tempDir,
+      env: { BORG_MODEL_RECALL_EXPANSION: "custom-recall" },
+    });
+    expect(omitted.anthropic.models.preTurnExtraction).toBeUndefined();
+    expect(omitted.anthropic.models.recallExpansion).toBe("custom-recall");
+    writeJsonFileAtomic(join(tempDir, "config.json"), {
+      anthropic: { models: { preTurnExtraction: "file-pre-turn" } },
+    });
+    expect(loadConfig({ dataDir: tempDir, env: {} }).anthropic.models.preTurnExtraction).toBe(
+      "file-pre-turn",
+    );
+    expect(
+      loadConfig({ dataDir: tempDir, env: { BORG_MODEL_PRE_TURN_EXTRACTION: "env-pre-turn" } })
+        .anthropic.models.preTurnExtraction,
+    ).toBe("env-pre-turn");
+    expect(() =>
+      configSchema.parse({ anthropic: { models: { preTurnExtraction: "" } } }),
+    ).toThrow();
   });
 
   it("defaults shared-state compilation to Sonnet independently of recall expansion overrides", () => {
@@ -1325,6 +1565,94 @@ describe("config", () => {
     expect(config.offline.reviewResolver.autonomous).toBe(true);
     expect(config.offline.reviewResolver.maxNeedsManualAttempts).toBe(2);
   });
+
+  it("allows cadence overlap with independent process overrides and validates refusal backoff", () => {
+    const config = configSchema.parse({
+      maintenance: {
+        lightProcesses: ["review-resolver"],
+        heavyProcesses: ["review-resolver"],
+      },
+    });
+    expect(config.maintenance.processOverrides).toEqual({
+      light: { "review-resolver": { params: { maxItemsPerPass: 3 } } },
+      heavy: {},
+    });
+    expect(config.offline.ruminator).toMatchObject({
+      maxConsecutiveRefusals: 3,
+      refusalBackoffDays: 7,
+    });
+    expect(() =>
+      configSchema.parse({
+        maintenance: { lightProcesses: ["review-resolver", "review-resolver"] },
+      }),
+    ).toThrow();
+    expect(() =>
+      configSchema.parse({
+        maintenance: { processOverrides: { light: { "review-resolver": { budget: 0 } } } },
+      }),
+    ).toThrow();
+    for (const ruminator of [
+      { maxConsecutiveRefusals: 0 },
+      { maxConsecutiveRefusals: 1.5 },
+      { refusalBackoffDays: 0 },
+    ]) {
+      expect(() => configSchema.parse({ offline: { ruminator } })).toThrow();
+    }
+  });
+
+  it.each([
+    { light: { curator: { params: { custom: true } } }, expectedCut: 3 },
+    { light: { "review-resolver": { budget: 100 } }, expectedCut: 3 },
+    { light: { "review-resolver": { params: { custom: true } } }, expectedCut: 3 },
+    { light: { "review-resolver": { params: { maxItemsPerPass: 5 } } }, expectedCut: 5 },
+  ])(
+    "merges production cadence defaults with partial overrides: $light",
+    ({ light, expectedCut }) => {
+      const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+      tempDirs.push(tempDir);
+      writeJsonFileAtomic(join(tempDir, "config.json"), {
+        maintenance: { processOverrides: { light, heavy: { "review-resolver": { budget: 200 } } } },
+      });
+      const config = loadConfig({ dataDir: tempDir, env: {} });
+      expect(config.maintenance.processOverrides.light).toMatchObject(light);
+      expect(
+        config.maintenance.processOverrides.light["review-resolver"]?.params?.maxItemsPerPass,
+      ).toBe(expectedCut);
+      expect(config.maintenance.processOverrides.heavy).toEqual({
+        "review-resolver": { budget: 200 },
+      });
+    },
+  );
+
+  it.each(["light", "heavy"] as const)(
+    "rejects invalid review-resolver cuts through the production loader for %s",
+    (cadence) => {
+      const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+      tempDirs.push(tempDir);
+      for (const maxItemsPerPass of ["bad", "3", 0, -1, 1.5, null, true]) {
+        writeJsonFileAtomic(join(tempDir, "config.json"), {
+          maintenance: {
+            processOverrides: {
+              [cadence]: { "review-resolver": { params: { maxItemsPerPass } } },
+            },
+          },
+        });
+        expect(() => loadConfig({ dataDir: tempDir, env: {} })).toThrow(ConfigError);
+      }
+      writeJsonFileAtomic(join(tempDir, "config.json"), {
+        maintenance: {
+          processOverrides: {
+            [cadence]: { "review-resolver": { params: { maxItemsPerPass: 5 } } },
+          },
+        },
+      });
+      expect(
+        loadConfig({ dataDir: tempDir, env: {} }).maintenance.processOverrides[cadence][
+          "review-resolver"
+        ]?.params?.maxItemsPerPass,
+      ).toBe(5);
+    },
+  );
 
   it("defaults review resolver autonomous mode off", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
@@ -1447,6 +1775,9 @@ describe("config", () => {
       dataDir: tempDir,
       env: {
         ANTHROPIC_API_KEY: "secret",
+        BORG_EMBEDDING_API_KEY: "embedding-secret",
+        BORG_EMBEDDING_MAX_INPUT_BYTES: "32000",
+        BORG_EMBEDDING_PROVIDER: '{"data_collection":"deny","ignore":["SiliconFlow"]}',
       },
     });
 
@@ -1459,6 +1790,8 @@ describe("config", () => {
       },
       embedding: {
         apiKey: "[REDACTED]",
+        provider: { data_collection: "deny", ignore: ["SiliconFlow"] },
+        maxInputBytes: 32000,
       },
       anthropic: {
         apiKey: "[REDACTED]",

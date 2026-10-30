@@ -1,3 +1,5 @@
+import { readEmbeddingProviderEnv } from "../src/config/embedding-provider.js";
+import { readEmbeddingMaxInputBytesEnv } from "../src/config/embedding-input.js";
 /*
  * One-off: roll up scheduled OUTCOME episodes by role and UTC day, backfill
  * surviving OUTCOME consolidation embeddings, and archive the validated toxic
@@ -2425,6 +2427,8 @@ function createScriptEmbeddingClient(env: NodeJS.ProcessEnv, dims: number): Embe
     baseUrl: requiredEnv(env, "KRATOS_BASE_URL"),
     apiKey: requiredEnv(env, "LLM_API_KEY"),
     model: requiredEnv(env, "EMBEDDING_MODEL"),
+    provider: readEmbeddingProviderEnv(env),
+    maxInputBytes: readEmbeddingMaxInputBytesEnv(env),
     dims,
   });
 }

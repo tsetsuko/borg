@@ -1,16 +1,17 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AutonomyScheduler } from "../scheduler.js";
 import { AutonomyWakesRepository } from "../wakes-repository.js";
 import { TestEmbeddingClient, createOfflineTestHarness } from "../../offline/test-support.js";
 import type { TurnResult } from "../../cognition/index.js";
 import type { EmbeddingClient } from "../../embeddings/index.js";
+import { clearGoalScoringElisionTraceCache } from "../../retrieval/scoring-features.js";
 import { StreamWatermarkRepository, StreamWriter } from "../../stream/index.js";
 import { ToolDispatcher } from "../../tools/index.js";
 import { OUTBOUND_POST_TOOL_NAME } from "../../tools/internal/outbound-post-name.js";
 import { ManualClock } from "../../util/clock.js";
 import { SessionBusyError } from "../../util/errors.js";
-import { DEFAULT_SESSION_ID } from "../../util/ids.js";
+import { DEFAULT_SESSION_ID, createStreamEntryId } from "../../util/ids.js";
 import type { AutonomyWakeSource } from "../types.js";
 import {
   executiveFocusGoalStaleBackoffCooldownMs,
@@ -23,6 +24,9 @@ import { createGoalFollowupDueTrigger } from "./goal-followup-due.js";
 
 describe("executive focus due trigger", () => {
   let cleanup: (() => Promise<void>) | undefined;
+
+  beforeEach(clearGoalScoringElisionTraceCache);
+  afterEach(clearGoalScoringElisionTraceCache);
 
   afterEach(async () => {
     await cleanup?.();
@@ -96,6 +100,140 @@ describe("executive focus due trigger", () => {
       ...overrides,
     });
   }
+
+  it("reports over-cap goal scoring once across repeated scheduler scans", async () => {
+    const embeddingClient = Object.assign(new TestEmbeddingClient(), { maxInputBytes: 20 });
+    const h = await createHarness(1_000_000, embeddingClient);
+    const goal = h.goalsRepository.add({
+      description: "目的",
+      progressNotes: "古い".repeat(20) + "新しい進捗",
+      priority: 10,
+      provenance: { kind: "manual" },
+    });
+    const emit = vi.fn();
+    const trigger = createTrigger(h, {
+      tracer: { enabled: true, includePayloads: false, emit },
+    });
+    for (let tick = 0; tick < 5; tick += 1) {
+      await trigger.scan();
+      h.clock.advance(60_000);
+    }
+    expect(
+      emit.mock.calls.filter(([, data]) => data.reason === "goal_scoring_text_elided"),
+    ).toHaveLength(1);
+    h.goalsRepository.updateProgress(goal.id, "さらに進捗", { kind: "manual" });
+    await trigger.scan();
+    expect(
+      emit.mock.calls.filter(([, data]) => data.reason === "goal_scoring_text_elided"),
+    ).toHaveLength(2);
+  });
+
+  it("does not re-present a goal on score drift, expired cooldown, new steps or action topology, but accepts new input", async () => {
+    const h = await createHarness();
+    const goal = h.goalsRepository.add({
+      description: "目的",
+      priority: 10,
+      provenance: { kind: "manual" },
+    });
+    h.clock.advance(86_400_001);
+    let actionKey = "before";
+    const trigger = createTrigger(h, {
+      threshold: 0,
+      goalStaleBackoffActionAvailabilityKey: () => actionKey,
+    });
+    expect(await trigger.scan()).toHaveLength(1);
+    expect(h.goalsRepository.presentation!.wasPresented(goal)).toBe(false);
+    h.goalsRepository.presentation!.presented(
+      [h.goalsRepository.presentation!.snapshot(goal)],
+      "turn_presented",
+    );
+    h.clock.advance(10 * 86_400_000);
+    actionKey = "after";
+    h.executiveStepsRepository.add({
+      goalId: goal.id,
+      description: "Now due",
+      kind: "think",
+      dueAt: h.clock.now() - 1,
+      provenance: { kind: "manual" },
+    });
+    expect(await trigger.scan()).toEqual([]);
+    h.goalsRepository.presentation!.associateInbound(goal.id, createStreamEntryId());
+    expect(await trigger.scan()).toHaveLength(1);
+    h.goalsRepository.presentation!.presented(
+      [h.goalsRepository.presentation!.snapshot(h.goalsRepository.get(goal.id)!)],
+      "turn_input",
+    );
+    expect(await trigger.scan()).toEqual([]);
+    h.goalsRepository.updateProgress(goal.id, "進捗", { kind: "manual" });
+    expect(await trigger.scan()).toHaveLength(1);
+  });
+
+  it.each([false, true])(
+    "shares re-presentation eligibility with followup, due step=%s",
+    async (dueStep) => {
+      const h = await createHarness();
+      const goal = h.goalsRepository.add({
+        description: "Shared generation",
+        priority: 9,
+        provenance: { kind: "manual" },
+        createdAt: h.clock.now() - 200_000,
+      });
+      if (dueStep)
+        h.executiveStepsRepository.add({
+          goalId: goal.id,
+          description: "Due step",
+          kind: "think",
+          dueAt: h.clock.now() - 1,
+          provenance: { kind: "manual" },
+        });
+      let actionKey = "before";
+      const executive = createTrigger(h, {
+        threshold: 0,
+        stalenessMs: 100_000,
+        goalFollowupDue: { enabled: true, lookaheadMs: 20_000, staleMs: 100_000 },
+        goalStaleBackoffActionAvailabilityKey: () => actionKey,
+      });
+      const followup = createGoalFollowupDueTrigger({
+        goalsRepository: h.goalsRepository,
+        watermarkRepository: h.watermarkRepository,
+        lookaheadMs: 20_000,
+        staleMs: 100_000,
+        respectStaleBackoff: true,
+        staleBackoff: {
+          baseCooldownMs: 1_000,
+          multiplier: 2,
+          maxCooldownMs: 60_000,
+          dormancyCount: 3,
+        },
+        goalStaleBackoffActionAvailabilityKey: () => actionKey,
+        clock: h.clock,
+      });
+      const first = (await followup.scan())[0]!;
+      h.watermarkRepository.set(first.watermarkProcessName, DEFAULT_SESSION_ID, {
+        lastTs: h.clock.now(),
+        lastEntryId: first.id,
+      });
+      const presentations = h.goalsRepository.presentation!;
+      presentations.presented([presentations.snapshot(goal)], "presented-by-either-lane");
+      actionKey = "changed-topology";
+      h.clock.advance(15 * 86_400_000);
+      expect(await executive.scan()).toEqual([]);
+      expect(await followup.scan()).toEqual([]);
+      for (const input of ["association", "progress"]) {
+        if (input === "association") presentations.associateInbound(goal.id, createStreamEntryId());
+        else {
+          h.goalsRepository.updateProgress(goal.id, "Structural progress", { kind: "manual" });
+          h.clock.advance(100_001);
+        }
+        // No gap: executive either admits its due step or delegates to an open followup lane.
+        expect(await executive.scan()).toHaveLength(dueStep ? 1 : 0);
+        expect(await followup.scan()).toHaveLength(1);
+        presentations.presented([presentations.snapshot(h.goalsRepository.get(goal.id)!)], input);
+        expect(await executive.scan()).toEqual([]);
+        expect(await followup.scan()).toEqual([]);
+      }
+    },
+  );
 
   function createScheduler(input: {
     harness: Awaited<ReturnType<typeof createHarness>>;
@@ -378,6 +516,49 @@ describe("executive focus due trigger", () => {
       },
     });
     expect(events[0]?.payload).not.toHaveProperty("score_basis");
+  });
+
+  it("carries the selected goal's terminal condition whole, and null when none is stored", async () => {
+    const terminalCondition = `The criterion runs past every excerpt budget on the page. ${"x".repeat(400)}`;
+    const harness = await createHarness();
+    const stated = harness.goalsRepository.add({
+      description: "Ship executive focus",
+      terminalCondition,
+      priority: 10,
+      provenance: { kind: "manual" },
+    });
+    harness.executiveStepsRepository.add({
+      goalId: stated.id,
+      description: "Act on the overdue step",
+      kind: "act",
+      dueAt: harness.clock.now(),
+      provenance: { kind: "manual" },
+    });
+    const trigger = createTrigger(harness);
+
+    const statedEvents = await trigger.scan();
+
+    expect(statedEvents).toHaveLength(1);
+    expect(statedEvents[0]?.payload.selected_goal.terminal_condition).toBe(terminalCondition);
+
+    const unstatedHarness = await createHarness();
+    const unstated = unstatedHarness.goalsRepository.add({
+      description: "Ship executive focus",
+      priority: 10,
+      provenance: { kind: "manual" },
+    });
+    unstatedHarness.executiveStepsRepository.add({
+      goalId: unstated.id,
+      description: "Act on the overdue step",
+      kind: "act",
+      dueAt: unstatedHarness.clock.now(),
+      provenance: { kind: "manual" },
+    });
+
+    const unstatedEvents = await createTrigger(unstatedHarness).scan();
+
+    expect(unstatedEvents).toHaveLength(1);
+    expect(unstatedEvents[0]?.payload.selected_goal.terminal_condition).toBeNull();
   });
 
   it("describes the next due executive step boundary without scoring", async () => {
@@ -958,7 +1139,7 @@ describe("executive focus due trigger", () => {
     });
   });
 
-  it("stops firing once a stale goal reaches the empty-wake dormancy count", async () => {
+  it("pauses a stale goal for fourteen days after the empty-wake dormancy count", async () => {
     const harness = await createHarness(5_000_000);
     const goal = harness.goalsRepository.add({
       description: "Perpetually empty stale goal",
@@ -981,11 +1162,14 @@ describe("executive focus due trigger", () => {
     harness.clock.advance(60_000);
     expect(await trigger.scan()).toHaveLength(1);
 
-    // At the dormancy count it exits selection entirely, regardless of how much
-    // time elapses -- no timer brings it back.
+    // Dormancy expires at fourteen days even without progress.
     setGoalStaleBackoff({ harness, goalId: goal.id, emptyCount: 2 });
-    harness.clock.advance(10 * 86_400_000);
+    harness.clock.advance(14 * 86_400_000 - 1);
     expect(await trigger.scan()).toHaveLength(0);
+    expect(trigger.dormantGoalIds?.()).toEqual([goal.id]);
+    harness.clock.advance(1);
+    expect(await trigger.scan()).toHaveLength(1);
+    expect(trigger.dormantGoalIds?.()).toEqual([]);
   });
 
   it("re-enters selection when a dormant stale goal makes progress", async () => {
@@ -1009,7 +1193,7 @@ describe("executive focus due trigger", () => {
     expect(await trigger.scan()).toHaveLength(0);
 
     // Headway after the backoff stamp clears dormancy; once it is stale again
-    // it is eligible -- the only way back is real progress, never a timer.
+    // it is eligible before the fourteen-day timer expires.
     harness.clock.advance(1_000);
     harness.goalsRepository.updateProgress(goal.id, "External report advanced the goal.", {
       kind: "manual",
@@ -1045,7 +1229,7 @@ describe("executive focus due trigger", () => {
     expect(released[0]?.goalStaleBackoffActionAvailabilityKey).toBe(actionAvailabilityKey);
 
     // Once an empty wake has stamped the same structural key, ordinary
-    // infinite dormancy resumes rather than retrying every scan.
+    // fourteen-day dormancy resumes rather than retrying every scan.
     setGoalStaleBackoff({
       harness,
       goalId: goal.id,

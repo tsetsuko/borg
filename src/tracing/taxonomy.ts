@@ -28,12 +28,14 @@ export const TRACE_EVENT_TAXONOMY = {
     "closure_loop.degraded",
     "closure_loop.transitioned",
   ],
-  working_memory: ["working_memory.degraded"],
+  working_memory: ["working_memory.degraded", "working_memory.pending_action_resolved"],
   executive_focus: [],
   retrieval: [
     "retrieval.started",
+    "retrieval.raw_query",
     "retrieval.completed",
     "retrieval.intent_candidates",
+    "retrieval.lane_settled",
     "retrieval.degraded",
     "recall_expansion.completed",
     "creator_directive_rendered",
@@ -73,6 +75,7 @@ export const TRACE_EVENT_TAXONOMY = {
   deliberation: [
     "llm_call.started",
     "llm_call.retried",
+    "llm_call.tool_choice_translated",
     "llm_call.completed",
     "llm_call.schema_repair.attempted",
     "llm_call.schema_repair.succeeded",
@@ -109,6 +112,7 @@ export const TRACE_EVENT_TAXONOMY = {
     "post_generation.rejected",
   ],
   extraction: [
+    "sidecar.append_turn.completed",
     "extraction.commitments.degraded",
     "extraction.commitments.rejected",
     "extraction.commitments.transitioned",
@@ -175,7 +179,11 @@ export const TRACE_EVENT_TAXONOMY = {
     "semantic_node.status.transitioned",
   ],
   offline: ["offline_process.started", "offline_process.completed"],
-  maintenance: ["maintenance_snapshot.completed", "storage.optimize.completed"],
+  maintenance: [
+    "maintenance_snapshot.completed",
+    "storage.optimize.completed",
+    "process.memory.sample",
+  ],
   session: ["session.completed", "turn.rollback_incomplete", "turn.rejected", "turn.terminal"],
 } as const satisfies Record<string, readonly TurnTraceEventName[]>;
 

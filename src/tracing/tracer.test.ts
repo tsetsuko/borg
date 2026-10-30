@@ -270,6 +270,76 @@ describe("TurnTracer", () => {
     expect(typeof fullEntries[0]?.wallMs).toBe("number");
   });
 
+  it("retains legacy entityTerms and nested payloads in JSONL when payloads are disabled", () => {
+    const tracePath = join(createTempDir(), "legacy-payload-policy.jsonl");
+    const tracer = new JsonlTracer({ path: tracePath, includePayloads: false });
+    tracer.emit("retrieval.started", {
+      turnId: "legacy", query: "omitted", entityTerms: ["legacy top-level"],
+      options: { entityTerms: ["legacy nested"] },
+    });
+    const event = readTraceEvents(tracePath)[0];
+    expect(event).toMatchObject({
+      entityTerms: ["legacy top-level"], options: { entityTerms: ["legacy nested"] },
+    });
+    expect(event).not.toHaveProperty("query");
+  });
+
+  it.each(["autonomy.tick", "autonomy.tick_error"] as const)(
+    "redacts nested %s errors in standalone tracers according to payload tracing",
+    (event) => {
+      const data: TurnTraceData = {
+        turnId: "autonomy_errors",
+        errorCount: 2,
+        errors: [
+          { sourceName: "scheduled_wake", errorName: "TypeError", error: "private cause text" },
+        ],
+        sourceErrors: [
+          {
+            sourceName: "scheduled_reflection",
+            errorName: "AutonomySourcePreparationError",
+            error: "private source text",
+          },
+        ],
+      };
+      for (const includePayloads of [false, true]) {
+        const entries: CallbackTraceEntry[] = [];
+        const callback = new CallbackTracer({
+          includePayloads,
+          sink: (entry) => entries.push(entry),
+        });
+        const tracePath = join(createTempDir(), "errors.jsonl");
+        const jsonl = new JsonlTracer({ path: tracePath, includePayloads });
+        callback.emit(event, data);
+        jsonl.emit(event, data);
+        const expected = {
+          errors: [
+            {
+              sourceName: "scheduled_wake",
+              errorName: "TypeError",
+              error: includePayloads ? "private cause text" : "TypeError",
+            },
+          ],
+          sourceErrors: [
+            {
+              sourceName: "scheduled_reflection",
+              errorName: "AutonomySourcePreparationError",
+              error: includePayloads ? "private source text" : "AutonomySourcePreparationError",
+            },
+          ],
+        };
+        expect(entries[0]).toMatchObject(expected);
+        expect(readTraceEvents(tracePath)[0]).toMatchObject(expected);
+        if (!includePayloads) {
+          expect(JSON.stringify(entries)).not.toContain("private");
+          expect(readFileSync(tracePath, "utf8")).not.toContain("private");
+        }
+      }
+      expect(data.errors).toEqual([
+        { sourceName: "scheduled_wake", errorName: "TypeError", error: "private cause text" },
+      ]);
+    },
+  );
+
   it("strips payload-gated keys for a lone JsonlTracer without payloads", () => {
     const tempDir = createTempDir();
     const tracePath = join(tempDir, "jsonl-no-payloads.jsonl");
@@ -581,7 +651,29 @@ describe("TurnTracer", () => {
       }),
     );
     expect(new Set(turnEvents.map((event) => event.turnId)).size).toBe(1);
-    expect(turnEvents.map((event) => event.event)).toEqual([
+    // Concurrent collectors may settle in any order, but all ten lane events
+    // must belong to this session's retrieval phase. Every other event keeps
+    // the strict ordering contract below.
+    const laneEvents = turnEvents.filter((event) => event.event === "retrieval.lane_settled");
+    const retrievalStartedIndex = turnEvents.findIndex(
+      (event) => event.event === "retrieval.started",
+    );
+    const retrievalCompletedIndex = turnEvents.findIndex(
+      (event) => event.event === "retrieval.completed",
+    );
+    expect(laneEvents).toHaveLength(10);
+    expect(retrievalStartedIndex).toBeGreaterThanOrEqual(0);
+    expect(retrievalCompletedIndex).toBeGreaterThan(retrievalStartedIndex);
+    for (const event of laneEvents) {
+      expect(event.session_id).toBe(sessionId);
+      expect(turnEvents.indexOf(event)).toBeGreaterThan(retrievalStartedIndex);
+      expect(turnEvents.indexOf(event)).toBeLessThan(retrievalCompletedIndex);
+    }
+    expect(
+      turnEvents
+        .filter((event) => event.event !== "retrieval.lane_settled")
+        .map((event) => event.event),
+    ).toEqual([
       "turn_phase.started",
       "turn_phase.completed",
       "turn_phase.started",
@@ -626,6 +718,7 @@ describe("TurnTracer", () => {
       "turn_phase.completed",
       "turn_phase.started",
       "retrieval.started",
+      "retrieval.raw_query",
       "llm_call.started",
       "llm_call.completed",
       "retrieval.degraded",
@@ -638,6 +731,7 @@ describe("TurnTracer", () => {
       "evidence_ledger.reverse_scan",
       "turn_phase.started",
       "turn_phase.completed",
+      "evidence_ledger.compaction.completed",
       "evidence_ledger.completed",
       "evidence_ledger.built",
       "turn_phase.completed",
@@ -666,6 +760,8 @@ describe("TurnTracer", () => {
       "turn_phase.started",
       "turn_phase.completed",
       "turn_phase.started",
+      "llm_call.started",
+      "llm_call.completed",
       "reflection.completed",
       "turn_phase.completed",
       "action_archive_scan.completed",

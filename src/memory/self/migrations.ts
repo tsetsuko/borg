@@ -1,5 +1,6 @@
 import type { Migration } from "../../storage/sqlite/index.js";
 import { tableHasColumn } from "../../storage/sqlite/migrations-utils.js";
+import { StorageError } from "../../util/errors.js";
 
 export const selfMigrations = [
   {
@@ -442,6 +443,61 @@ export const selfMigrations = [
     name: "goal_deadline_assignment_basis",
     up: (db) => {
       db.exec("ALTER TABLE goals ADD COLUMN target_assigned_at INTEGER NULL");
+    },
+  },
+  {
+    id: 12,
+    name: "open_question_refusal_backoff",
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE open_questions ADD COLUMN consecutive_refusals INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE open_questions ADD COLUMN last_rumination_attempt_outcome TEXT;
+        ALTER TABLE open_questions ADD COLUMN last_rumination_attempt_at INTEGER;
+        ALTER TABLE open_questions ADD COLUMN refusal_backoff_until INTEGER;
+        CREATE TABLE open_question_rumination_attempts (
+          open_question_id TEXT NOT NULL,
+          source_run_id TEXT NOT NULL,
+          attempted_at INTEGER NOT NULL,
+          outcome TEXT NOT NULL CHECK (outcome IN ('completed', 'refused')),
+          PRIMARY KEY (open_question_id, source_run_id),
+          FOREIGN KEY (open_question_id) REFERENCES open_questions(id) ON DELETE CASCADE
+        );
+      `);
+    },
+  },
+  {
+    id: 13,
+    name: "goal_superseded_status",
+    disableForeignKeys: true,
+    up: (db) => {
+      // Transform only machine-authored DDL; retain every existing column,
+      // row, reference, index and trigger, including deployment-added indexes.
+      const row = db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'goals'")
+        .get() as { sql: string };
+      const sql = row.sql
+        .replace(/^CREATE TABLE\s+(?:"goals"|goals)\s*\(/i, "CREATE TABLE goals_next (")
+        .replace(
+          "'active', 'done', 'abandoned', 'blocked'",
+          "'active', 'done', 'abandoned', 'blocked', 'superseded'",
+        );
+      if (
+        sql === row.sql ||
+        !sql.includes("CREATE TABLE goals_next (") ||
+        !sql.includes("'superseded'")
+      ) {
+        throw new StorageError("Unexpected goals schema during superseded-status migration");
+      }
+      const objects = db
+        .prepare(
+          "SELECT sql FROM sqlite_master WHERE tbl_name = 'goals' AND type IN ('index', 'trigger') AND sql IS NOT NULL ORDER BY type, name",
+        )
+        .all() as Array<{ sql: string }>;
+      db.exec(sql);
+      db.exec(
+        "INSERT INTO goals_next SELECT * FROM goals; DROP TABLE goals; ALTER TABLE goals_next RENAME TO goals;",
+      );
+      for (const object of objects) db.exec(object.sql);
     },
   },
 ] as const satisfies readonly Migration[];

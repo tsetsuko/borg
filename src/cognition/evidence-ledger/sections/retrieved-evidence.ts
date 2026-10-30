@@ -1,5 +1,7 @@
+import { frameAnomalyAnnotationFields } from "../../../stream/frame-anomaly.js";
 import type { BuilderSectionContext } from "../builder-context.js";
 import {
+  actorForStreamEntry,
   appendMemoryDisclosureState,
   appendMemoryDisclosureStateMetadata,
   rawStreamActor,
@@ -18,6 +20,7 @@ import { unknownMemoryDisclosureLabel } from "../../../retrieval/index.js";
 import {
   persistenceClassFromProvenance,
   persistenceClassFromStreamIds,
+  scopeFromCarriedSessionId,
   scopeFromStreamIds,
   streamIndexFromSingleCurrentSessionStreamId,
 } from "../scope-resolver.js";
@@ -37,18 +40,28 @@ export function addRetrievedRawStreamEvidenceSection(context: BuilderSectionCont
 
     const itemStreamIds = item.provenance?.streamIds ?? [];
 
-    // If every stream ID this retrieval item points to is already in the
-    // current_session_transcript section, skip emitting the duplicate
-    // retrieved_raw_stream_evidence row. The transcript renders the same
-    // underlying content with higher trust rank.
-    if (
-      itemStreamIds.length > 0 &&
-      itemStreamIds.every((id) => context.transcript.rawStreamIds.has(id))
-    ) {
-      continue;
-    }
+    // Keep the recalled copy until compaction knows which transcript rows survived.
 
-    const scope = scopeFromStreamIds(itemStreamIds, context.resolver);
+    // Both of the next two resolve out of the builder's entry map, and a recalled entry
+    // is frequently not in it. Neither miss is visible on the row: the miss answers
+    // "global" and "memory", which are also answers a hit produces. Fall back to the
+    // facts the pipeline copied off the entry itself -- `kind` decides the actor on its
+    // own, and the carried session gets the same comparison the resolver would apply.
+    // `source_type` follows scope, so it is corrected by the same step. What this does
+    // not recover is `persistence_class` below, whose absence still reads as "not an
+    // assistant self-report" on an entry the map never held.
+    const resolvedFromEntries = itemStreamIds.every((id) =>
+      context.resolver.streamEntriesById.has(id),
+    );
+    const resolvedScope = scopeFromStreamIds(itemStreamIds, context.resolver);
+    const scope = resolvedFromEntries
+      ? resolvedScope
+      : (scopeFromCarriedSessionId(item.streamEntrySessionId, context.resolver.currentSessionId) ??
+        resolvedScope);
+    const actor =
+      resolvedFromEntries || item.streamEntryKind === undefined
+        ? rawStreamActor(itemStreamIds, context.resolver)
+        : actorForStreamEntry({ kind: item.streamEntryKind });
     const streamIndex = streamIndexFromSingleCurrentSessionStreamId(
       itemStreamIds,
       context.resolver,
@@ -65,9 +78,10 @@ export function addRetrievedRawStreamEvidenceSection(context: BuilderSectionCont
         id: `retrieved_stream:${item.id}`,
         source_type: rawStreamSourceType(scope),
         session_scope: scope,
-        actor: rawStreamActor(itemStreamIds, context.resolver),
+        actor,
         trust_rank: RAW_STREAM_TRUST_RANK,
         text: item.text,
+        ...frameAnomalyAnnotationFields(item.frame_anomalies),
         value: item.source,
         ...(streamIndex === undefined ? {} : { stream_index: streamIndex }),
         state: appendMemoryDisclosureState({
@@ -90,11 +104,21 @@ export function addRetrievedStructuredEvidenceSection(context: BuilderSectionCon
     }
 
     const scope = evidenceItemScope(item, context.resolver);
+    const itemStreamIds = item.provenance?.streamIds ?? [];
+    // A row carrying a stream entry's kind is that entry's own text (on this lane, a warm
+    // recall of one entry): its author decides the actor exactly as on the raw-stream lane.
+    // Its scope stays the resolver's, since a corrected prior_session would move the row.
+    const actor =
+      item.streamEntryKind === undefined
+        ? ("memory" as const)
+        : itemStreamIds.every((id) => context.resolver.streamEntriesById.has(id))
+          ? rawStreamActor(itemStreamIds, context.resolver)
+          : actorForStreamEntry({ kind: item.streamEntryKind });
     const entry = cappedTrustRank({
       id: `retrieved_evidence:${item.id}`,
       source_type: evidenceItemSourceType(item, scope),
       session_scope: scope,
-      actor: "memory" as const,
+      actor,
       trust_rank:
         item.source === "warm_recall"
           ? WARM_RECALL_TRUST_RANK
@@ -102,6 +126,7 @@ export function addRetrievedStructuredEvidenceSection(context: BuilderSectionCon
             ? IMAGE_PERCEPTION_TRUST_RANK
             : RAW_STREAM_TRUST_RANK,
       text: item.text,
+      ...frameAnomalyAnnotationFields(item.frame_anomalies),
       value: item.source,
       state: evidenceItemState(item),
       state_metadata: evidenceItemProvenanceMetadata(item),

@@ -1,5 +1,6 @@
 import { goalSchedulingTimes } from "../../memory/self/goal-blocks.js";
 import { computeExecutiveContextFits, selectExecutiveFocus } from "../../executive/index.js";
+import { GoalPresentationStore } from "../../executive/goal-presentation.js";
 import type { EmbeddingClient } from "../../embeddings/index.js";
 import { flattenGoalTree, type GoalRecord, type GoalsRepository } from "../../memory/self/index.js";
 import {
@@ -84,13 +85,15 @@ export function createGoalFollowupDueTrigger(
 ): AutonomyTrigger<GoalFollowupDuePayload> {
   const clock = options.clock ?? new SystemClock();
   const sessionId = options.sessionId ?? DEFAULT_SESSION_ID;
+  const presentations =
+    options.goalsRepository.presentation ?? new GoalPresentationStore(options.watermarkRepository);
 
   function staleBackoff(
     goal: GoalRecord,
     actionAvailabilityKey: string | null,
   ): GoalStaleBackoffState {
-    if (!options.respectStaleBackoff) {
-      return { endMs: null, actionAvailabilityChanged: false };
+    if (!options.respectStaleBackoff || presentations.hasNewInput(goal)) {
+      return { endMs: null, actionAvailabilityChanged: false, dormant: false };
     }
 
     return goalStaleBackoffState({
@@ -121,6 +124,9 @@ export function createGoalFollowupDueTrigger(
       goalVectors = (
         await buildSelfScoringFeatureSet({
           embeddingClient: scoring.embeddingClient,
+          maxInputBytes: scoring.embeddingClient.maxInputBytes,
+          tracer: scoring.tracer,
+          turnId: "autonomy:goal_followup_due",
           goals,
           activeValues: [],
         })
@@ -192,6 +198,16 @@ export function createGoalFollowupDueTrigger(
     name: TRIGGER_NAME,
     type: "trigger",
     sourceCategory: "operational",
+    dormantGoalIds() {
+      const nowMs = clock.now();
+      const actionKey = options.goalStaleBackoffActionAvailabilityKey?.() ?? null;
+      return flattenGoalTree(options.goalsRepository.list({ status: "active" }))
+        .filter((goal) => {
+          const state = staleBackoff(goal, actionKey);
+          return state.dormant && state.endMs !== null && state.endMs > nowMs;
+        })
+        .map((goal) => goal.id);
+    },
     async scan() {
       const nowMs = clock.now();
       const actionAvailabilityKey = options.goalStaleBackoffActionAvailabilityKey?.() ?? null;
@@ -201,6 +217,8 @@ export function createGoalFollowupDueTrigger(
         rawGoals;
       const dueEvents = goals
         .map<DueEvent<GoalFollowupDuePayload> | null>((goal) => {
+          if (presentations.wasPresented(goal)) return null;
+          const hasNewInput = presentations.hasNewInput(goal);
           const { progressAnchor: baseProgressTs, targetAt } = goalSchedulingTimes(goal);
           const deadlineDue = targetAt !== null && targetAt - nowMs < options.lookaheadMs;
           const staleDue = baseProgressTs + options.staleMs < nowMs;
@@ -216,11 +234,11 @@ export function createGoalFollowupDueTrigger(
           const watermarkProcessName = phaseLatchProcessName(goal, phase);
           const backoff = staleBackoff(goal, actionAvailabilityKey);
 
-          // A phase latch identifies the goal/progress threshold, so its key
-          // cannot express the newly executable topology. Let only the durable
-          // dormant-key mismatch pierce it; scheduler bookkeeping re-stamps the
-          // key after an empty wake and closes this exception again.
+          // Old phase latches remain useful for pre-presentation history, but
+          // neither they nor topology/backoff may override the shared input
+          // generation. New goal input reopens either scheduling lane.
           if (
+            !hasNewInput &&
             !backoff.actionAvailabilityChanged &&
             (options.watermarkRepository.get(legacyProcessName, sessionId) !== null ||
               options.watermarkRepository.get(watermarkProcessName, sessionId) !== null)
@@ -294,12 +312,15 @@ export function createGoalFollowupDueTrigger(
 
       for (const candidate of candidates) {
         const goal = candidate.goal;
+        if (presentations.wasPresented(goal)) continue;
+        const hasNewInput = presentations.hasNewInput(goal);
         const { progressAnchor: baseProgressTs, targetAt } = goalSchedulingTimes(goal);
         const deadlineDue = targetAt !== null && targetAt - nowMs < options.lookaheadMs;
         const legacyProcessName = legacyLatchProcessName(goal);
         const backoff = staleBackoff(goal, actionAvailabilityKey);
 
         if (
+          !hasNewInput &&
           !backoff.actionAvailabilityChanged &&
           options.watermarkRepository.get(legacyProcessName, sessionId) !== null
         ) {
@@ -310,6 +331,7 @@ export function createGoalFollowupDueTrigger(
 
         if (deadlineDue) {
           if (
+            hasNewInput ||
             backoff.actionAvailabilityChanged ||
             options.watermarkRepository.get(deadlineProcessName, sessionId) === null
           ) {
@@ -325,7 +347,8 @@ export function createGoalFollowupDueTrigger(
             ? Number.POSITIVE_INFINITY
             : dueAfterStrictThreshold(targetAt - options.lookaheadMs);
         const staleCandidateAt =
-          (!backoff.actionAvailabilityChanged &&
+          (!hasNewInput &&
+            !backoff.actionAvailabilityChanged &&
             options.watermarkRepository.get(phaseLatchProcessName(goal, "stale"), sessionId) !==
               null) ||
           backoff.endMs === Number.POSITIVE_INFINITY
@@ -334,6 +357,7 @@ export function createGoalFollowupDueTrigger(
         // Deadline piercing begins at the structural lookahead boundary, even
         // when that boundary lies in the future at describe-time.
         const deadlineCandidateAt =
+          hasNewInput ||
           backoff.actionAvailabilityChanged ||
           options.watermarkRepository.get(deadlineProcessName, sessionId) === null
             ? Math.max(deadlineDueAt, nowMs)

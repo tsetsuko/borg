@@ -58,4 +58,16 @@ export const predictionMigrations = [
       `);
     },
   },
+  {
+    id: 3,
+    name: "autonomy_wakes_prediction_error_spike",
+    up: () => {
+      // Moved here from the autonomy group, where it first widened the wake-name
+      // CHECKs for M2. That widening now lives in autonomy_wakes_interrupted_outcome,
+      // so this does nothing. It stays because banks that applied it record the name
+      // in _migrations and the runner refuses an applied name it cannot find; the
+      // runner re-ids such a row here by name. Keeping it out of the autonomy group
+      // leaves that group's ids exactly as upstream ships them.
+    },
+  },
 ] as const satisfies readonly Migration[];

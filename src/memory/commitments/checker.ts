@@ -2,13 +2,20 @@ import { z } from "zod";
 
 import {
   callStructuredTool,
+  isLlmProviderTransportError,
   isStructuredToolCallError,
   toToolInputSchema,
   type LLMClient,
   type LLMToolDefinition,
 } from "../../llm/index.js";
 import { summarizeProvenanceForPrompt } from "../common/provenance.js";
-import { parseCommitmentId, type CommitmentId, type EntityId } from "../../util/ids.js";
+import type { TurnTracer } from "../../tracing/tracer.js";
+import {
+  parseCommitmentId,
+  type CommitmentId,
+  type EntityId,
+  type SessionId,
+} from "../../util/ids.js";
 import { escapeReservedBorgTags } from "../../util/prompt-tags.js";
 import { EntityRepository } from "./repository.js";
 import {
@@ -44,6 +51,9 @@ export type CommitmentCheckerOptions = {
   detectionModel: string;
   rewriteModel: string;
   entityRepository: EntityRepository;
+  tracer?: TurnTracer;
+  turnId?: string;
+  sessionId?: SessionId;
 };
 
 // Schema for the violation-detection tool. The judge returns a list of
@@ -181,9 +191,8 @@ export class CommitmentChecker {
       commitmentLines.push(describeCommitmentForJudge(commitment, this.options.entityRepository));
     }
 
-    let judged: z.infer<typeof judgeSchema>;
-    try {
-      judged = (
+    const judge = async () =>
+      (
         await callStructuredTool({
           llmClient: this.options.llmClient,
           request: {
@@ -218,6 +227,12 @@ export class CommitmentChecker {
             max_tokens: 1_000,
             budget: "commitment-judge",
           },
+          trace: {
+            tracer: this.options.tracer,
+            turnId: this.options.turnId,
+            sessionId: this.options.sessionId,
+            label: "commitment_judge",
+          },
           toolName: VIOLATION_JUDGE_TOOL_NAME,
           parse: (input) => {
             const parsed = judgeSchema.safeParse(input);
@@ -230,6 +245,18 @@ export class CommitmentChecker {
           },
         })
       ).parsed;
+
+    let judged: z.infer<typeof judgeSchema>;
+    try {
+      judged = await judge().catch((error: unknown) => {
+        // A provider failure means no judge read the response, so failing closed on the first
+        // one reports a violation nobody found. Ask once more before treating it as one.
+        if (isStructuredToolCallError(error, "llm_failed") && isLlmProviderTransportError(error)) {
+          return judge();
+        }
+
+        throw error;
+      });
     } catch (error) {
       if (isStructuredToolCallError(error, "missing_tool_call")) {
         return [

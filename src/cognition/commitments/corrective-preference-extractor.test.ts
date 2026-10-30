@@ -38,7 +38,6 @@ function correctivePreferenceResponse(input: {
   directive_family?: string | null;
   closure_pressure_relevance?: "no_closure" | "neutral" | "closure_seeking" | null;
   priority?: number | null;
-  reason?: string;
   confidence?: number;
   retiresCommitmentId?: ReturnType<typeof createCommitmentId> | null;
   relationship_claims?: RelationshipClaim[];
@@ -76,7 +75,6 @@ function correctivePreferenceResponse(input: {
             input.closure_pressure_relevance ??
             (input.classification === "corrective_preference" ? "neutral" : null),
           priority: input.priority ?? null,
-          reason: input.reason ?? "Classification reason.",
           confidence: input.confidence ?? 0.9,
           supersedes_commitment_id: null,
           retires_commitment_id: input.retiresCommitmentId ?? null,
@@ -112,7 +110,6 @@ describe("CorrectivePreferenceExtractor", () => {
           directive_family: "no_terminal_valediction",
           closure_pressure_relevance: "no_closure",
           priority: 8,
-          reason: "The user corrected recurring future response behavior.",
           confidence: 0.9,
         }),
       ],
@@ -138,9 +135,12 @@ describe("CorrectivePreferenceExtractor", () => {
       directive_family: "no_terminal_valediction",
       closure_pressure_relevance: "no_closure",
       priority: 8,
-      reason: "The user corrected recurring future response behavior.",
       confidence: 0.9,
     });
+    expect(result).not.toHaveProperty("reason");
+    const schema = llm.requests[0]?.tools?.[0]?.inputSchema;
+    expect(schema?.properties).not.toHaveProperty("reason");
+    expect(schema?.required).not.toContain("reason");
     expect(llm.requests[0]?.model).toBe("haiku");
     expect(llm.requests[0]?.max_tokens).toBe(EXTRACTOR_MAX_TOKENS_DEFAULT);
     expect(llm.requests[0]?.tool_choice).toEqual({
@@ -179,7 +179,6 @@ describe("CorrectivePreferenceExtractor", () => {
       responses: [
         correctivePreferenceResponse({
           classification: "none",
-          reason: "The source asked Borg to choose rather than stating a directive.",
         }),
       ],
     });
@@ -282,7 +281,6 @@ describe("CorrectivePreferenceExtractor", () => {
       responses: [
         correctivePreferenceResponse({
           classification: "retire_commitment",
-          reason: "The model judged the supplied active commitment resolved.",
           confidence: 0.91,
           retiresCommitmentId: commitmentId,
         }),
@@ -323,7 +321,6 @@ describe("CorrectivePreferenceExtractor", () => {
       preference: null,
       retirement: {
         commitmentId,
-        reason: "The model judged the supplied active commitment resolved.",
         confidence: 0.91,
       },
       slot_negations: [],
@@ -400,7 +397,6 @@ describe("CorrectivePreferenceExtractor", () => {
           directive_family: "care_planning_parent_constraint",
           closure_pressure_relevance: "neutral",
           priority: 8,
-          reason: "The user supplied durable relationship-grounded process guidance.",
           confidence: 0.9,
           relationship_claims: [
             relationshipClaim({
@@ -448,7 +444,6 @@ describe("CorrectivePreferenceExtractor", () => {
           directive_family: "deployment_incident_channel_scope",
           closure_pressure_relevance: "neutral",
           priority: 10,
-          reason: "The user set a durable audience-scoped disclosure boundary.",
           confidence: 0.92,
         }),
       ],
@@ -488,7 +483,6 @@ describe("CorrectivePreferenceExtractor", () => {
           directive_family: "surface_durable_decisions",
           closure_pressure_relevance: "neutral",
           priority: 8,
-          reason: "The user gave durable process presentation guidance.",
           confidence: 0.91,
         }),
       ],
@@ -535,7 +529,6 @@ describe("CorrectivePreferenceExtractor", () => {
           directive_family: "hold_working_decisions",
           closure_pressure_relevance: "neutral",
           priority: 8,
-          reason: "The user gave durable state-management guidance.",
           confidence: 0.9,
         }),
       ],
@@ -588,7 +581,6 @@ describe("CorrectivePreferenceExtractor", () => {
           directive_family: "no_terminal_valediction",
           closure_pressure_relevance: "no_closure",
           priority: 8,
-          reason: "The user corrected recurring future response behavior.",
           confidence: 0.9,
         }),
       ],
@@ -651,7 +643,6 @@ describe("CorrectivePreferenceExtractor", () => {
       responses: [
         correctivePreferenceResponse({
           classification: "none",
-          reason: "The user is sharing a state, not correcting future behavior.",
           confidence: 0.95,
         }),
       ],
@@ -684,8 +675,6 @@ describe("CorrectivePreferenceExtractor", () => {
       responses: [
         correctivePreferenceResponse({
           classification: "none",
-          reason:
-            "The operator describes a transport decision and permits sharing with Kira; no participant states a restriction.",
           confidence: 0.95,
         }),
       ],
@@ -725,9 +714,7 @@ describe("CorrectivePreferenceExtractor", () => {
     expect(request?.system).toContain(
       "emit a boundary only when a participant explicitly states a restriction about their own content or the addressee",
     );
-    expect(request?.system).toContain(
-      "quote the exact source span supporting that restriction in reason",
-    );
+    expect(request?.system).not.toContain("exact source span");
     expect(request?.system).toContain(
       "Never infer a restriction from a third party being mentioned or from an operator describing a decision about transport or tooling.",
     );
@@ -744,7 +731,6 @@ describe("CorrectivePreferenceExtractor", () => {
       responses: [
         correctivePreferenceResponse({
           classification: "none",
-          reason: "The user rejected a stored relational value, not future style.",
           confidence: 0.95,
           slot_negations: [
             {
@@ -824,7 +810,6 @@ describe("CorrectivePreferenceExtractor", () => {
           directive_family: "mark_revisions",
           closure_pressure_relevance: "neutral",
           priority: 5,
-          reason: "Sol corrects his own earlier claim.",
           confidence: 0.95,
         }),
       ],
@@ -860,7 +845,6 @@ describe("CorrectivePreferenceExtractor", () => {
           directive_family: "adjust_future_response_behavior",
           closure_pressure_relevance: "neutral",
           priority: 5,
-          reason: "The signal is ambiguous.",
           confidence: 0.5,
         }),
       ],
@@ -886,7 +870,6 @@ describe("CorrectivePreferenceExtractor", () => {
       responses: [
         correctivePreferenceResponse({
           classification: "retire_commitment",
-          reason: "The model was uncertain about retiring the commitment.",
           confidence: 0.5,
           retiresCommitmentId: commitmentId,
         }),

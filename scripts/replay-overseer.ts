@@ -1,3 +1,5 @@
+import { readEmbeddingProviderEnv } from "../src/config/embedding-provider.js";
+import { readEmbeddingMaxInputBytesEnv } from "../src/config/embedding-input.js";
 // Replay the overseer against a COPY of a tenant bank and capture what the model
 // actually emits per target: finish reason, output tokens, raw tool-argument
 // length, parse success, flag count, and a head/tail sample. Dry run only.
@@ -168,6 +170,8 @@ const embeddingClient = createCachingEmbeddingClient(
       client: openai,
       model: embeddingModel,
       dims: embeddingDims,
+      provider: readEmbeddingProviderEnv(process.env),
+      maxInputBytes: readEmbeddingMaxInputBytesEnv(process.env),
     }),
     { timeoutMs: 1_000, batchTimeoutMs: 20_000, maxRetries: 1 },
   ),

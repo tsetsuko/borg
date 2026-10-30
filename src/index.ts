@@ -15,6 +15,7 @@ export type {
 // behind internal paths.
 
 export const VERSION = "0.1.0";
+export type { LanceDbMemoryStats, LanceDbTableStats } from "./storage/lancedb/diagnostics.js";
 
 export {
   Borg,
@@ -158,6 +159,7 @@ export {
   FakeEmbeddingClient,
   OpenAICompatibleEmbeddingClient,
   type EmbeddingClient,
+  type EmbeddingClientStats,
   type OpenAICompatibleEmbeddingClientOptions,
 } from "./embeddings/index.js";
 export {
@@ -166,6 +168,7 @@ export {
   type OpenAICompatibleLLMClientOptions,
   type OpenAIChatCompletionsClient,
   LLMStructuredOutputParseError,
+  LLMRefusalError,
   toStructuredOutputFormat,
   type AnthropicAuthMode,
   type AnthropicLLMClientOptions,
@@ -584,6 +587,7 @@ export {
 } from "./stream/index.js";
 
 export { FixedClock, ManualClock, SystemClock, type Clock } from "./util/clock.js";
+export { settleBeforeDeadline, type DeadlineSettlement } from "./util/deadline.js";
 export {
   AuthError,
   AttachmentError,

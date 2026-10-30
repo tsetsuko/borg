@@ -101,6 +101,7 @@ import { RetrievalPipeline } from "../retrieval/index.js";
 import { sessionMigrations } from "../sessions/index.js";
 import {
   StreamEntryIndexRepository,
+  StreamWatermarkRepository,
   StreamWriter,
   streamEntryIndexMigrations,
   streamWatermarkMigrations,
@@ -450,6 +451,16 @@ export function createTestConfig(
     maintenance: {
       ...DEFAULT_CONFIG.maintenance,
       ...overrides.maintenance,
+      processOverrides: {
+        light: {
+          ...DEFAULT_CONFIG.maintenance.processOverrides.light,
+          ...overrides.maintenance?.processOverrides?.light,
+        },
+        heavy: {
+          ...DEFAULT_CONFIG.maintenance.processOverrides.heavy,
+          ...overrides.maintenance?.processOverrides?.heavy,
+        },
+      },
     },
     autonomy: {
       ...DEFAULT_CONFIG.autonomy,
@@ -733,6 +744,7 @@ export async function createOfflineTestHarness(
     clock,
     identityEventRepository,
     executiveStepsRepository,
+    watermarkRepository: new StreamWatermarkRepository({ db, clock }),
   });
   const traitsRepository = new TraitsRepository({
     db,
@@ -868,6 +880,7 @@ export async function createOfflineTestHarness(
     embeddingClient,
     llmClient,
     recallExpansionModel: config.anthropic.models.recallExpansion,
+    rawQueryMaxBytes: config.retrieval.rawQueryMaxBytes,
     recallExpansionSemanticVariantCount: config.retrieval.recallExpansionSemanticVariantCount,
     episodicRepository,
     semanticNodeRepository,

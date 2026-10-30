@@ -1,4 +1,5 @@
 import { similarityThresholds } from "../config/similarity.js";
+import type { FailureReportTracker } from "../util/failure-reports.js";
 import { refreshSerializedEmbeddings } from "../embeddings/serialized.js";
 import { parseSemanticNodeId } from "../util/ids.js";
 // Builds Borg's repository graph and the cross-repository services that sit on top of it.
@@ -75,7 +76,12 @@ import { RecallStateRepository, RetrievalPipeline } from "../retrieval/index.js"
 import { SessionsRepository } from "../sessions/index.js";
 import type { LanceDbTable } from "../storage/lancedb/index.js";
 import type { SqliteDatabase } from "../storage/sqlite/index.js";
-import { StreamEntryIndexRepository, StreamWriter, type StreamEntry } from "../stream/index.js";
+import {
+  StreamEntryIndexRepository,
+  StreamWriter,
+  StreamWatermarkRepository,
+  type StreamEntry,
+} from "../stream/index.js";
 import type { Clock } from "../util/clock.js";
 import { DEFAULT_SESSION_ID } from "../util/ids.js";
 import { PromptOverrideRepository } from "../cognition/prompts/override-repository.js";
@@ -142,6 +148,7 @@ export type BorgRepositorySetup = Pick<
 };
 
 export type BuildBorgRepositoriesOptions = {
+  failureReports?: FailureReportTracker;
   pendingStartupTasks?: Promise<unknown>[];
   config: Config;
   sqlite: SqliteDatabase;
@@ -178,11 +185,20 @@ export async function buildBorgRepositories(
     db: sqlite,
     clock,
   });
-  const sessionsRepository = new SessionsRepository({
+  const entityRepository = new EntityRepository({
     db: sqlite,
     clock,
   });
+  if (entityRepository.getSelf() === null) {
+    entityRepository.add({ canonicalName: "self", kind: "self", provenance: "assistant_seeded" });
+  }
+  const sessionsRepository = new SessionsRepository({
+    db: sqlite,
+    clock,
+    entityRepository,
+  });
   const episodicRepository = new EpisodicRepository({
+    entityRepository,
     table: options.episodesTable,
     db: sqlite,
     clock,
@@ -196,6 +212,7 @@ export async function buildBorgRepositories(
   const entryIndex =
     options.entryIndex ??
     new StreamEntryIndexRepository({
+      entityRepository,
       db: sqlite,
       dataDir: config.dataDir,
     });
@@ -214,6 +231,7 @@ export async function buildBorgRepositories(
 
   const createStreamWriter = (sessionId: Parameters<BorgStreamWriterFactory>[0]) =>
     new StreamWriter({
+      failureReports: options.failureReports,
       dataDir: config.dataDir,
       sessionId,
       clock,
@@ -226,6 +244,7 @@ export async function buildBorgRepositories(
     });
   const createNonNotifyingStreamWriter = (sessionId: Parameters<BorgStreamWriterFactory>[0]) =>
     new StreamWriter({
+      failureReports: options.failureReports,
       dataDir: config.dataDir,
       sessionId,
       clock,
@@ -289,7 +308,7 @@ export async function buildBorgRepositories(
     contradictionJudgeModel: config.anthropic.models.background,
     onDuplicateReviewError: (error) => {
       const writer = createDefaultStreamWriter();
-      void appendInternalFailureEvent(writer, "semantic_duplicate_review", error).finally(() => {
+      return appendInternalFailureEvent(writer, "semantic_duplicate_review", error).finally(() => {
         writer.close();
       });
     },
@@ -317,6 +336,7 @@ export async function buildBorgRepositories(
     identityEventRepository,
   });
   const goalsRepository = new GoalsRepository({
+    watermarkRepository: new StreamWatermarkRepository({ db: sqlite, clock }),
     db: sqlite,
     dataDir: config.dataDir,
     clock,
@@ -338,11 +358,8 @@ export async function buildBorgRepositories(
     db: sqlite,
     clock,
   });
-  const entityRepository = new EntityRepository({
-    db: sqlite,
-    clock,
-  });
   const socialRepository = new SocialRepository({
+    entityRepository,
     db: sqlite,
     clock,
   });
@@ -366,6 +383,7 @@ export async function buildBorgRepositories(
     clock,
   });
   const activityRepository = new ActivityRepository({
+    entityRepository,
     db: sqlite,
     clock,
   });
@@ -509,11 +527,13 @@ export async function buildBorgRepositories(
       }),
     onEnqueueError: (error) => {
       const writer = createDefaultStreamWriter();
-      void appendOpenQuestionHookFailureEvent(writer, "review_queue_open_question", error).finally(
-        () => {
-          writer.close();
-        },
-      );
+      return appendOpenQuestionHookFailureEvent(
+        writer,
+        "review_queue_open_question",
+        error,
+      ).finally(() => {
+        writer.close();
+      });
     },
   });
   reviewQueueRepository = createdReviewQueueRepository;
@@ -566,6 +586,7 @@ export async function buildBorgRepositories(
     embeddingClient,
     llmClient: options.llmClient,
     recallExpansionModel: config.anthropic.models.recallExpansion,
+    rawQueryMaxBytes: config.retrieval.rawQueryMaxBytes,
     recallExpansionTimeoutMs: config.retrieval.recallExpansionTimeoutMs,
     recallPlannerTimeZone: config.retrieval.recallPlannerTimeZone,
     plannerCueTimeWeight: config.retrieval.attentionWeights.time,
@@ -614,6 +635,11 @@ export async function buildBorgRepositories(
   });
   applyCorrectionReview = (item) => correctionService.applyCorrectionReview(item);
   const workingMemoryStore = new WorkingMemoryStore({
+    entityRepository,
+    actionRepository,
+    tracer: options.tracer,
+    audienceForSession: (sessionId) =>
+      sessionsRepository.getMany([sessionId])[0]?.audience_entity_id ?? null,
     similarityConfig: config,
     dataDir: config.dataDir,
     clock,

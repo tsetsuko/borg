@@ -1,3 +1,4 @@
+import { frameAnomalyAnnotationFields } from "../stream/frame-anomaly.js";
 import { similarityThresholds, type SimilarityConfigSource } from "../config/similarity.js";
 import type { AttentionWeights, TemporalCue } from "../contracts/cognitive-contracts.js";
 import {
@@ -20,7 +21,7 @@ import {
   isEpisodeVisibleToCapability,
   resolveViewerCapability,
 } from "../memory/episodic/access.js";
-import { parseEpisodeParticipantEntityIdTerm } from "../memory/episodic/participant-terms.js";
+import { episodeParticipantEntityId } from "../memory/episodic/participant-terms.js";
 import type { EpisodicRepository } from "../memory/episodic/repository.js";
 import type {
   Episode,
@@ -70,6 +71,7 @@ import {
 import { DEFAULT_MMR_LAMBDA } from "./mmr.js";
 import { retrieveOpenQuestionsForQuery as retrieveOpenQuestionsForQueryFromRepository } from "./open-questions.js";
 import { RawStreamAdapter } from "./raw-stream-adapter.js";
+import { boundRawRecallQuery, DEFAULT_RAW_QUERY_MAX_BYTES } from "./raw-query.js";
 import {
   DEFAULT_RECALL_STATE_MAX_ACTIVE_HANDLES,
   DEFAULT_RECALL_STATE_MAX_NEW_HANDLES_PER_TURN,
@@ -159,6 +161,7 @@ export type RetrievalPipelineOptions = {
   llmClient?: LLMClient;
   recallExpansionModel?: string;
   recallExpansionSemanticVariantCount?: number;
+  rawQueryMaxBytes?: number;
   // Hard cap for the recall-expansion LLM call; on timeout recall proceeds
   // without expansion via the existing degraded path. Unset or 0 disables it.
   recallExpansionTimeoutMs?: number;
@@ -181,7 +184,8 @@ export type RetrievalPipelineOptions = {
   >;
   openQuestionsRepository?: OpenQuestionsRepository;
   imagePerceptionRepository?: ImagePerceptionRepository;
-  entityRepository?: Pick<EntityRepository, "findByName">;
+  entityRepository?: Pick<EntityRepository, "findByName"> &
+    Partial<Pick<EntityRepository, "get" | "resolveReferences">>;
   commitmentRepository?: Pick<CommitmentRepository, "get" | "list">;
   recallStateRepository?: Pick<RecallStateRepository, "load" | "save">;
   clock?: Clock;
@@ -221,6 +225,8 @@ export type RecallPlanOutcome = {
 };
 
 export type RetrievalSharedOptions = EpisodeCognitionRecallOptions & {
+  // Whole current-input messages in durable oldest-first order; only for this query.
+  rawQueryMessages?: readonly string[];
   onDegraded?: (degradation: RetrievalDegradation) => void;
   onRecallPlan?: (plan: RecallPlanOutcome) => void;
   rankingAudienceEntityId?: EntityId | null;
@@ -469,6 +475,7 @@ export class RetrievalPipeline {
       queryVector?: Float32Array;
       traceTurnId?: string;
       sessionId?: SessionId;
+      onDegraded?: (reason: string, error?: unknown) => void | Promise<void>;
     } = {},
   ): Promise<OpenQuestion[]> {
     return retrieveOpenQuestionsForQueryFromRepository(
@@ -478,17 +485,37 @@ export class RetrievalPipeline {
       {
         ...options,
         similarityConfig: this.options.similarityConfig,
-        onDegraded:
-          this.tracer.enabled && options.traceTurnId !== undefined
-            ? (reason, error) => {
-                this.tracer.emit("retrieval.degraded", {
-                  turnId: options.traceTurnId!,
-                  session_id: options.sessionId,
-                  subsystem: "open_questions",
-                  reason: error instanceof Error ? `${reason}: ${error.message}` : reason,
-                });
-              }
-            : undefined,
+        onDegraded: (reason, error) => {
+          const reportObserverError = (observerError: unknown): void => {
+            try {
+              console.error("Retrieval open-question observer failed", {
+                error_name: observerError instanceof Error ? observerError.name : typeof observerError,
+              });
+            } catch {
+              // Degradation observers must not prevent fallback retrieval.
+            }
+          };
+          try {
+            // Lane bookkeeping happens during this call. Async observers never
+            // become part of the fallback's completion dependency.
+            const observed = options.onDegraded?.(reason, error);
+            if (observed !== undefined) void observed.catch(reportObserverError);
+          } catch (observerError) {
+            reportObserverError(observerError);
+          }
+          try {
+            if (this.tracer.enabled && options.traceTurnId !== undefined) {
+              this.tracer.emit("retrieval.degraded", {
+                turnId: options.traceTurnId,
+                session_id: options.sessionId,
+                subsystem: "open_questions",
+                reason: error instanceof Error ? `${reason}: ${error.message}` : reason,
+              });
+            }
+          } catch (observerError) {
+            reportObserverError(observerError);
+          }
+        },
       },
     );
   }
@@ -544,6 +571,7 @@ export class RetrievalPipeline {
       timeRange: { start: number; end: number };
     },
   ): Promise<{ episodes: RetrievedEpisode[]; timeRangeFallback: boolean }> {
+    const rawQuery = this.prepareRawRecallQuery(query, options);
     const expansion = await this.tryExpandRecall(query, options);
     const intentQueryVectors: IntentQueryVectorMemo = new Map();
     const scoped = await this.searchWithContextInternal(
@@ -553,6 +581,7 @@ export class RetrievalPipeline {
       "episodes-only",
       expansion,
       intentQueryVectors,
+      rawQuery,
     );
     const strictEpisodes = scoped.episodes.filter(
       (result) =>
@@ -585,6 +614,7 @@ export class RetrievalPipeline {
       "episodes-only",
       expansion,
       intentQueryVectors,
+      rawQuery,
     );
 
     return { episodes: fallback.episodes, timeRangeFallback: true };
@@ -597,7 +627,9 @@ export class RetrievalPipeline {
     projection: RetrievalProjection = "full",
     expansionOverride?: ExpansionOutcome,
     intentQueryVectorsOverride?: IntentQueryVectorMemo,
+    rawQueryOverride?: string,
   ): Promise<RetrievedContext> {
+    options = this.options.entityRepository?.resolveReferences?.(options) ?? options;
     if (this.tracer.enabled && options.traceTurnId !== undefined) {
       this.tracer.emit("retrieval.started", {
         turnId: options.traceTurnId,
@@ -644,7 +676,8 @@ export class RetrievalPipeline {
       }
     }
 
-    const intents = await this.buildRecallIntents(query, options, expansionOverride);
+    const rawQuery = rawQueryOverride ?? this.prepareRawRecallQuery(query, options);
+    const intents = await this.buildRecallIntents(query, rawQuery, options, expansionOverride);
     const timeSignalPresent =
       options.timeRange !== undefined || intents.some((intent) => intent.kind === "time");
     const plannerTimeWeightApplied =
@@ -1097,10 +1130,17 @@ export class RetrievalPipeline {
       return null;
     }
 
+    // One entry's verbatim text says whose it is and when it was written, as a fresh
+    // raw-stream hit does. A join of several entries has no single author or instant.
+    const onlyEntry = orderedEntries.length === 1 ? orderedEntries[0] : undefined;
+
     return {
       id: `warm_recall_raw_stream_${handle.streamIds.join("_")}`,
       source: "warm_recall",
       text: orderedEntries.map((entry) => streamEntryContentToText(entry)).join("\n"),
+      ...frameAnomalyAnnotationFields(
+        orderedEntries.flatMap((entry) => entry.frame_anomalies ?? []),
+      ),
       provenance: {
         streamIds: [...handle.streamIds],
         ...(handle.parentEpisodeId === undefined
@@ -1109,6 +1149,9 @@ export class RetrievalPipeline {
       },
       recallIntentId: WARM_RECALL_INTENT_ID,
       matchedTerms: [],
+      ...(onlyEntry === undefined
+        ? {}
+        : { streamEntryKind: onlyEntry.kind, streamEntryAtMs: onlyEntry.timestamp }),
       score: warmRecallScore(stateHandle),
       scoreBreakdown: {
         provenance: 1,
@@ -1207,7 +1250,7 @@ export class RetrievalPipeline {
     return {
       id: `warm_recall_semantic_edge_${edge.id}`,
       source: "warm_recall",
-      text: `${node.label}: ${node.description}`,
+      text: `${edge.from_node_id} --${edge.relation}--> ${edge.to_node_id}: ${node.label}: ${node.description}`,
       provenance: {
         edgeId: edge.id,
         nodeId: node.id,
@@ -1428,8 +1471,27 @@ export class RetrievalPipeline {
     );
   }
 
+  private prepareRawRecallQuery(query: string, options: RetrievalExecutionOptions): string {
+    const maxBytes = this.options.rawQueryMaxBytes ?? DEFAULT_RAW_QUERY_MAX_BYTES;
+    const rawQuery = boundRawRecallQuery(query, maxBytes, options.rawQueryMessages);
+    if (this.tracer.enabled && options.traceTurnId !== undefined) {
+      this.tracer.emit("retrieval.raw_query", {
+        turnId: options.traceTurnId,
+        session_id: options.sessionId,
+        bounded: rawQuery.bounded,
+        mode: rawQuery.mode,
+        original_bytes: rawQuery.originalBytes,
+        query_bytes: rawQuery.queryBytes,
+        max_bytes: maxBytes,
+        selected_message_count: rawQuery.selectedMessageCount,
+      });
+    }
+    return rawQuery.query;
+  }
+
   private async buildRecallIntents(
     query: string,
+    rawQuery: string,
     options: RetrievalExecutionOptions,
     expansionOverride?: ExpansionOutcome,
   ): Promise<RecallIntent[]> {
@@ -1437,7 +1499,7 @@ export class RetrievalPipeline {
       {
         id: "recall_raw_text_0",
         kind: "raw_text",
-        query,
+        query: rawQuery,
         terms: [],
         priority: 100,
         source: "raw-user-message",
@@ -1676,15 +1738,19 @@ export class RetrievalPipeline {
     // recall outage for the caller, so collect what survived and report the
     // rest as a degradation.
     const settled = await Promise.allSettled(
-      intents.map((intent) =>
-        this.collectEpisodicCandidatesForDisclosureModeIntent(
-          intent,
-          options,
-          limit,
-          mode,
-          intentQueryVectors,
-        ),
-      ),
+      intents.map(async (intent) => {
+        const settle = this.startLaneTrace(options, intent, "episodic");
+        try {
+          const candidates = await this.collectEpisodicCandidatesForDisclosureModeIntent(
+            intent, options, limit, mode, intentQueryVectors,
+          );
+          settle(candidates.length);
+          return candidates;
+        } catch (error) {
+          settle(0, error, "rejected");
+          throw error;
+        }
+      }),
     );
     const rawCandidates = settled
       .filter(
@@ -1778,6 +1844,41 @@ export class RetrievalPipeline {
           : {}),
       });
     }
+  }
+
+  private startLaneTrace(
+    options: RetrievalExecutionOptions,
+    intent: { id: string; kind: string; source: string },
+    collector: string,
+  ): (candidateCount: number, error?: unknown, outcome?: "fulfilled" | "rejected") => void {
+    if (!this.tracer.enabled || options.traceTurnId === undefined) return () => {};
+    const startedAt = this.clock.now();
+    return (candidateCount, error, outcome = "fulfilled") => {
+      try {
+        this.tracer.emit("retrieval.lane_settled", {
+          turnId: options.traceTurnId!,
+          session_id: options.sessionId,
+          intent_id: intent.id,
+          intent_kind: intent.kind,
+          intent_source: intent.source,
+          collector,
+          candidate_count: candidateCount,
+          duration_ms: Math.max(0, this.clock.now() - startedAt),
+          outcome,
+          ...(outcome === "fulfilled"
+            ? {}
+            : { error_name: error instanceof Error ? error.name : typeof error }),
+        });
+      } catch (observerError) {
+        try {
+          console.error("Retrieval lane observer failed", {
+            error_name: observerError instanceof Error ? observerError.name : typeof observerError,
+          });
+        } catch {
+          // An optional observer cannot change a lane's outcome.
+        }
+      }
+    };
   }
 
   private async collectEpisodicCandidatesForDisclosureModeIntent(
@@ -1952,6 +2053,7 @@ export class RetrievalPipeline {
       relevantIntents,
       RETRIEVAL_FANOUT_CONCURRENCY,
       async (intent): Promise<SemanticEvidenceCandidate | null> => {
+        const settle = this.startLaneTrace(options, intent, "semantic");
         try {
           const intentVector = await this.resolveIntentQueryVector(
             intent.query,
@@ -1984,11 +2086,14 @@ export class RetrievalPipeline {
             },
           );
 
+          settle(semantic.matchedNodes.length + semantic.supportHits.length + semantic.causalHits.length +
+            semantic.contradictionHits.length + semantic.categoryHits.length);
           return {
             intent,
             semantic,
           };
         } catch (error) {
+          settle(0, error, "rejected");
           this.emitRetrievalDegraded(options, "semantic", error);
           return null;
         }
@@ -2014,20 +2119,29 @@ export class RetrievalPipeline {
       relevantIntents,
       RETRIEVAL_FANOUT_CONCURRENCY,
       async (intent): Promise<OpenQuestionEvidenceCandidate[]> => {
+        const settle = this.startLaneTrace(options, intent, "open_questions");
+        let laneError: unknown;
+        let laneRejected = false;
         try {
           const questions = await this.retrieveOpenQuestionsForQuery(intent.query, {
             relatedSemanticNodeIds: semantic.matchedNodeIds,
             limit: options.openQuestionsLimit,
             traceTurnId: options.traceTurnId,
             sessionId: options.sessionId,
+            onDegraded: (_reason, error) => {
+              laneRejected = true;
+              laneError = error;
+            },
           });
 
+          settle(questions.length, laneError, laneRejected ? "rejected" : "fulfilled");
           return questions.map((question) => ({
             intent,
             question,
             score: question.urgency + intent.priority / 100,
           }));
         } catch (error) {
+          settle(0, error, "rejected");
           this.emitRetrievalDegraded(options, "open_questions", error);
           return [];
         }
@@ -2067,6 +2181,7 @@ export class RetrievalPipeline {
       relevantIntents,
       RETRIEVAL_FANOUT_CONCURRENCY,
       async (intent): Promise<ImagePerceptionEvidenceCandidate[]> => {
+        const settle = this.startLaneTrace(options, intent, "image_perception");
         try {
           const vector = await this.resolveIntentQueryVector(intent.query, intentQueryVectors);
           const imageRecallLimit = Math.max(1, options.limit ?? 5);
@@ -2083,14 +2198,17 @@ export class RetrievalPipeline {
                   crossAudience: options.crossAudience,
                 });
 
-          return hits
+          const candidates = hits
             .filter((hit) => !currentTurnAttachmentIds.has(hit.record.attachment_id))
             .slice(0, imageRecallLimit)
             .map((hit) => ({
               intent,
               hit,
             }));
+          settle(candidates.length);
+          return candidates;
         } catch (error) {
+          settle(0, error, "rejected");
           this.emitRetrievalDegraded(options, "image_perception", error);
           return [];
         }
@@ -2129,74 +2247,91 @@ export class RetrievalPipeline {
     intents: readonly RecallIntent[],
     options: RetrievalExecutionOptions,
   ): Promise<EvidenceItem[]> {
-    if (this.options.commitmentRepository === undefined) {
-      return [];
-    }
-
-    const relevantIntents = intents.filter(
-      (intent) => intent.kind === "commitment" || intent.kind === "known_term",
-    );
-
-    if (relevantIntents.length === 0) {
-      return [];
-    }
-
-    const rawActiveCommitments = this.options.commitmentRepository.list({
-      activeOnly: true,
-      nowMs: this.clock.now(),
-    });
-    const activeCommitments =
-      this.options.sourceStreamAudienceDisclosureResolver?.resolve({
-        commitments: rawActiveCommitments,
-      }).commitments ?? rawActiveCommitments;
-
-    if (activeCommitments.length === 0) {
-      return [];
-    }
-
-    let intentVectors: Float32Array[];
-    let commitmentVectors: Float32Array[];
+    const settle = this.startLaneTrace(options, {
+      id: "context:commitments", kind: "commitment", source: "context",
+    }, "commitments");
+    let candidateCount = 0;
+    let laneError: unknown;
+    let laneRejected = false;
     try {
-      intentVectors = await this.options.embeddingClient.embedBatch(
-        relevantIntents.map((intent) => intent.query),
-      );
-      commitmentVectors = await this.options.embeddingClient.embedBatch(
-        activeCommitments.map((commitment) => commitment.directive),
-      );
-    } catch (error) {
-      this.emitRetrievalDegraded(options, "commitments", error);
-      return [];
-    }
-    const threshold =
-      this.options.commitmentEvidenceSimilarityThreshold ??
-      similarityThresholds(
-        this.options.similarityConfig ?? { embedding: this.options.embeddingClient?.profile },
-      ).commitmentEvidence;
-    const evidence: EvidenceItem[] = [];
-
-    for (const [intentIndex, intent] of relevantIntents.entries()) {
-      const intentVector = intentVectors[intentIndex];
-
-      if (intentVector === undefined) {
-        continue;
+      if (this.options.commitmentRepository === undefined) {
+        return [];
       }
 
-      for (const [commitmentIndex, commitment] of activeCommitments.entries()) {
-        const commitmentVector = commitmentVectors[commitmentIndex];
+      const relevantIntents = intents.filter(
+        (intent) => intent.kind === "commitment" || intent.kind === "known_term",
+      );
 
-        if (commitmentVector === undefined) {
+      if (relevantIntents.length === 0) {
+        return [];
+      }
+
+      const rawActiveCommitments = this.options.commitmentRepository.list({
+        activeOnly: true,
+        nowMs: this.clock.now(),
+      });
+      const activeCommitments =
+        this.options.sourceStreamAudienceDisclosureResolver?.resolve({
+          commitments: rawActiveCommitments,
+        }).commitments ?? rawActiveCommitments;
+
+      if (activeCommitments.length === 0) {
+        return [];
+      }
+
+      let intentVectors: Float32Array[];
+      let commitmentVectors: Float32Array[];
+      try {
+        intentVectors = await this.options.embeddingClient.embedBatch(
+          relevantIntents.map((intent) => intent.query),
+        );
+        commitmentVectors = await this.options.embeddingClient.embedBatch(
+          activeCommitments.map((commitment) => commitment.directive),
+        );
+      } catch (error) {
+        laneError = error;
+        laneRejected = true;
+        this.emitRetrievalDegraded(options, "commitments", error);
+        return [];
+      }
+      const threshold =
+        this.options.commitmentEvidenceSimilarityThreshold ??
+        similarityThresholds(
+          this.options.similarityConfig ?? { embedding: this.options.embeddingClient?.profile },
+        ).commitmentEvidence;
+      const evidence: EvidenceItem[] = [];
+
+      for (const [intentIndex, intent] of relevantIntents.entries()) {
+        const intentVector = intentVectors[intentIndex];
+
+        if (intentVector === undefined) {
           continue;
         }
 
-        const similarity = cosineSimilarity(intentVector, commitmentVector);
+        for (const [commitmentIndex, commitment] of activeCommitments.entries()) {
+          const commitmentVector = commitmentVectors[commitmentIndex];
 
-        if (similarity >= threshold) {
-          evidence.push(commitmentToEvidence(commitment, intent, similarity));
+          if (commitmentVector === undefined) {
+            continue;
+          }
+
+          const similarity = cosineSimilarity(intentVector, commitmentVector);
+
+          if (similarity >= threshold) {
+            evidence.push(commitmentToEvidence(commitment, intent, similarity));
+          }
         }
       }
-    }
 
-    return evidence;
+      candidateCount = evidence.length;
+      return evidence;
+    } catch (error) {
+      laneError = error;
+      laneRejected = true;
+      throw error;
+    } finally {
+      settle(candidateCount, laneError, laneRejected ? "rejected" : "fulfilled");
+    }
   }
 
   private collectCurrentSessionRecentRawStreamEvidence(
@@ -2236,6 +2371,7 @@ export class RetrievalPipeline {
     id: Episode["id"],
     options: RetrievalGetEpisodeOptions = {},
   ): Promise<RetrievedEpisode | null> {
+    options = this.options.entityRepository?.resolveReferences?.(options) ?? options;
     const episode = await this.options.episodicRepository.get(id);
 
     if (episode === null) {
@@ -2329,10 +2465,12 @@ export class RetrievalPipeline {
           continue;
         }
 
+        const id =
+          episodeParticipantEntityId(participant) ??
+          this.options.entityRepository.findByName(participant);
         participantEntityIds.set(
           key,
-          parseEpisodeParticipantEntityIdTerm(participant) ??
-            this.options.entityRepository.findByName(participant),
+          id === null ? null : (this.options.entityRepository.get?.(id)?.id ?? id),
         );
       }
     }
@@ -2943,7 +3081,7 @@ function semanticRetrievalToEvidence(
     return {
       id: `evidence_semantic_edge_${edgeId ?? hit.node.id}_${intent.id}`,
       source: "semantic_edge",
-      text: `${hit.node.label}: ${hit.node.description}`,
+      text: `${edge === undefined ? "" : `${edge.from_node_id} --${edge.relation}--> ${edge.to_node_id}: `}${hit.node.label}: ${hit.node.description}`,
       provenance: {
         ...(edgeId === undefined ? {} : { edgeId }),
         nodeId: hit.node.id,
@@ -3108,6 +3246,7 @@ function streamEntryToEvidence(
     id: `evidence_raw_stream_${entry.id}_${intent.id}`,
     source,
     text: streamEntryContentToText(entry),
+    ...frameAnomalyAnnotationFields(entry.frame_anomalies),
     provenance: {
       streamIds: [entry.id],
       ...(options.parentEpisodeId === undefined
@@ -3116,6 +3255,9 @@ function streamEntryToEvidence(
     },
     recallIntentId: intent.id,
     matchedTerms: [],
+    streamEntryKind: entry.kind,
+    streamEntryAtMs: entry.timestamp,
+    streamEntrySessionId: entry.session_id,
     score:
       intent.kind === "recent"
         ? RECENT_RAW_STREAM_EVIDENCE_SCORE

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createOfflineTestHarness } from "../../offline/test-support.js";
 import { StreamWatermarkRepository } from "../../stream/index.js";
 import { ManualClock } from "../../util/clock.js";
-import { DEFAULT_SESSION_ID } from "../../util/ids.js";
+import { DEFAULT_SESSION_ID, createStreamEntryId } from "../../util/ids.js";
 import { formatAutonomyTriggerContext } from "../../cognition/autonomy-trigger.js";
 import { getExecutiveFocusGoalStaleBackoffProcessName } from "../executive-focus-stale-backoff.js";
 
@@ -23,6 +23,91 @@ describe("goal followup due trigger", () => {
     await cleanup?.();
     cleanup = undefined;
   });
+
+  it.each(["deadline", "stale"] as const)(
+    "shares the presentation generation across old %s latches, topology drift and new input",
+    async (phase) => {
+      const clock = new ManualClock(1_000_000);
+      const harness = await createOfflineTestHarness({ clock });
+      cleanup = harness.cleanup;
+      const watermarkRepository = new StreamWatermarkRepository({ db: harness.db, clock });
+      const goal = harness.goalsRepository.add({
+        description: "目的",
+        priority: 8,
+        provenance: { kind: "manual" },
+        createdAt: clock.now() - 200_000,
+        ...(phase === "deadline" ? { targetAt: clock.now() + 10_000 } : {}),
+      });
+      const presentations = harness.goalsRepository.presentation!;
+      let actionKey = "before";
+      const trigger = createGoalFollowupDueTrigger({
+        goalsRepository: harness.goalsRepository,
+        watermarkRepository,
+        lookaheadMs: 20_000,
+        staleMs: 100_000,
+        staleBackoff: STALE_BACKOFF,
+        respectStaleBackoff: true,
+        goalStaleBackoffActionAvailabilityKey: () => actionKey,
+        clock,
+      });
+      const first = (await trigger.scan())[0]!;
+      watermarkRepository.set(first.watermarkProcessName, DEFAULT_SESSION_ID, {
+        lastTs: clock.now(),
+        lastEntryId: first.id,
+      });
+      watermarkRepository.set(
+        `autonomy:goal-followup-due:${goal.id}:${goal.target_at ?? "no-target"}:${goal.created_at}`,
+        DEFAULT_SESSION_ID,
+        { lastTs: clock.now(), lastEntryId: first.id },
+      );
+      watermarkRepository.set(
+        getExecutiveFocusGoalStaleBackoffProcessName(goal.id),
+        DEFAULT_SESSION_ID,
+        {
+          lastTs: clock.now(),
+          lastEntryId: first.id,
+          metadata: { empty_count: 3, action_availability_key: actionKey },
+        },
+      );
+      expect(await trigger.scan()).toEqual([]);
+      presentations.associateInbound(goal.id, createStreamEntryId());
+      expect(await trigger.scan()).toHaveLength(1);
+      expect(await trigger.nextDueAt!()).toBe(clock.now());
+      presentations.presented([presentations.snapshot(goal)], "first-wake");
+      actionKey = "new-topology";
+      clock.advance(14 * 86_400_000 + 1);
+      expect(await trigger.scan()).toEqual([]);
+      expect(await trigger.nextDueAt!()).toBeNull();
+
+      // An explicit inbound association must pierce an unchanged phase latch
+      // and renewed dormancy, without depending on an action-topology change.
+      watermarkRepository.set(
+        getExecutiveFocusGoalStaleBackoffProcessName(goal.id),
+        DEFAULT_SESSION_ID,
+        {
+          lastTs: clock.now(),
+          lastEntryId: first.id,
+          metadata: { empty_count: 3, action_availability_key: actionKey },
+        },
+      );
+      presentations.associateInbound(goal.id, createStreamEntryId());
+      expect(await trigger.scan()).toHaveLength(1);
+      expect(await trigger.nextDueAt!()).toBe(clock.now());
+      expect(trigger.dormantGoalIds!()).toEqual([]);
+      presentations.presented([presentations.snapshot(goal)], "inbound-wake");
+      expect(await trigger.scan()).toEqual([]);
+
+      harness.goalsRepository.updateProgress(goal.id, "進捗", { kind: "manual" });
+      if (phase === "stale") clock.advance(100_001);
+      expect(await trigger.scan()).toHaveLength(1);
+      expect(await trigger.nextDueAt!()).toBe(clock.now());
+      presentations.presented(
+        [presentations.snapshot(harness.goalsRepository.get(goal.id)!)],
+        "progress-wake",
+      );
+      expect(await trigger.scan()).toEqual([]);
+    },
+  );
 
   it("fires for deadline-approaching goals", async () => {
     const clock = new ManualClock(1_000_000);
@@ -256,7 +341,7 @@ describe("goal followup due trigger", () => {
     expect(topEvent?.payload).not.toHaveProperty("executiveGoalRank");
   });
 
-  it("excludes dormant goals from scan and nextDueAt", async () => {
+  it("defers dormant goals until the fourteen-day expiry", async () => {
     const clock = new ManualClock(2_500_000);
     const harness = await createOfflineTestHarness({ clock });
     cleanup = harness.cleanup;
@@ -287,7 +372,11 @@ describe("goal followup due trigger", () => {
     });
 
     await expect(trigger.scan()).resolves.toEqual([]);
-    await expect(trigger.nextDueAt!()).resolves.toBeNull();
+    expect(trigger.dormantGoalIds?.()).toEqual([goal.id]);
+    await expect(trigger.nextDueAt!()).resolves.toBe(clock.now() + 14 * 86_400_000);
+    clock.advance(14 * 86_400_000);
+    expect(await trigger.scan()).toHaveLength(1);
+    expect(trigger.dormantGoalIds?.()).toEqual([]);
   });
 
   it("releases stale followup dormancy for a new structural action key", async () => {

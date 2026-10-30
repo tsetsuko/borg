@@ -1,3 +1,4 @@
+import { frameAnomalyAnnotationFields } from "../../stream/frame-anomaly.js";
 import { buildEpisodeEmbeddingText } from "./protected-lines.js";
 import type { EmbeddingClient } from "../../embeddings/index.js";
 import type { TurnTracer } from "../../tracing/tracer.js";
@@ -466,6 +467,7 @@ function buildExtractorPrompt(
       sender_entity_id: entry.sender_entity_id ?? undefined,
       sender_display_name: sender?.display_name,
       content: entry.content,
+      ...frameAnomalyAnnotationFields(entry.frame_anomalies),
       conversation: entry.conversation,
       audience:
         entry.audience === undefined
@@ -1005,22 +1007,7 @@ export class EpisodicExtractor {
     canonicalLabel: string;
   } {
     const trimmed = audience.trim();
-
-    if (entityIdHelpers.is(trimmed)) {
-      const existing = this.options.entityRepository.get(trimmed as EntityId);
-
-      if (existing !== null) {
-        return {
-          entityId: existing.id,
-          canonicalLabel: existing.canonical_name,
-        };
-      }
-    }
-
-    const entityId = this.options.entityRepository.resolve(trimmed, {
-      ...(trimmed === "self" ? { kind: "self" as const } : {}),
-      provenance: "transport_audience_label",
-    });
+    const entityId = this.options.entityRepository.resolveAudienceLabel(trimmed);
     const entity = this.options.entityRepository.get(entityId);
 
     return {
@@ -1263,6 +1250,7 @@ export class EpisodicExtractor {
   ): Promise<ExtractFromStreamResult> {
     const session = extractOptions.session ?? DEFAULT_SESSION_ID;
     const reader = new StreamReader({
+      entityRepository: this.options.entityRepository,
       dataDir: this.options.dataDir,
       sessionId: session,
     });

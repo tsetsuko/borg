@@ -103,6 +103,7 @@ export class CitationResolver {
           dataDir: this.options.dataDir,
           sessionId: record.session_id,
           byteOffset: record.byte_offset,
+          entryIndex: this.options.entryIndex,
         });
 
         if (entry === null) {
@@ -127,7 +128,7 @@ export class CitationResolver {
           continue;
         }
 
-        entries.set(entryId, entry);
+        entries.set(entryId, this.options.entryIndex.resolveEntityReferences(entry));
         pendingIds.delete(entryId);
       }
     }
@@ -172,6 +173,7 @@ export class CitationResolver {
           dataDir: this.options.dataDir,
           sessionId: record.session_id,
           byteOffset: record.byte_offset,
+          entryIndex: this.options.entryIndex,
         });
 
         if (entry === null || entry.id !== record.entry_id || entry.kind !== "internal_event") {
@@ -263,6 +265,7 @@ export class CitationResolver {
       const reader = new StreamReader({
         dataDir: this.options.dataDir,
         sessionId,
+        entryIndex: this.options.entryIndex,
       });
 
       for await (const entry of reader.iterate()) {

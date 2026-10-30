@@ -1,3 +1,4 @@
+import { FailureReportTracker } from "../../util/failure-reports.js";
 import type { EmbeddingClient } from "../../embeddings/index.js";
 import { z } from "zod";
 import {
@@ -168,7 +169,7 @@ function nullableRowValue(value: unknown): unknown {
   return value === null || value === undefined ? null : value;
 }
 
-function mapObservedEventRow(row: Record<string, unknown>): ObservedEvent {
+export function mapObservedEventRow(row: Record<string, unknown>): ObservedEvent {
   const parsed = observedEventSchema.safeParse({
     id: row.id,
     occurred_at: Number(row.occurred_at),
@@ -266,6 +267,7 @@ function vectorRowFromObservedEvent(
 export class ObservedEventRepository {
   private readonly clock: Clock;
   private readonly pendingEmbeddingTasks = new Set<Promise<unknown>>();
+  private readonly failureReports = new FailureReportTracker("observed-event embedding failure");
 
   constructor(private readonly options: ObservedEventRepositoryOptions) {
     this.clock = options.clock ?? new SystemClock();
@@ -298,11 +300,7 @@ export class ObservedEventRepository {
     error: unknown,
     details: ObservedEventEmbeddingFailureDetails,
   ): Promise<void> {
-    try {
-      await this.options.onEmbeddingFailure?.(error, details);
-    } catch {
-      // Best-effort failure reporting only.
-    }
+    await this.failureReports.report(() => this.options.onEmbeddingFailure?.(error, details));
   }
 
   private async readStoredEmbedding(id: ObservedEventId): Promise<Float32Array | null> {
@@ -372,7 +370,10 @@ export class ObservedEventRepository {
   }
 
   async waitForPendingEmbeddings(): Promise<void> {
-    await Promise.allSettled([...this.pendingEmbeddingTasks]);
+    while (this.pendingEmbeddingTasks.size > 0) {
+      await Promise.allSettled([...this.pendingEmbeddingTasks]);
+    }
+    await this.failureReports.flush();
   }
 
   async getEmbeddedEventIds(ids: readonly ObservedEventId[]): Promise<Set<ObservedEventId>> {
@@ -489,6 +490,19 @@ export class ObservedEventRepository {
       });
     }
 
+    const existing = this.getByRecurrenceKey(input.recurrenceKey);
+    if (existing !== null) {
+      const existingSourceIds = new Set(existing.source_stream_entry_ids);
+      // Retrying the same source occurrence is not another recurrence, even for
+      // callers without a fire key. Compare only source handles, never rationale.
+      if (
+        existingSourceIds.size === sourceStreamEntryIds.length &&
+        sourceStreamEntryIds.every((sourceId) => existingSourceIds.has(sourceId))
+      ) {
+        return existing;
+      }
+    }
+
     const now = input.now ?? this.clock.now();
     const id = input.id ?? createObservedEventId();
     const dimensions = observedEventRecordDimensionsSchema.safeParse({
@@ -517,6 +531,17 @@ export class ObservedEventRepository {
             recurrence_count = observed_events.recurrence_count + 1,
             fire_dedup_key = COALESCE(excluded.fire_dedup_key, observed_events.fire_dedup_key),
             last_seen_at = excluded.last_seen_at,
+            interaction_text = excluded.interaction_text,
+            source_stream_entry_ids = excluded.source_stream_entry_ids,
+            session_id = excluded.session_id,
+            speaker_entity_id = excluded.speaker_entity_id,
+            audience_entity_id = excluded.audience_entity_id,
+            source_entity_id = excluded.source_entity_id,
+            disclosure_class = excluded.disclosure_class,
+            stance = excluded.stance,
+            taint = excluded.taint,
+            belief_effect = excluded.belief_effect,
+            classification_kind = excluded.classification_kind,
             updated_at = excluded.updated_at
         `,
       )

@@ -4,6 +4,7 @@ import { canonicalTraceEventName, phaseForTraceEventName } from "./taxonomy.js";
 
 describe("trace taxonomy", () => {
   it("routes normalized trace events to their shared reporting phase", () => {
+    expect(phaseForTraceEventName("working_memory.pending_action_resolved")).toBe("working_memory");
     expect(phaseForTraceEventName("extraction.actions.completed")).toBe("extraction");
     expect(phaseForTraceEventName("extraction.commitments.transitioned")).toBe("extraction");
     expect(phaseForTraceEventName("episodic_extractor.skipped")).toBe("ingestion");
@@ -14,10 +15,12 @@ describe("trace taxonomy", () => {
     expect(phaseForTraceEventName("frame_anomaly.disposition")).toBe("perception");
     expect(phaseForTraceEventName("frame_anomaly.degraded_fail_open")).toBe("perception");
     expect(phaseForTraceEventName("semantic_revision.completed")).toBe("retrieval");
+    expect(phaseForTraceEventName("retrieval.raw_query")).toBe("retrieval");
     expect(phaseForTraceEventName("creator_directive_rendered")).toBe("retrieval");
     expect(phaseForTraceEventName("shared_state.compile.completed")).toBe("retrieval");
     expect(phaseForTraceEventName("shared_state.reconcile.completed")).toBe("retrieval");
     expect(phaseForTraceEventName("llm_call.schema_repair.attempted")).toBe("deliberation");
+    expect(phaseForTraceEventName("llm_call.tool_choice_translated")).toBe("deliberation");
     expect(phaseForTraceEventName("attachment.quarantined")).toBe("perception");
     expect(phaseForTraceEventName("image_perception.deactivated")).toBe("perception");
     expect(phaseForTraceEventName("image_perception.reactivated")).toBe("perception");

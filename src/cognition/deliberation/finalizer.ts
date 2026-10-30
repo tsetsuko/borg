@@ -7,6 +7,7 @@ import type {
   LLMConverseOptions,
   LLMSystemBlock,
 } from "../../llm/index.js";
+import { turnExecutionMetricsStorage } from "../turn-execution-metrics.js";
 import {
   LLM_STREAMING_CALL_TIMEOUT_MS,
   willSendThinkingUnderAutoToolChoice,
@@ -408,6 +409,9 @@ export type RunFinalizerOptions = {
   audienceEntityId?: EntityId | null;
   model: string;
   baseSystemPrompt: string;
+  shownOpenQuestionIds?: readonly string[];
+  shownGoalIds?: readonly string[];
+  onPromptPresented?: (shownGoalIds: readonly string[]) => void;
   initialMessages: readonly LLMContentBlockMessage[];
   userEntryId: string | undefined;
   maxTokens: number;
@@ -636,6 +640,7 @@ function legacyFinalizerTraceSummary(
 export function buildFinalizerSystemPrompt(options: RunFinalizerOptions): {
   system: readonly LLMSystemBlock[];
   traceSummary: FinalizerContextTraceSummary | null;
+  shownGoalIds: readonly string[];
 } {
   const resolvedVariant = resolveFinalizerSurfaceVariant(
     options.finalizerSurfaceVariant,
@@ -670,6 +675,7 @@ export function buildFinalizerSystemPrompt(options: RunFinalizerOptions): {
     const totalText = system.map((block) => block.text).join("\n\n");
     return {
       system,
+      shownGoalIds: compact.shownGoalIds,
       traceSummary: {
         ...compact.traceSummary,
         sections: {
@@ -716,6 +722,7 @@ export function buildFinalizerSystemPrompt(options: RunFinalizerOptions): {
     return {
       system,
       traceSummary: legacyFinalizerTraceSummary(options, system),
+      shownGoalIds: options.shownGoalIds ?? [],
     };
   }
 
@@ -745,6 +752,7 @@ export function buildFinalizerSystemPrompt(options: RunFinalizerOptions): {
   return {
     system,
     traceSummary: legacyFinalizerTraceSummary(options, system),
+    shownGoalIds: options.shownGoalIds ?? [],
   };
 }
 
@@ -1144,10 +1152,10 @@ export async function runFinalizer(options: RunFinalizerOptions): Promise<Finali
     .map((tool) => tool.name);
   const effectiveThinking =
     options.finalizerAttempt === "regenerate" ? undefined : options.thinking;
-  const effectiveEffort = options.finalizerAttempt === "regenerate" ? undefined : options.effort;
-  // Auto tool_choice iff thinking will actually reach the model -- otherwise force
-  // an emission tool so a structured emission stays guaranteed (e.g. manual
-  // thinking on Opus is omitted by the client, so forcing is correct there).
+  // Keep request-level effort stable across regeneration for prompt caching;
+  // thinking compatibility must not discard the caller's configured effort.
+  // Request auto when explicit thinking reaches the model, otherwise request
+  // an emission tool. The shared client handles models without forced tool use.
   const useAutoToolChoice = willSendThinkingUnderAutoToolChoice(options.model, effectiveThinking);
   const finalizerTransport = options.finalizerTransport ?? "unary";
   let tokenSequence = 0;
@@ -1172,7 +1180,7 @@ export async function runFinalizer(options: RunFinalizerOptions): Promise<Finali
       // Buffered delivery keeps the finalizer's existing streaming deadline.
       timeoutMs: LLM_STREAMING_CALL_TIMEOUT_MS,
       ...(effectiveThinking === undefined ? {} : { thinking: effectiveThinking }),
-      ...(effectiveEffort === undefined ? {} : { effort: effectiveEffort }),
+      ...(options.effort === undefined ? {} : { effort: options.effort }),
       // Emission-tool protocol: the answer lives in the terminal tool input, so any
       // loose text the model emits under auto tool_choice must not reach the stream.
       suppressRawTextStream: true,
@@ -1180,8 +1188,8 @@ export async function runFinalizer(options: RunFinalizerOptions): Promise<Finali
       // thinking active. When thinking will be sent, omit toolChoice (auto): the
       // model thinks, then calls exactly one emission tool. The emission is read
       // from the terminal tool (loose text never leaks), and the invalid-tool retry
-      // net covers the rare turn that emits no terminal tool. Otherwise force a tool
-      // ("any") so an emission is guaranteed.
+      // net covers the rare turn that emits no terminal tool. Otherwise request
+      // "any"; the shared client translates it if the model cannot force tools.
       ...(useAutoToolChoice || emissionTools.length === 0
         ? {}
         : { toolChoice: { type: "any" as const } }),
@@ -1206,8 +1214,15 @@ export async function runFinalizer(options: RunFinalizerOptions): Promise<Finali
       onRequestPrepared: (request, attempt) => {
         recordPreparedFinalizerRequest(captureState, request, attempt);
         options.onRequestPrepared?.(request, attempt);
+        const metrics = turnExecutionMetricsStorage.getStore();
+        if (metrics !== undefined && (options.shownOpenQuestionIds?.length ?? 0) > 0) {
+          metrics.shownOpenQuestionIds = [
+            ...new Set([...(metrics.shownOpenQuestionIds ?? []), ...options.shownOpenQuestionIds!]),
+          ];
+        }
       },
       toolResultObserver: captureState.toolTranscriptCollector ?? undefined,
+      onPromptPresented: () => options.onPromptPresented?.(renderedSystemPrompt.shownGoalIds),
     });
   } catch (error) {
     const code =

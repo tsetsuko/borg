@@ -1,3 +1,5 @@
+import { EntityRepository } from "../memory/commitments/repository.js";
+import { FailureReportTracker } from "../util/failure-reports.js";
 import { logSimilarityProfile } from "../config/similarity.js";
 import {
   requireEmbeddingClientProfile,
@@ -76,6 +78,7 @@ export async function openBorgDependencies(
   let lance: LanceDbStore | undefined;
   let releaseEmbeddingBankAccess: (() => Promise<void>) | undefined;
   const pendingStartupTasks: Promise<unknown>[] = [];
+  const failureReports = new FailureReportTracker("Borg stream diagnostic");
   let catchUpWorker: ChatResponseCatchUpWorker | undefined;
 
   try {
@@ -125,6 +128,7 @@ export async function openBorgDependencies(
     });
     const attachmentRepository = new AttachmentRepository(sqlite);
     const entryIndex = new StreamEntryIndexRepository({
+      entityRepository: new EntityRepository({ db: sqlite }),
       db: sqlite,
       dataDir: config.dataDir,
     });
@@ -163,6 +167,7 @@ export async function openBorgDependencies(
       }
     };
     const repositories = await buildBorgRepositories({
+      failureReports,
       pendingStartupTasks,
       config,
       sqlite,
@@ -221,6 +226,7 @@ export async function openBorgDependencies(
       promptSurfaceHistoryRepository: repositories.promptSurfaceHistoryRepository,
       createStreamWriter: repositories.createStreamWriter,
       clock,
+      tracer,
     });
     const outboundDelivery = new OutboundDelivery({
       connectorRegistry: outboundConnectorRegistry,
@@ -384,7 +390,11 @@ export async function openBorgDependencies(
             cause: error instanceof Error ? error.message : String(error),
           });
         } finally {
-          catchUpWorker?.onPendingSession(event.sessionId, event.pendingAt);
+          catchUpWorker?.onPendingSession(
+            event.sessionId,
+            event.pendingAt,
+            event.entries.find((entry) => entry.kind === "user_msg")?.id,
+          );
         }
       },
       clock,
@@ -464,6 +474,8 @@ export async function openBorgDependencies(
           runDirectedOutboundTurn(
             {
               turnOrchestrator,
+              substratePrivilegedSourceTypes:
+                config.internalIdentifierGuard.substratePrivilegedSourceTypes,
             },
             input,
           ),
@@ -513,6 +525,7 @@ export async function openBorgDependencies(
           }),
       coordinator: chatResponseWatermarkCoordinator,
       prefixBuilder: chatResponseBacklogPrefixBuilder,
+      observer: options.inbox?.observer,
       entryIndex: repositories.entryIndex,
       repairSessionStreamEntryIndex,
       ...(catchUpRunner === undefined ? { turnOrchestrator } : { runner: catchUpRunner }),
@@ -546,6 +559,7 @@ export async function openBorgDependencies(
       },
     });
     const autonomyScheduler = buildAutonomyScheduler({
+      maintenancePassStartedAt: () => offline.maintenanceOrchestrator.getActivePassStartedAt(),
       entryIndex: repositories.entryIndex,
       config,
       commitmentRepository: repositories.commitmentRepository,
@@ -655,13 +669,20 @@ export async function openBorgDependencies(
       embeddingClient,
       releaseEmbeddingBankAccess,
       pendingStartupTasks,
+      failureReports,
       tracer,
       clock,
     };
   } catch (error) {
-    await Promise.allSettled(pendingStartupTasks);
-    await closeBestEffort(sqlite, lance);
-    await releaseEmbeddingBankAccess?.();
+    const pendingResults = await Promise.allSettled(pendingStartupTasks);
+    const reportResults = await Promise.allSettled([failureReports.flush()]);
+    const storesClosed = await closeBestEffort(sqlite, lance);
+    if (
+      storesClosed &&
+      [...pendingResults, ...reportResults].every((result) => result.status === "fulfilled")
+    ) {
+      await releaseEmbeddingBankAccess?.();
+    }
     throw error;
   }
 }

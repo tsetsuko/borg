@@ -1,3 +1,4 @@
+import { FailureReportTracker } from "../../util/failure-reports.js";
 import { createHash } from "node:crypto";
 
 import { z } from "zod";
@@ -339,7 +340,7 @@ export function buildOpenQuestionDedupeKey(input: {
   return `v2:${questionHash}|${relatedHash}`;
 }
 
-function mapOpenQuestionRow(row: Record<string, unknown>): OpenQuestion {
+export function mapOpenQuestionRow(row: Record<string, unknown>): OpenQuestion {
   const disclosureLabel =
     row.disclosure_label === null ||
     row.disclosure_label === undefined ||
@@ -414,6 +415,10 @@ function mapOpenQuestionRow(row: Record<string, unknown>): OpenQuestion {
       row.last_ruminated_at === null || row.last_ruminated_at === undefined
         ? null
         : Number(row.last_ruminated_at),
+    consecutive_refusals: Number(row.consecutive_refusals ?? 0),
+    last_rumination_attempt_outcome: row.last_rumination_attempt_outcome ?? null,
+    last_rumination_attempt_at: row.last_rumination_attempt_at ?? null,
+    refusal_backoff_until: row.refusal_backoff_until ?? null,
   });
 
   if (!parsed.success) {
@@ -426,7 +431,7 @@ function mapOpenQuestionRow(row: Record<string, unknown>): OpenQuestion {
   return parsed.data;
 }
 
-function mapOpenQuestionRuminationRow(row: Record<string, unknown>): OpenQuestionRumination {
+export function mapOpenQuestionRuminationRow(row: Record<string, unknown>): OpenQuestionRumination {
   const parsed = z
     .object({
       id: z.number().int().positive(),
@@ -557,16 +562,52 @@ function reparentOpenQuestionHandles(
   return result;
 }
 
+const OPEN_QUESTION_MERGE_TOMBSTONE_PREFIX = "merged:";
+const OPEN_QUESTION_MERGE_TOMBSTONE_INFIX = ":into:";
+
 function openQuestionMergeTombstoneDedupeKey(
   duplicateId: OpenQuestionId,
   primaryId: OpenQuestionId,
 ): string {
-  return `merged:${duplicateId}:into:${primaryId}`;
+  return `${OPEN_QUESTION_MERGE_TOMBSTONE_PREFIX}${duplicateId}${OPEN_QUESTION_MERGE_TOMBSTONE_INFIX}${primaryId}`;
+}
+
+// Inverse of the key above. The grammar is machine-minted by the merge itself and carries only
+// ids, so reading it back is a source-handle lookup, not an interpretation of the row's prose.
+function parseOpenQuestionMergeTombstoneDedupeKey(
+  dedupeKey: string | null,
+): { duplicateId: OpenQuestionId; primaryId: OpenQuestionId } | null {
+  if (dedupeKey === null || !dedupeKey.startsWith(OPEN_QUESTION_MERGE_TOMBSTONE_PREFIX)) {
+    return null;
+  }
+
+  const infixIndex = dedupeKey.indexOf(
+    OPEN_QUESTION_MERGE_TOMBSTONE_INFIX,
+    OPEN_QUESTION_MERGE_TOMBSTONE_PREFIX.length,
+  );
+
+  if (infixIndex === -1) {
+    return null;
+  }
+
+  const duplicateId = openQuestionIdSchema.safeParse(
+    dedupeKey.slice(OPEN_QUESTION_MERGE_TOMBSTONE_PREFIX.length, infixIndex),
+  );
+  const primaryId = openQuestionIdSchema.safeParse(
+    dedupeKey.slice(infixIndex + OPEN_QUESTION_MERGE_TOMBSTONE_INFIX.length),
+  );
+
+  if (!duplicateId.success || !primaryId.success) {
+    return null;
+  }
+
+  return { duplicateId: duplicateId.data, primaryId: primaryId.data };
 }
 
 export class OpenQuestionsRepository {
   private readonly clock: Clock;
   private readonly pendingEmbeddingTasks = new Set<Promise<unknown>>();
+  private readonly failureReports = new FailureReportTracker("open-question embedding failure");
 
   constructor(private readonly options: OpenQuestionsRepositoryOptions) {
     this.clock = options.clock ?? new SystemClock();
@@ -599,11 +640,7 @@ export class OpenQuestionsRepository {
     error: unknown,
     details: OpenQuestionEmbeddingFailureDetails,
   ): Promise<void> {
-    try {
-      await this.options.onEmbeddingFailure?.(error, details);
-    } catch {
-      // Best-effort failure reporting only.
-    }
+    await this.failureReports.report(() => this.options.onEmbeddingFailure?.(error, details));
   }
 
   private async readStoredEmbedding(id: OpenQuestionId): Promise<Float32Array | null> {
@@ -673,7 +710,10 @@ export class OpenQuestionsRepository {
   }
 
   async waitForPendingEmbeddings(): Promise<void> {
-    await Promise.allSettled([...this.pendingEmbeddingTasks]);
+    while (this.pendingEmbeddingTasks.size > 0) {
+      await Promise.allSettled([...this.pendingEmbeddingTasks]);
+    }
+    await this.failureReports.flush();
   }
 
   async getEmbeddedQuestionIds(ids: readonly OpenQuestionId[]): Promise<Set<OpenQuestionId>> {
@@ -1047,8 +1087,9 @@ export class OpenQuestionsRepository {
   findByHandles(options: OpenQuestionHandleLookupOptions): OpenQuestion[] {
     const streamEntryIds = uniqueNonEmptyStrings(options.streamEntryIds);
     const episodeIds = uniqueNonEmptyStrings(options.episodeIds);
+    const semanticNodeIds = uniqueNonEmptyStrings(options.semanticNodeIds);
 
-    if (streamEntryIds.length === 0 && episodeIds.length === 0) {
+    if (streamEntryIds.length === 0 && episodeIds.length === 0 && semanticNodeIds.length === 0) {
       return [];
     }
 
@@ -1109,6 +1150,18 @@ export class OpenQuestionsRepository {
         )`,
       );
       values.push(...episodeIds, ...episodeIds, ...episodeIds);
+    }
+
+    // A contradiction-sourced row can carry node ids and nothing else. The open-row draw reaches it
+    // through node overlap, so without this arm its closure is also the last time any page shows it.
+    if (semanticNodeIds.length > 0) {
+      handleFilters.push(
+        `EXISTS (
+          SELECT 1 FROM json_each(open_questions.related_semantic_node_ids)
+          WHERE value IN (${semanticNodeIds.map(() => "?").join(", ")})
+        )`,
+      );
+      values.push(...semanticNodeIds);
     }
 
     filters.push(`(${handleFilters.join(" OR ")})`);
@@ -1226,6 +1279,33 @@ export class OpenQuestionsRepository {
       .all() as Record<string, unknown>[];
 
     return rows.map((row) => mapOpenQuestionRow(row));
+  }
+
+  // The population of the register, which every reader of it so far has had to infer from a draw.
+  // Both draws that reach a page are small and scored, so a short draw is consistent with a short
+  // register and with a long one, and nothing else in this repository answers "how many". Every
+  // status in the enum is seeded to zero so a status the table holds no rows of reads as a measured
+  // zero rather than as a key this query forgot; a row whose status the enum does not contain is
+  // skipped, which no writer here can produce because status is schema-parsed on every write.
+  countByStatus(): Record<OpenQuestionStatus, number> {
+    const counts = Object.fromEntries(
+      OPEN_QUESTION_STATUSES.map((status) => [status, 0]),
+    ) as Record<OpenQuestionStatus, number>;
+    const rows = this.db
+      .prepare("SELECT status AS status, count(*) AS total FROM open_questions GROUP BY status")
+      .all() as { status?: unknown; total?: unknown }[];
+
+    for (const row of rows) {
+      const status = row.status as OpenQuestionStatus;
+
+      if (!(OPEN_QUESTION_STATUSES as readonly string[]).includes(status)) {
+        continue;
+      }
+
+      counts[status] = Number(row.total ?? 0);
+    }
+
+    return counts;
   }
 
   get(id: OpenQuestionId): OpenQuestion | null {
@@ -1346,13 +1426,57 @@ export class OpenQuestionsRepository {
     return rows.map((row) => mapOpenQuestionRuminationRow(row));
   }
 
+  // How many notes the store actually holds for this question. listRecentRuminations returns a
+  // capped tail, so a reader shown that tail cannot tell it apart from the whole record; this is
+  // the quantity that distinguishes them.
+  countRuminations(openQuestionId: OpenQuestionId): number {
+    const parsedId = openQuestionIdSchema.parse(openQuestionId);
+    const row = this.db
+      .prepare(
+        `
+          SELECT count(*) AS total
+          FROM open_question_ruminations
+          WHERE open_question_id = ?
+        `,
+      )
+      .get(parsedId) as { total: number } | undefined;
+
+    return row?.total ?? 0;
+  }
+
+  // Where a merged-away question's record went. A merge moves the duplicate's notes, stamps and
+  // handles onto the primary and leaves the pointer in dedupe_key, so a reader holding the
+  // duplicate's id otherwise sees an empty record and cannot tell it apart from a question the
+  // loop never worked. One hop: the primary may itself be a tombstone.
+  mergeTombstonePrimaryId(openQuestionId: OpenQuestionId): OpenQuestionId | null {
+    const parsedId = openQuestionIdSchema.parse(openQuestionId);
+    const row = this.db
+      .prepare("SELECT dedupe_key FROM open_questions WHERE id = ?")
+      .get(parsedId) as { dedupe_key: string | null } | undefined;
+
+    if (row === undefined) {
+      return null;
+    }
+
+    const parsed = parseOpenQuestionMergeTombstoneDedupeKey(row.dedupe_key);
+
+    // The key names the duplicate it was minted for. A key naming some other row is not this row's
+    // pointer and is not read as one.
+    return parsed === null || parsed.duplicateId !== parsedId ? null : parsed.primaryId;
+  }
+
   // Time-range browse over ruminations regardless of the question's current status: a note written
   // against a question that has since resolved or been abandoned stays readable, because the record
   // of how a question was reached is what survives the question closing.
   listRuminationsInRange(options: OpenQuestionRuminationRangeOptions): OpenQuestionRumination[] {
     const sinceMs = z.number().int().finite().parse(options.sinceMs);
     const untilMs = z.number().int().finite().parse(options.untilMs);
-    const limit = Math.max(1, Math.min(50, Math.floor(options.limit ?? 20)));
+    // The tool caps its page size, but requests one extra row for lookahead.
+    const limit = z
+      .number()
+      .int()
+      .positive()
+      .parse(options.limit ?? 20);
     const openQuestionId =
       options.openQuestionId === undefined
         ? null
@@ -1858,7 +1982,9 @@ export class OpenQuestionsRepository {
               resolution_evidence_stream_entry_ids = ?, resolution_disclosure_label = ?,
               resolution_note = ?, resolved_at = ?,
               abandoned_reason = ?, abandoned_at = ?, resolved_by_artifact_entry_id = ?,
-              unresolved_rumination_ticks = ?, last_ruminated_at = ?
+              unresolved_rumination_ticks = ?, last_ruminated_at = ?,
+              consecutive_refusals = ?, last_rumination_attempt_outcome = ?,
+              last_rumination_attempt_at = ?, refusal_backoff_until = ?
           WHERE id = ?
         `,
       )
@@ -1888,6 +2014,10 @@ export class OpenQuestionsRepository {
         parsed.resolved_by_artifact_entry_id ?? null,
         parsed.unresolved_rumination_ticks,
         parsed.last_ruminated_at,
+        parsed.consecutive_refusals,
+        parsed.last_rumination_attempt_outcome,
+        parsed.last_rumination_attempt_at,
+        parsed.refusal_backoff_until,
         parsed.id,
       );
 
@@ -2013,9 +2143,12 @@ export class OpenQuestionsRepository {
       resolutionEvidenceEpisodeIds.length === 0 &&
       resolutionEvidenceStreamEntryIds.length === 0
     ) {
-      throw new StorageError("Open question resolution requires episode or stream evidence", {
-        code: "OPEN_QUESTION_RESOLUTION_EVIDENCE_REQUIRED",
-      });
+      throw new StorageError(
+        "Open question resolution requires episode or stream evidence: set resolution_evidence_episode_ids or resolution_evidence_stream_entry_ids, either one alone",
+        {
+          code: "OPEN_QUESTION_RESOLUTION_EVIDENCE_REQUIRED",
+        },
+      );
     }
 
     const resolvedAt = this.clock.now();
@@ -2032,6 +2165,8 @@ export class OpenQuestionsRepository {
               abandoned_reason = NULL, abandoned_at = NULL, last_touched = ?,
               resolved_by_artifact_entry_id = ?,
               unresolved_rumination_ticks = 0, last_ruminated_at = NULL,
+              consecutive_refusals = 0, last_rumination_attempt_outcome = NULL,
+              last_rumination_attempt_at = NULL, refusal_backoff_until = NULL,
               record_version = record_version + 1
           WHERE id = ? AND record_version = ?
         `,
@@ -2070,6 +2205,10 @@ export class OpenQuestionsRepository {
       last_touched: resolvedAt,
       unresolved_rumination_ticks: 0,
       last_ruminated_at: null,
+      consecutive_refusals: 0,
+      last_rumination_attempt_outcome: null,
+      last_rumination_attempt_at: null,
+      refusal_backoff_until: null,
     };
 
     this.scheduleQuestionVectorUpsert(resolved, "metadata_sync", {
@@ -2096,8 +2235,7 @@ export class OpenQuestionsRepository {
 
     const abandonedAt = this.clock.now();
     const expectedVersion = expectedRecordVersion(existing, options);
-    // Rumination counters describe the active open lifecycle. Terminal states
-    // keep their own timestamps/events, so reset the active-loop metadata.
+    // Preserve the counter and last pass that explain the abandonment decision.
     const result = this.db
       .prepare(
         `
@@ -2106,7 +2244,6 @@ export class OpenQuestionsRepository {
               resolution_evidence_episode_ids = '[]', resolution_evidence_stream_entry_ids = '[]',
               resolution_disclosure_label = ?, resolution_note = NULL, resolved_at = NULL, last_touched = ?,
               resolved_by_artifact_entry_id = NULL,
-              unresolved_rumination_ticks = 0, last_ruminated_at = NULL,
               record_version = record_version + 1
           WHERE id = ? AND record_version = ?
         `,
@@ -2139,8 +2276,6 @@ export class OpenQuestionsRepository {
       abandoned_at: abandonedAt,
       resolved_by_artifact_entry_id: null,
       last_touched: abandonedAt,
-      unresolved_rumination_ticks: 0,
-      last_ruminated_at: null,
     };
 
     this.scheduleQuestionVectorUpsert(abandoned, "metadata_sync", {
@@ -2289,6 +2424,85 @@ export class OpenQuestionsRepository {
     return updated;
   }
 
+  // Separate from deliberation stamps: a provider refusal is not a no-traction tick.
+  recordRuminationAttemptForRun(
+    input: {
+      open_question_id: OpenQuestionId;
+      source_run_id: MaintenanceRunId;
+      outcome: "completed" | "refused";
+      attempted_at: number;
+      maxConsecutiveRefusals: number;
+      refusalBackoffMs: number;
+    },
+    options: IdentityCasOptions = {},
+  ): { question: OpenQuestion; recorded: boolean } {
+    const id = openQuestionIdSchema.parse(input.open_question_id);
+    const runId = maintenanceRunIdSchema.parse(input.source_run_id);
+    const outcome = z.enum(["completed", "refused"]).parse(input.outcome);
+    const attemptedAt = z.number().finite().parse(input.attempted_at);
+    const threshold = z.number().int().positive().parse(input.maxConsecutiveRefusals);
+    const backoffMs = z.number().positive().parse(input.refusalBackoffMs);
+    return this.db.transaction(() => {
+      const existing = this.get(id);
+      if (existing === null) {
+        throw new StorageError(`Unknown open question id: ${id}`, {
+          code: "OPEN_QUESTION_NOT_FOUND",
+        });
+      }
+      if (
+        this.db
+          .prepare(
+            `
+              SELECT 1 FROM open_question_rumination_attempts
+              WHERE open_question_id = ? AND source_run_id = ?
+            `,
+          )
+          .get(id, runId) !== undefined
+      ) {
+        return { question: existing, recorded: false };
+      }
+      const expectedVersion = expectedRecordVersion(existing, options);
+      const streak = outcome === "refused" ? existing.consecutive_refusals + 1 : 0;
+      const until = outcome === "refused" && streak >= threshold ? attemptedAt + backoffMs : null;
+      const result = this.db
+        .prepare(
+          `
+            UPDATE open_questions
+            SET consecutive_refusals = ?, last_rumination_attempt_outcome = ?,
+                last_rumination_attempt_at = ?, refusal_backoff_until = ?,
+                record_version = record_version + 1
+            WHERE id = ? AND record_version = ?
+          `,
+        )
+        .run(streak, outcome, attemptedAt, until, id, expectedVersion);
+      assertIdentityCasUpdated({
+        result,
+        recordType: "open_question",
+        recordId: id,
+        expectedVersion,
+      });
+      this.db
+        .prepare(
+          `
+            INSERT INTO open_question_rumination_attempts
+              (open_question_id, source_run_id, attempted_at, outcome)
+            VALUES (?, ?, ?, ?)
+          `,
+        )
+        .run(id, runId, attemptedAt, outcome);
+      const question: OpenQuestion = {
+        ...existing,
+        record_version: nextRecordVersion(expectedVersion),
+        consecutive_refusals: streak,
+        last_rumination_attempt_outcome: outcome,
+        last_rumination_attempt_at: attemptedAt,
+        refusal_backoff_until: until,
+      };
+      this.scheduleQuestionVectorUpsert(question, "metadata_sync", { skipIfMissing: true });
+      return { question, recorded: true };
+    })();
+  }
+
   stampRuminationForRun(
     input: OpenQuestionRuminationRunStampInput,
     options: IdentityCasOptions = {},
@@ -2428,6 +2642,8 @@ export class OpenQuestionsRepository {
               resolved_at = NULL, abandoned_reason = NULL, abandoned_at = NULL,
               resolved_by_artifact_entry_id = NULL,
               unresolved_rumination_ticks = 0, last_ruminated_at = NULL,
+              consecutive_refusals = 0, last_rumination_attempt_outcome = NULL,
+              last_rumination_attempt_at = NULL, refusal_backoff_until = NULL,
               record_version = record_version + 1
           WHERE id = ? AND record_version = ?
         `,
@@ -2462,6 +2678,10 @@ export class OpenQuestionsRepository {
       resolved_by_artifact_entry_id: null,
       unresolved_rumination_ticks: 0,
       last_ruminated_at: null,
+      consecutive_refusals: 0,
+      last_rumination_attempt_outcome: null,
+      last_rumination_attempt_at: null,
+      refusal_backoff_until: null,
     };
 
     this.scheduleQuestionVectorUpsert(reopened, "update");

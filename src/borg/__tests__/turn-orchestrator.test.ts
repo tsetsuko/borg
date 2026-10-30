@@ -138,7 +138,6 @@ function createNoCorrectivePreferenceResponse() {
           directive_family: null,
           closure_pressure_relevance: null,
           priority: null,
-          reason: "No durable correction detected.",
           confidence: 0,
           supersedes_commitment_id: null,
           directive_target: null,
@@ -369,7 +368,7 @@ describe("Borg", () => {
       expect(result.retrievedEpisodeIds).toEqual(["ep_aaaaaaaaaaaaaaaa"]);
       expect(result.intents).toEqual([expectedIntent]);
       expect(borg.workmem.load().turn_counter).toBe(1);
-      expect(borg.workmem.load().pending_actions).toEqual([
+      expect(borg.workmem.load().pending_actions).toMatchObject([
         {
           ...expectedIntent,
           created_at: 1_000,

@@ -26,7 +26,8 @@ type TerminalEntryIndex = Pick<
   | "lookupMany"
   | "lookupSessionEntriesByKind"
   | "lookupSessionStreamBacklogResponseStamps"
->;
+> &
+  Partial<Pick<StreamEntryIndexRepository, "annotateFrameAnomalies">>;
 
 export type HydratedStreamBacklogBatch = {
   sourceEntries: readonly StreamEntry[];
@@ -78,7 +79,7 @@ export type BacklogTerminalServiceOptions = {
   createStreamWriter: (sessionId: SessionId) => Pick<StreamWriter, "append" | "close">;
   coordinator: ChatResponseWatermarkCoordinator;
   streamIngestionCoordinator?: Pick<StreamIngestionCoordinator, "ingest">;
-  onTerminalCommitted?: (terminalEntry: StreamEntry) => void;
+  onTerminalCommitted?: (terminalEntry: StreamEntry, details?: { sealed: boolean }) => void;
 };
 
 function requiredEntryIndex(record: StreamEntryIndexRecord, code: string): number {
@@ -514,6 +515,7 @@ export class BacklogTerminalService {
       dataDir: this.options.dataDir,
       sessionId: input.sessionId,
       byteOffset: terminalRecord.byte_offset,
+      entryIndex: this.options.entryIndex,
     });
     if (terminalEntry?.response_to?.kind !== "stream_backlog") {
       return { status: "pending" };
@@ -583,7 +585,7 @@ export class BacklogTerminalService {
     } finally {
       if (terminalEntry !== undefined) {
         try {
-          this.options.onTerminalCommitted?.(terminalEntry);
+          this.options.onTerminalCommitted?.(terminalEntry, { sealed: !exactIngestion });
         } catch (error) {
           console.error("Backlog terminal commit observer failed", error);
         }

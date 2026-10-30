@@ -74,7 +74,6 @@ function correctivePreferenceResponse(
           directive_family: input.directiveFamily ?? "separate_trip_tasks",
           closure_pressure_relevance: "neutral",
           priority: 8,
-          reason: "The current speaker made a durable correction.",
           confidence: 0.91,
           supersedes_commitment_id: input.supersedesCommitmentId ?? null,
           directive_target: "self",
@@ -88,11 +87,7 @@ function correctivePreferenceResponse(
   };
 }
 
-function retireCommitmentResponse(input: {
-  commitmentId: CommitmentId;
-  reason?: string;
-  confidence?: number;
-}) {
+function retireCommitmentResponse(input: { commitmentId: CommitmentId; confidence?: number }) {
   return {
     text: "",
     input_tokens: 6,
@@ -113,7 +108,6 @@ function retireCommitmentResponse(input: {
           directive_family: null,
           closure_pressure_relevance: null,
           priority: null,
-          reason: input.reason ?? "The model judged the active commitment no longer applicable.",
           confidence: input.confidence ?? 0.91,
           supersedes_commitment_id: null,
           directive_target: null,
@@ -425,7 +419,7 @@ describe("CorrectivePreferenceTurnService", () => {
     ]);
   });
 
-  it("keeps batch provenance and no committer when no directive source is named", async () => {
+  it("keeps batch provenance and no committer when the batch senders disagree", async () => {
     const firstEntryId = createStreamEntryId();
     const secondEntryId = createStreamEntryId();
     const llm = new FakeLLMClient({ responses: [correctivePreferenceResponse()] });
@@ -468,6 +462,96 @@ describe("CorrectivePreferenceTurnService", () => {
     expect(result.commitment).toMatchObject({
       committed_by_entity_id: null,
       source_stream_entry_ids: [firstEntryId, secondEntryId],
+    });
+  });
+
+  it("resolves the committer from the stored batch when no directive source is named", async () => {
+    const firstEntryId = createStreamEntryId();
+    const secondEntryId = createStreamEntryId();
+    const sender = createEntityId();
+    const llm = new FakeLLMClient({ responses: [correctivePreferenceResponse()] });
+    const service = new CorrectivePreferenceTurnService({
+      model: "haiku",
+      commitmentRepository: {
+        get: () => null,
+        getApplicable: () => [],
+        revoke: vi.fn(),
+        supersede: vi.fn(),
+      },
+      identityService: { addCommitment: vi.fn() },
+      relationalSlotRepository: { list: () => [], applyNegation: vi.fn() },
+      workingMemoryStore: {
+        load: () => createWorkingMemory(DEFAULT_SESSION_ID, 2_000),
+        sanitizePendingActionsForRelationalSlot: vi.fn(),
+      },
+      clock: new FixedClock(2_000),
+      tracer: { enabled: false, includePayloads: false, emit: vi.fn() },
+    });
+
+    const result = await service.extractAndApply({
+      llmClient: llm,
+      turnId: "turn-unnamed-source-single-sender",
+      ...defaultCorrectiveTurnContext,
+      userMessage: "<inbound_batch>...</inbound_batch>",
+      sourceUserEntryIds: [firstEntryId, secondEntryId],
+      senderAttribution: [
+        { entryId: firstEntryId, senderEntityId: sender },
+        { entryId: secondEntryId, senderEntityId: sender },
+      ],
+      recentHistory: [],
+      audienceEntityId: createEntityId(),
+      committedByEntityId: null,
+      sessionId: DEFAULT_SESSION_ID,
+      onHookFailure: vi.fn(),
+      trackAppliedSlotNegation: vi.fn(),
+    });
+
+    expect(result.commitment).toMatchObject({
+      committed_by_entity_id: sender,
+      source_stream_entry_ids: [firstEntryId, secondEntryId],
+    });
+  });
+
+  it("resolves the committer from the persisted entry when the turn carries no batch", async () => {
+    const userEntryId = createStreamEntryId();
+    const sender = createEntityId();
+    const llm = new FakeLLMClient({ responses: [correctivePreferenceResponse()] });
+    const service = new CorrectivePreferenceTurnService({
+      model: "haiku",
+      commitmentRepository: {
+        get: () => null,
+        getApplicable: () => [],
+        revoke: vi.fn(),
+        supersede: vi.fn(),
+      },
+      identityService: { addCommitment: vi.fn() },
+      relationalSlotRepository: { list: () => [], applyNegation: vi.fn() },
+      workingMemoryStore: {
+        load: () => createWorkingMemory(DEFAULT_SESSION_ID, 2_000),
+        sanitizePendingActionsForRelationalSlot: vi.fn(),
+      },
+      clock: new FixedClock(2_000),
+      tracer: { enabled: false, includePayloads: false, emit: vi.fn() },
+    });
+
+    const result = await service.extractAndApply({
+      llmClient: llm,
+      turnId: "turn-unnamed-source-persisted-entry",
+      ...defaultCorrectiveTurnContext,
+      userMessage: "Keep my trip tasks out of the channel.",
+      persistedUserEntryId: userEntryId,
+      senderAttribution: [{ entryId: userEntryId, senderEntityId: sender }],
+      recentHistory: [],
+      audienceEntityId: createEntityId(),
+      committedByEntityId: null,
+      sessionId: DEFAULT_SESSION_ID,
+      onHookFailure: vi.fn(),
+      trackAppliedSlotNegation: vi.fn(),
+    });
+
+    expect(result.commitment).toMatchObject({
+      committed_by_entity_id: sender,
+      source_stream_entry_ids: [userEntryId],
     });
   });
 
@@ -1348,7 +1432,6 @@ describe("CorrectivePreferenceTurnService", () => {
       responses: [
         retireCommitmentResponse({
           commitmentId: retiredId,
-          reason: "The temporary audience boundary is resolved.",
         }),
       ],
     });
@@ -1369,13 +1452,13 @@ describe("CorrectivePreferenceTurnService", () => {
     expect(result.commitmentRetirement).toMatchObject({
       retiredId,
       allowedActiveCommitmentIds: [retiredId],
-      reason: "The temporary audience boundary is resolved.",
+      reason: "retired_by_corrective_preference",
       confidence: 0.91,
     });
     expect(addCommitment).not.toHaveBeenCalled();
     expect(revoke).toHaveBeenCalledWith(
       retiredId,
-      "The temporary audience boundary is resolved.",
+      "retired_by_corrective_preference",
       {
         kind: "online",
         process: "corrective-preference-extractor",
@@ -1450,7 +1533,7 @@ describe("CorrectivePreferenceTurnService", () => {
 
     expect(revoke).toHaveBeenCalledWith(
       retiredId,
-      "The model judged the active commitment no longer applicable.",
+      "retired_by_corrective_preference",
       {
         kind: "online",
         process: "corrective-preference-extractor",
@@ -1630,7 +1713,7 @@ describe("CorrectivePreferenceTurnService", () => {
 
     expect(revoke).toHaveBeenCalledWith(
       retiredId,
-      "The model judged the active commitment no longer applicable.",
+      "retired_by_corrective_preference",
       {
         kind: "online",
         process: "corrective-preference-extractor",

@@ -1,9 +1,11 @@
 import type { EmbeddingProfile } from "./bank-profile.js";
+import type { EmbeddingProvider } from "../config/embedding-provider.js";
 import OpenAI from "openai";
 
 import { sleep } from "../util/clock.js";
 import { ConfigError, EmbeddingError } from "../util/errors.js";
 import { toWellFormedUtf16 } from "../util/utf16-boundary.js";
+import { utf8SafePrefix } from "../util/utf8-boundary.js";
 
 type OpenAIEmbeddingsClient = {
   embeddings: {
@@ -11,6 +13,7 @@ type OpenAIEmbeddingsClient = {
       input: string | string[];
       model: string;
       encoding_format?: "float" | "base64";
+      provider?: EmbeddingProvider;
     }): Promise<{
       data: Array<{
         embedding: number[];
@@ -20,9 +23,17 @@ type OpenAIEmbeddingsClient = {
   };
 };
 
+export type EmbeddingClientStats = {
+  /** Inputs shortened for transport; in-place retries reuse the prepared input. */
+  input_truncations: number;
+};
+
 export type EmbeddingClient = {
+  /** Effective transport cap; wrappers must preserve it for bounded scoring text. */
+  readonly maxInputBytes?: number | undefined;
   /** Required when injecting into Borg.open; wrappers must preserve this identity. */
   readonly profile?: EmbeddingProfile;
+  stats?(): EmbeddingClientStats;
   embed(text: string): Promise<Float32Array>;
   embedBatch(texts: readonly string[]): Promise<Float32Array[]>;
 };
@@ -35,6 +46,8 @@ export type OpenAICompatibleEmbeddingClientOptions = {
   client?: OpenAIEmbeddingsClient;
   modelReloadRetryDelaysMs?: readonly number[];
   maxBatchSize?: number;
+  maxInputBytes?: number;
+  provider?: EmbeddingProvider;
 };
 
 const DEFAULT_MODEL_RELOAD_RETRY_DELAYS_MS: readonly number[] = [1000, 4000, 10_000];
@@ -160,6 +173,9 @@ export class OpenAICompatibleEmbeddingClient implements EmbeddingClient {
   private readonly dims: number;
   private readonly modelReloadRetryDelaysMs: readonly number[];
   private readonly maxBatchSize: number;
+  readonly maxInputBytes: number | undefined;
+  private inputTruncations = 0;
+  private readonly provider: EmbeddingProvider | undefined;
 
   constructor(options: OpenAICompatibleEmbeddingClientOptions) {
     if (!Number.isInteger(options.dims) || options.dims <= 0) {
@@ -189,6 +205,7 @@ export class OpenAICompatibleEmbeddingClient implements EmbeddingClient {
 
     this.model = options.model;
     this.dims = options.dims;
+    this.provider = options.provider;
     this.modelReloadRetryDelaysMs =
       options.modelReloadRetryDelaysMs ?? DEFAULT_MODEL_RELOAD_RETRY_DELAYS_MS;
 
@@ -197,10 +214,37 @@ export class OpenAICompatibleEmbeddingClient implements EmbeddingClient {
       throw new ConfigError("Embedding max batch size must be a positive integer");
     }
     this.maxBatchSize = requestedBatchSize;
+
+    if (
+      options.maxInputBytes !== undefined &&
+      (!Number.isSafeInteger(options.maxInputBytes) || options.maxInputBytes <= 0)
+    ) {
+      throw new ConfigError("Embedding max input bytes must be a positive integer");
+    }
+    this.maxInputBytes = options.maxInputBytes;
   }
 
   get profile(): EmbeddingProfile {
     return { model: this.model, dimensions: this.dims };
+  }
+
+  stats(): EmbeddingClientStats {
+    return { input_truncations: this.inputTruncations };
+  }
+
+  private prepareInput(text: string): string {
+    // Repair first: a replacement character occupies three UTF-8 bytes. Only
+    // the transport copy is shortened; callers retain their original text.
+    const wellFormed = toWellFormedUtf16(text);
+    if (
+      this.maxInputBytes === undefined ||
+      Buffer.byteLength(wellFormed, "utf8") <= this.maxInputBytes
+    ) {
+      return wellFormed;
+    }
+
+    this.inputTruncations += 1;
+    return utf8SafePrefix(wellFormed, this.maxInputBytes);
   }
 
   async embed(text: string): Promise<Float32Array> {
@@ -275,7 +319,7 @@ export class OpenAICompatibleEmbeddingClient implements EmbeddingClient {
     // The gateway rejects a body with a lone surrogate for the WHOLE batch, and
     // reports it as "No model field." (prod, 2026-09-09). Callers are expected to
     // cut text on code-point boundaries; this is the last line of defence.
-    const wellFormed = texts.map(toWellFormedUtf16);
+    const wellFormed = texts.map((text) => this.prepareInput(text));
     const singleInput = wellFormed[0];
     const params = {
       input: wellFormed.length === 1 && singleInput !== undefined ? singleInput : wellFormed,
@@ -287,6 +331,7 @@ export class OpenAICompatibleEmbeddingClient implements EmbeddingClient {
       // silently returns a truncated, all-zero Float32Array. Asking for
       // "float" explicitly bypasses the client-side decode.
       encoding_format: "float" as const,
+      ...(this.provider === undefined ? {} : { provider: this.provider }),
     };
 
     const maxAttempts = this.modelReloadRetryDelaysMs.length;

@@ -251,7 +251,7 @@ function nodeToRow(node: SemanticNode): SemanticNodeRow {
   };
 }
 
-function nodeFromRow(row: Record<string, unknown>): SemanticNode {
+export function nodeFromRow(row: Record<string, unknown>): SemanticNode {
   const parsed = semanticNodeSchema.safeParse({
     id: row.id,
     kind: row.kind,
@@ -333,7 +333,7 @@ function sqlOnlyFieldsFromRow(row: SemanticNodeSqlOnlyRow): SemanticNodeSqlOnlyF
   return parsed.data;
 }
 
-function edgeFromRow(row: Record<string, unknown>): SemanticEdge {
+export function edgeFromRow(row: Record<string, unknown>): SemanticEdge {
   const parsed = semanticEdgeSchema.safeParse({
     id: row.id,
     from_node_id: row.from_node_id,
@@ -525,12 +525,12 @@ export class SemanticNodeRepository {
         });
   }
 
-  private enqueueVectorSyncRow(input: {
+  enqueueVectorSyncRow(input: {
     nodeId: SemanticNodeId;
     reason?: string;
     createdAt: number;
   }): void {
-    this.db
+    const result = this.db
       .prepare(
         `
           INSERT INTO semantic_node_vector_sync_outbox (
@@ -546,6 +546,10 @@ export class SemanticNodeRepository {
         `,
       )
       .run(input.nodeId, normalizeOutboxReason(input.reason), input.createdAt);
+    if (result.changes !== 1)
+      throw new SemanticError("Vector outbox enqueue changed unexpectedly", {
+        code: "SEMANTIC_VECTOR_SYNC_FAILED",
+      });
   }
 
   private enqueueVectorSyncRowForResync(nodeId: SemanticNodeId, reason: string): void {
@@ -1761,7 +1765,7 @@ export class SemanticEdgeRepository {
       valid_from: Math.min(current.valid_from, parsed.valid_from ?? now),
     });
 
-    this.db
+    const result = this.db
       .prepare(
         `
           UPDATE semantic_edges
@@ -1780,6 +1784,10 @@ export class SemanticEdgeRepository {
         merged.id,
       );
 
+    if (result.changes !== 1)
+      throw new SemanticError("Open edge changed during evidence merge", {
+        code: "SEMANTIC_EDGE_NOT_FOUND",
+      });
     return merged;
   }
 

@@ -5,6 +5,7 @@ import { getSessionStreamPath } from "./path.js";
 import { streamEntryReadSchema, type SessionId, type StreamEntry } from "./types.js";
 import type { StreamReader } from "./stream-reader.js";
 import type { StreamEntryId } from "../util/ids.js";
+import { StreamFrameAnomalyReader } from "./frame-anomaly.js";
 
 const INDEXED_STREAM_ENTRY_READ_CHUNK_SIZE_BYTES = 64 * 1024;
 const NEWLINE_BYTE = 0x0a;
@@ -13,7 +14,8 @@ export type HydrateStreamEntriesByIdInput = {
   dataDir: string;
   sessionId: SessionId;
   streamEntryIds: readonly StreamEntryId[];
-  entryIndex?: Pick<StreamEntryIndexRepository, "lookupMany">;
+  entryIndex?: Pick<StreamEntryIndexRepository, "lookupMany"> &
+    Partial<Pick<StreamEntryIndexRepository, "resolveEntityReferences" | "annotateFrameAnomalies">>;
   createStreamReader?: (sessionId: SessionId) => StreamReader;
   fallbackSessionIds?: readonly SessionId[];
   budgetMs?: number;
@@ -26,6 +28,7 @@ export function readStreamEntryAtOffset(input: {
   dataDir: string;
   sessionId: SessionId;
   byteOffset: number;
+  entryIndex?: Partial<Pick<StreamEntryIndexRepository, "annotateFrameAnomalies">>;
 }): StreamEntry | null {
   const streamPath = getSessionStreamPath(input.dataDir, input.sessionId);
 
@@ -80,13 +83,20 @@ export function readStreamEntryAtOffset(input: {
     return null;
   }
 
+  let entry: StreamEntry;
   try {
     const raw = JSON.parse(line) as unknown;
     const parsed = streamEntryReadSchema.safeParse(raw);
-    return parsed.success ? parsed.data : null;
+    if (!parsed.success) return null;
+    entry = parsed.data;
   } catch {
     return null;
   }
+  // Projection failure is an index/read incident, not a missing citation.
+  return (
+    input.entryIndex?.annotateFrameAnomalies?.(entry) ??
+    new StreamFrameAnomalyReader().annotate(entry, streamPath)
+  );
 }
 
 export async function hydrateStreamEntriesById(
@@ -125,6 +135,7 @@ export async function hydrateStreamEntriesById(
         dataDir: input.dataDir,
         sessionId: record.session_id,
         byteOffset: record.byte_offset,
+        entryIndex: input.entryIndex,
       });
 
       if (!hasBudget()) {
@@ -135,7 +146,7 @@ export async function hydrateStreamEntriesById(
         continue;
       }
 
-      entries.set(streamEntryId, entry);
+      entries.set(streamEntryId, input.entryIndex?.resolveEntityReferences?.(entry) ?? entry);
       pendingIds.delete(streamEntryId);
     }
   }

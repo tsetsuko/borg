@@ -11,6 +11,8 @@ import { dedupePreservingOrder } from "../../util/collections.js";
 import type { CommitmentId, EntityId, GoalId, SessionId, StreamEntryId } from "../../util/ids.js";
 import {
   memoryDisclosureLabelMetadata,
+  relationshipPrivateMemoryDisclosureLabel,
+  selfPrivateMemoryDisclosureLabel,
   type MemoryDisclosureLabel,
   type MemoryDisclosureLabelMetadata,
 } from "./disclosure-label.js";
@@ -33,7 +35,8 @@ export type DisclosureResolvedGoalTreeNode = DisclosureResolvedGoal & {
 
 export type SourceStreamAudienceDisclosureResolverOptions = {
   dataDir: string;
-  entryIndex: Pick<StreamEntryIndexRepository, "lookupMany">;
+  entryIndex: Pick<StreamEntryIndexRepository, "lookupMany"> &
+    Partial<Pick<StreamEntryIndexRepository, "annotateFrameAnomalies">>;
   sessionsRepository: Pick<SessionsRepository, "getMany">;
   entityRepository: Pick<EntityRepository, "findByNames">;
 };
@@ -162,6 +165,19 @@ function labelWithResolvedOrigin(
 export class SourceStreamAudienceDisclosureResolver {
   constructor(private readonly options: SourceStreamAudienceDisclosureResolverOptions) {}
 
+  resolveStreamEntryLabel(entry: StreamEntry): MemoryDisclosureLabel {
+    const audienceId =
+      entry.audience === undefined
+        ? this.options.sessionsRepository.getMany([entry.session_id])[0]?.audience_entity_id
+        : this.options.entityRepository.findByNames([entry.audience]).get(entry.audience);
+    const origin = audienceId == null ? [] : [audienceId];
+    return entry.kind === "user_msg" ||
+      entry.kind === "agent_msg" ||
+      entry.kind === "user_image_attachment"
+      ? relationshipPrivateMemoryDisclosureLabel(origin)
+      : selfPrivateMemoryDisclosureLabel(origin);
+  }
+
   resolveLabels(
     input: ResolveCommitmentGoalDisclosureLabelsInput,
   ): ResolvedCommitmentGoalDisclosureLabels {
@@ -184,6 +200,7 @@ export class SourceStreamAudienceDisclosureResolver {
         dataDir: this.options.dataDir,
         sessionId: indexRecord.session_id,
         byteOffset: indexRecord.byte_offset,
+        entryIndex: this.options.entryIndex,
       });
       if (entry?.id !== sourceStreamEntryId || entry.session_id !== indexRecord.session_id) {
         continue;

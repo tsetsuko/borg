@@ -1,4 +1,8 @@
 import { similarityConfigSchema, similarityValuesSchema } from "./similarity.js";
+import { DEFAULT_RAW_QUERY_MAX_BYTES } from "../retrieval/raw-query.js";
+import { AUTONOMY_WAKE_SOURCE_NAMES } from "../autonomy/types.js";
+import { embeddingProviderSchema, readEmbeddingProviderEnv } from "./embedding-provider.js";
+import { embeddingMaxInputBytesSchema, readEmbeddingMaxInputBytesEnv } from "./embedding-input.js";
 export {
   similarityThresholds,
   logSimilarityProfile,
@@ -38,6 +42,7 @@ import { readJsonFile } from "../util/atomic-write.js";
 import { ConfigError } from "../util/errors.js";
 import { isNodeError, isPlainRecord } from "../util/guards.js";
 import { expandPath } from "../util/path.js";
+import { positiveIntegerValue } from "../util/parse.js";
 
 const DEFAULT_DATA_DIR = "~/.borg";
 export const DEFAULT_ACTIVE_PARTICIPANT_LIMIT = 8;
@@ -241,12 +246,13 @@ const evidenceLedgerConfigSchema = z
 const cognitionThinkingConfigSchema = z
   .object({
     enabled: z.boolean().default(false),
-    // "adaptive" (Opus 4.6+/Sonnet 4.6; the only supported mode on Opus 4.7/4.8)
+    // "adaptive" (Opus 4.6+/Sonnet 4.6; always on for Opus 5.5)
     // lets the model decide thinking depth and uses `effort`; "enabled" is the
     // deprecated manual budget_tokens mode for older models.
     mode: z.enum(["adaptive", "enabled"]).default("adaptive"),
-    // Adaptive-thinking effort -- soft depth guidance. Default "high" (the API's
-    // adaptive default: deep reasoning, bounded). NOTE: "max" is intentionally NOT
+    // Adaptive-thinking effort -- Borg keeps "high" for cognition and explicitly
+    // defaults all omitted request effort to high (the Opus 5.5 API default is
+    // medium). NOTE: "max" is intentionally NOT
     // the default -- empirically it thinks without bound and exhausts max_tokens
     // before emitting a tool, stalling the turn; use "high"/"xhigh" for deep
     // thinking that still emits.
@@ -351,11 +357,31 @@ const postGenerationGuardsConfigSchema = z
   .strict()
   .prefault({});
 const maintenanceProcessSchema = z.enum(OFFLINE_PROCESS_NAMES);
+const maintenanceProcessOverridesSchema = z
+  .partialRecord(
+    maintenanceProcessSchema,
+    z
+      .object({
+        budget: z.number().int().positive().optional(),
+        params: z.record(z.string(), z.unknown()).optional(),
+      })
+      .strict(),
+  )
+  .superRefine((overrides, context) => {
+    const maxItemsPerPass = overrides["review-resolver"]?.params?.maxItemsPerPass;
+    if (maxItemsPerPass !== undefined && positiveIntegerValue(maxItemsPerPass) === null) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Review resolver maxItemsPerPass must be a positive integer",
+        path: ["review-resolver", "params", "maxItemsPerPass"],
+      });
+    }
+  });
 
 export type PostGenerationGuardMode = z.infer<typeof postGenerationGuardModeSchema>;
 const anthropicModelsConfigSchema = z
   .object({
-    // Cognition defaults to Opus 4.8; extraction/background stay on Opus 5.
+    // The main cognition/extraction/background slots default to Opus 5.5.
     // Recall expansion is a small structured fanout task and has its own
     // Haiku slot so it can stay fast without reusing background.
     // Creator-directive extraction is a nuanced semantic classification
@@ -363,10 +389,13 @@ const anthropicModelsConfigSchema = z
     // under-emits; it gets its own Sonnet slot -- stronger than the recall
     // Haiku, cheaper than the Opus cognition slot -- and only fires on
     // creator-in-operator turns, so the cost is bounded.
-    cognition: z.string().min(1).default("claude-opus-4-8"),
-    background: z.string().min(1).default("claude-opus-5"),
-    extraction: z.string().min(1).default("claude-opus-5"),
+    cognition: z.string().min(1).default("claude-opus-5-5"),
+    background: z.string().min(1).default("claude-opus-5-5"),
+    extraction: z.string().min(1).default("claude-opus-5-5"),
     recallExpansion: z.string().min(1).default("claude-haiku-4-5-20251001"),
+    // Action-state (including post-generation closes) and goal-promotion extraction.
+    // Resolve at the consumer so an omitted slot follows the configured recall model.
+    preTurnExtraction: z.string().min(1).optional(),
     // Corrective preferences need careful interpretation of participant restrictions.
     correctivePreference: z.string().min(1).default("claude-sonnet-5"),
     // Shared-state compilation must distinguish corrections and decisions from completed acts.
@@ -435,6 +464,10 @@ const configBaseSchema = z.object({
       apiKey: z.string().min(1).default("lm-studio"),
       model: z.string().min(1).default("text-embedding-qwen3-embedding-8b"),
       dims: z.number().int().positive().default(4096),
+      provider: embeddingProviderSchema.optional(),
+      // Qwen3 uses byte-level BPE: tokens <= UTF-8 bytes, so 32000 bytes fits
+      // every provider in any language. A character cap cannot guarantee this.
+      maxInputBytes: embeddingMaxInputBytesSchema.optional(),
       // Largest array sent to the embeddings endpoint in one request. Local
       // inference servers fail hard rather than degrade on big batches -- an 8B
       // model under LM Studio returned `400 "Model has unloaded or crashed."`
@@ -458,6 +491,9 @@ const configBaseSchema = z.object({
   retrieval: z
     .object({
       semanticOverfetchMultiplier: z.number().int().min(1).max(10).default(3),
+      // Keep the raw recall vector focused on recent input; bytes work in every
+      // language. 6 KiB leaves room for several messages below the transport cap.
+      rawQueryMaxBytes: z.number().int().positive().default(DEFAULT_RAW_QUERY_MAX_BYTES),
       // Hard cap for the recall-expansion LLM call (ms); recall degrades to
       // raw-query intents on timeout. 0 disables the cap. Sized so expansion
       // (2000) plus a double-stalled query embedding (2x1000) plus local
@@ -708,6 +744,8 @@ const configBaseSchema = z.object({
           revisitPeriodMaxDays: z.number().positive().default(30),
           stalenessDays: z.number().positive().default(30),
           staleNoTractionTicks: z.number().int().positive().default(4),
+          maxConsecutiveRefusals: z.number().int().positive().default(3),
+          refusalBackoffDays: z.number().positive().default(7),
           // Aborted at 40k-48k against the old 40k cap on five of nine runs.
           // See the reflector budget comment for the sizing rationale.
           budget: z.number().int().positive().default(150_000),
@@ -719,6 +757,8 @@ const configBaseSchema = z.object({
           // (~204% of budget) on eight of nine runs. See the reflector budget
           // comment for the sizing rationale.
           budget: z.number().int().positive().default(500_000),
+          // Complete input estimate: system, tool schema, and observation user message.
+          maxPromptTokens: z.number().int().positive().default(250_000),
           maxObservationsPerRun: z.number().int().positive().default(4),
           minSupportEpisodes: z.number().int().positive().default(2),
           // Bound the episode evidence in one narration call. Without this the
@@ -786,11 +826,19 @@ const configBaseSchema = z.object({
       optimizeStorage: z.boolean().default(true),
       lightBudget: z.number().int().positive().nullable().default(null),
       heavyBudget: z.number().int().positive().nullable().default(null),
+      processOverrides: z
+        .object({
+          light: maintenanceProcessOverridesSchema.default({
+            "review-resolver": { params: { maxItemsPerPass: 3 } },
+          }),
+          heavy: maintenanceProcessOverridesSchema.default({}),
+        })
+        .prefault({}),
       // These cadence lists are the single authority for offline process
       // enablement. Remove a process from both lists to disable it.
       lightProcesses: z
         .array(maintenanceProcessSchema)
-        .default(["consolidator", "semantic-extractor", "curator"]),
+        .default(["consolidator", "semantic-extractor", "curator", "review-resolver"]),
       heavyProcesses: z
         .array(maintenanceProcessSchema)
         .default([
@@ -821,8 +869,14 @@ const configBaseSchema = z.object({
       // deployments once their records have matured.
       enabled: z.boolean().default(true),
       intervalMs: z.number().int().positive().default(60_000),
-      prepToolTimeoutMs: z.number().int().positive().default(30_000),
+      prepToolTimeoutMs: z.number().int().positive().default(90_000),
       maxWakesPerWindow: z.number().int().positive().default(6),
+      // No per-source cap by default. A deployment allowing 25 wakes can set
+      // maxWakesPerWindowBySource: { open_question_dormant: 12 } to retain room
+      // for other sources within the same rolling budget window.
+      maxWakesPerWindowBySource: z
+        .partialRecord(z.enum(AUTONOMY_WAKE_SOURCE_NAMES), z.number().int().positive())
+        .default({}),
       goalWakeBatchMax: z.number().int().positive().default(5),
       budgetWindowMs: z.number().int().positive().default(86_400_000),
       reservedContemplativeWakesPerWindow: z.number().int().nonnegative().default(1),
@@ -981,16 +1035,6 @@ export const configSchema = configOutputSchema.superRefine((value, context) => {
         path: ["maintenance", `${cadence}Processes`],
       });
     }
-  }
-
-  const heavyProcesses = new Set(value.maintenance.heavyProcesses);
-  const overlap = value.maintenance.lightProcesses.filter((process) => heavyProcesses.has(process));
-  if (overlap.length > 0) {
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: `Maintenance light/heavy process lists must be disjoint: ${overlap.join(", ")}`,
-      path: ["maintenance", "heavyProcesses"],
-    });
   }
 
   if (value.offline.ruminator.revisitPeriodMinDays > value.offline.ruminator.revisitPeriodMaxDays) {
@@ -1326,6 +1370,8 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     ["embedding", "dims"],
     readOptionalEnvNumber(env, "BORG_EMBEDDING_DIMS"),
   );
+  setConfigOverride(overrides, ["embedding", "provider"], readEmbeddingProviderEnv(env));
+  setConfigOverride(overrides, ["embedding", "maxInputBytes"], readEmbeddingMaxInputBytesEnv(env));
   setConfigOverride(
     overrides,
     ["anthropic", "auth"],
@@ -1355,6 +1401,11 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["anthropic", "models", "recallExpansion"],
     readOptionalEnvString(env, "BORG_MODEL_RECALL_EXPANSION"),
+  );
+  setConfigOverride(
+    overrides,
+    ["anthropic", "models", "preTurnExtraction"],
+    readOptionalEnvString(env, "BORG_MODEL_PRE_TURN_EXTRACTION"),
   );
   setConfigOverride(
     overrides,
@@ -1470,6 +1521,11 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["retrieval", "lexicalFusion", "enabled"],
     readOptionalEnvBoolean(env, "BORG_RETRIEVAL_LEXICAL_FUSION_ENABLED"),
+  );
+  setConfigOverride(
+    overrides,
+    ["retrieval", "rawQueryMaxBytes"],
+    readOptionalEnvNumber(env, "BORG_RETRIEVAL_RAW_QUERY_MAX_BYTES"),
   );
   setConfigOverride(
     overrides,
@@ -1923,6 +1979,16 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
   );
   setConfigOverride(
     overrides,
+    ["offline", "ruminator", "maxConsecutiveRefusals"],
+    readOptionalEnvNumber(env, "BORG_OFFLINE_RUMINATOR_MAX_CONSECUTIVE_REFUSALS"),
+  );
+  setConfigOverride(
+    overrides,
+    ["offline", "ruminator", "refusalBackoffDays"],
+    readOptionalEnvFloat(env, "BORG_OFFLINE_RUMINATOR_REFUSAL_BACKOFF_DAYS"),
+  );
+  setConfigOverride(
+    overrides,
     ["offline", "ruminator", "resolveConfidenceThreshold"],
     readOptionalEnvFloat(env, "BORG_OFFLINE_RUMINATOR_RESOLVE_CONFIDENCE_THRESHOLD"),
   );
@@ -1963,6 +2029,11 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["offline", "selfNarrator", "budget"],
     readOptionalEnvNumber(env, "BORG_OFFLINE_SELF_NARRATOR_BUDGET"),
+  );
+  setConfigOverride(
+    overrides,
+    ["offline", "selfNarrator", "maxPromptTokens"],
+    readOptionalEnvNumber(env, "BORG_OFFLINE_SELF_NARRATOR_MAX_PROMPT_TOKENS"),
   );
   setConfigOverride(
     overrides,
@@ -2431,7 +2502,13 @@ export function loadConfig(options: LoadConfigOptions = {}): Config {
   const lookupDataDir = expandPath(options.dataDir ?? envDataDir ?? DEFAULT_DATA_DIR);
   const fileOverrides = parseConfigFile(lookupDataDir);
   const envOverrides = loadEnvOverrides(env);
-  let candidate = mergeConfigOverrides(fileOverrides, envOverrides);
+  let candidate = mergeConfigOverrides(
+    { maintenance: { processOverrides: DEFAULT_CONFIG.maintenance.processOverrides } },
+    mergeConfigOverrides(fileOverrides, envOverrides),
+  );
+  // Provider routing is opaque: the env object replaces the file object in full,
+  // so migration and live requests do not inherit different routing options.
+  setConfigOverride(candidate, ["embedding", "provider"], envOverrides.embedding?.provider);
 
   if (options.dataDir !== undefined) {
     candidate = mergeConfigOverrides(candidate, { dataDir: expandPath(options.dataDir) });
@@ -2481,6 +2558,7 @@ export function redactConfig(config: Config): Config {
     },
     retrieval: {
       semanticOverfetchMultiplier: config.retrieval.semanticOverfetchMultiplier,
+      rawQueryMaxBytes: config.retrieval.rawQueryMaxBytes,
       recallExpansionTimeoutMs: config.retrieval.recallExpansionTimeoutMs,
       recallPlannerTimeZone: config.retrieval.recallPlannerTimeZone,
       recallExpansionSemanticVariantCount: config.retrieval.recallExpansionSemanticVariantCount,

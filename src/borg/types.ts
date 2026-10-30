@@ -1,4 +1,5 @@
 import type { EmbeddingProfile } from "../embeddings/bank-profile.js";
+import type { FailureReportTracker } from "../util/failure-reports.js";
 // Shared public and internal Borg composition types used by the facade and setup modules.
 import type { AgentDeliveryRepository } from "../cognition/ingestion/agent-deliveries.js";
 import type {
@@ -22,6 +23,7 @@ import type {
   ChatResponseCatchUpLease,
   ChatResponseCatchUpWorker,
   ChatResponseCatchUpRunner,
+  ChatResponseCatchUpObserver,
   ChatResponseWatermarkCoordinator,
   MessageEnqueuer,
   StreamIngestionCoordinator,
@@ -182,6 +184,7 @@ export type BorgDependencies = {
   embeddingClient: EmbeddingClient;
   releaseEmbeddingBankAccess?: () => Promise<void>;
   pendingStartupTasks?: readonly Promise<unknown>[];
+  failureReports?: FailureReportTracker;
   tracer: TurnTracer;
   clock: Clock;
 };
@@ -236,7 +239,8 @@ export type BorgOpenOptions = {
         }) => ChatResponseCatchUpRunner);
     sessionPredicate?: (session: SessionRecord | null) => boolean;
     acquireLease?: () => ChatResponseCatchUpLease;
-    onTerminalCommitted?: (terminalEntry: StreamEntry) => void;
+    onTerminalCommitted?: (terminalEntry: StreamEntry, details?: { sealed: boolean }) => void;
+    observer?: ChatResponseCatchUpObserver;
     settleMs?: number;
     maxSettleMs?: number;
   };

@@ -748,6 +748,15 @@ export class TurnPhaseCoordinator {
         }),
       completedSub: () => "pre_turn_catchup",
     });
+    if (this.options.sessionLock !== undefined) {
+      // The orchestrator holds this session's lease throughout the turn. Recover
+      // an earlier aborted turn before taking the rollback snapshot or writing.
+      await this.options.workingMemoryStore.migratePendingActionIds(
+        sessionId,
+        this.options.sessionLock,
+        { lockedSessionId: sessionId, turnId },
+      );
+    }
     let workingMemory = this.options.workingMemoryStore.load(sessionId);
     lifecycleTracker.captureInitialWorkingMemory(workingMemory);
     const turnPerception = this.options.perceptionGateway.beginTurn({
@@ -768,9 +777,7 @@ export class TurnPhaseCoordinator {
         const resolvedAudienceEntityId =
           turnInput.audience === undefined || isSelfAudience
             ? null
-            : this.options.entityRepository.resolve(turnInput.audience, {
-                provenance: "transport_audience_label",
-              });
+            : this.options.entityRepository.resolveAudienceLabel(turnInput.audience);
         const resolvedAudienceEntity =
           resolvedAudienceEntityId === null
             ? null
@@ -1080,12 +1087,19 @@ export class TurnPhaseCoordinator {
           persistedUserEntryId,
           sourceUserEntryIds,
           streamWriter,
+          sourceUserEntries: [
+            ...new Set([
+              ...sourceUserEntries,
+              ...(persistedUserEntry == null ? [] : [persistedUserEntry]),
+            ]),
+          ],
         }),
       completedSub: summarizeFrameClassification,
     });
     const currentTurnFrameAnomaly = frameAnomalyPhase.actionableFrameAnomaly;
     if (
-      frameAnomalyPhase.disposition === "quarantine" &&
+      (frameAnomalyPhase.disposition === "quarantine" ||
+        frameAnomalyPhase.disposition === "annotate") &&
       frameAnomalyPhase.actionableFrameAnomaly !== null
     ) {
       const observedEventEmission = buildObservedEventEmission({
@@ -1377,6 +1391,7 @@ export class TurnPhaseCoordinator {
             : sourceUserEntries,
           currentTurnAttachmentIds,
           currentTurnFrameAnomaly,
+          frameAnomalyDisposition: frameAnomalyPhase.disposition,
           closureLoopAssessment,
         }),
       completedSub: summarizeRetrieval,
@@ -1467,6 +1482,7 @@ export class TurnPhaseCoordinator {
       suppressionSet,
       isUserTurn,
       currentTurnFrameAnomaly,
+      frameAnomalyDisposition: frameAnomalyPhase.disposition,
       closureLoopAssessment,
       activeParticipants,
       knownInternalIdentifiers,

@@ -1,3 +1,4 @@
+import type { EntityRepository } from "../commitments/repository.js";
 import { SqliteDatabase } from "../../storage/sqlite/index.js";
 import { SystemClock, type Clock } from "../../util/clock.js";
 import { ProvenanceError, StorageError } from "../../util/errors.js";
@@ -80,7 +81,7 @@ function parseSentimentHistory(value: string): SocialSentimentPoint[] {
   return result.data;
 }
 
-function mapProfileRow(row: Record<string, unknown>): SocialProfile {
+export function mapProfileRow(row: Record<string, unknown>): SocialProfile {
   const parsed = socialProfileSchema.safeParse({
     entity_id: row.entity_id,
     record_version: Number(row.record_version ?? 1),
@@ -116,7 +117,7 @@ function mapProfileRow(row: Record<string, unknown>): SocialProfile {
   return parsed.data;
 }
 
-function mapEventRow(row: Record<string, unknown>): SocialEvent {
+export function mapEventRow(row: Record<string, unknown>): SocialEvent {
   return socialEventSchema.parse({
     id: Number(row.id),
     entity_id: row.entity_id,
@@ -145,6 +146,7 @@ function requireProvenance(provenance: Provenance | undefined, label: string): P
 }
 
 export type SocialRepositoryOptions = {
+  entityRepository?: Pick<EntityRepository, "get">;
   db: SqliteDatabase;
   clock?: Clock;
 };
@@ -347,6 +349,7 @@ export class SocialRepository {
   }
 
   upsertProfile(entityId: EntityId): SocialProfile {
+    entityId = this.options.entityRepository?.get(entityId)?.id ?? entityId;
     const existing = this.getProfile(entityId);
 
     if (existing !== null) {
@@ -372,6 +375,7 @@ export class SocialRepository {
   }
 
   getProfile(entityId: EntityId): SocialProfile | null {
+    entityId = this.options.entityRepository?.get(entityId)?.id ?? entityId;
     const row = this.db
       .prepare("SELECT * FROM social_profiles WHERE entity_id = ?")
       .get(entityId) as Record<string, unknown> | undefined;
@@ -413,6 +417,7 @@ export class SocialRepository {
       now?: number;
     },
   ): SocialInteractionRecord {
+    entityId = this.options.entityRepository?.get(entityId)?.id ?? entityId;
     this.upsertProfile(entityId);
     const nowMs = input.now ?? this.clock.now();
     const provenance = requireProvenance(input.provenance, "Social interaction");
@@ -505,6 +510,7 @@ export class SocialRepository {
   }
 
   adjustTrust(entityId: EntityId, delta: number, provenance: Provenance): SocialProfile {
+    entityId = this.options.entityRepository?.get(entityId)?.id ?? entityId;
     this.upsertProfile(entityId);
     const parsedProvenance = requireProvenance(provenance, "Social trust adjustment");
     const storedProvenance = toStoredProvenance(parsedProvenance);
@@ -684,6 +690,7 @@ export class SocialRepository {
     entityId: EntityId,
     commitmentRepository: CommitmentRepository,
   ): SocialProfile {
+    entityId = this.options.entityRepository?.get(entityId)?.id ?? entityId;
     this.upsertProfile(entityId);
     const count = commitmentRepository
       .list({ activeOnly: true })
@@ -716,6 +723,8 @@ export class SocialRepository {
   }
 
   listEvents(entityId?: EntityId): SocialEvent[] {
+    if (entityId !== undefined)
+      entityId = this.options.entityRepository?.get(entityId)?.id ?? entityId;
     const rows =
       entityId === undefined
         ? (this.db

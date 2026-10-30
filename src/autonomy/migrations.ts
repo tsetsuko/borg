@@ -100,7 +100,8 @@ export const autonomyMigrations = [
       // Fork note: this rebuild also carries prediction_error_spike (M2) in both
       // name CHECKs. The fork first widened them in its own rebuild, which upstream's
       // rebuild here would otherwise silently narrow again. That earlier migration is
-      // kept at the end of this list under its applied name, as a no-op.
+      // kept under its applied name, as a no-op, in the fork's own prediction group
+      // (memory/predictions/migrations.ts), so the ids in this group stay upstream's.
       db.exec(`
         CREATE TABLE autonomy_wakes__next (
           id TEXT PRIMARY KEY,
@@ -202,12 +203,29 @@ export const autonomyMigrations = [
   },
   {
     id: 9,
-    name: "autonomy_wakes_prediction_error_spike",
-    up: () => {
-      // Folded into autonomy_wakes_interrupted_outcome above. Kept under its name
-      // because banks that applied it record it in _migrations, and the runner
-      // refuses an applied migration name it cannot find. On those banks the
-      // runner re-ids the row here by name; on new banks this does nothing.
+    name: "autonomy_wakes_preparation_failed",
+    up: (db) => {
+      // Only an observed preparation failure earns this flag. Existing errors
+      // stay budgeted: their text cannot establish whether a turn opened.
+      db.exec(`
+        ALTER TABLE autonomy_wakes
+        ADD COLUMN preparation_failed INTEGER NOT NULL DEFAULT 0 CHECK (
+          preparation_failed IN (0, 1)
+        );
+      `);
+    },
+  },
+  {
+    id: 10,
+    name: "autonomy_wakes_turn_provider_failed",
+    up: (db) => {
+      // Historical error prose cannot establish a provider failure.
+      db.exec(`
+        ALTER TABLE autonomy_wakes
+        ADD COLUMN turn_provider_failed INTEGER NOT NULL DEFAULT 0 CHECK (
+          turn_provider_failed IN (0, 1)
+        );
+      `);
     },
   },
 ] as const satisfies readonly Migration[];

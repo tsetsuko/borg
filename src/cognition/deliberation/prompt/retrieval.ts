@@ -1,3 +1,7 @@
+import {
+  frameAnomalyAnnotationFields,
+  renderFrameAnomalyAnnotations,
+} from "../../../stream/frame-anomaly.js";
 // Summarizes episodic and semantic retrieval results for deliberation prompts.
 import type { SemanticNode } from "../../../memory/semantic/index.js";
 import { openQuestionMemoryDisclosureLabel } from "../../../memory/common/disclosure-serializers.js";
@@ -148,9 +152,14 @@ export function summarizeRetrievalConfidence(
       " signatures by the top-N episode slice plus the semantic matches.",
     // Rendered every turn, floor or no floor: the ladder's shape is what makes
     // the floor readable, and stating it only on turns that cross would make
-    // the crossing look like the only way the path is ever decided.
-    "`s2_floor` is where `overall` alone takes this turn to S2. It is the fourth test in the path" +
-      " ladder, not the only one: reflective mode and high stakes take S2 above the floor, idle mode" +
+    // the crossing look like the only way the path is ever decided. The shape
+    // is stated in outcomes, not in an index: every clause names a test and the
+    // side it lands on, so the sentence can be checked against the tests it
+    // enumerates. An ordinal ("the fourth test") cannot be -- no enumeration
+    // supplies evaluation order, so reordering the ladder would leave "all
+    // four" true and the ordinal silently false.
+    "`s2_floor` is where `overall` alone takes this turn to S2. It is not the only test in the path" +
+      " ladder: reflective mode and high stakes take S2 above the floor, idle mode" +
       " takes S1 below it, and an operational-contradiction override outranks all four.",
   ];
 
@@ -232,7 +241,11 @@ function summarizeCitationChain(result: RetrievedEpisode): string | null {
     const content =
       typeof entry.content === "string" ? entry.content : JSON.stringify(entry.content ?? null);
     const normalized = content.replace(/\s+/g, " ").trim();
-    return normalized.length > 140 ? `${normalized.slice(0, 137).trimEnd()}...` : normalized;
+    const excerpt =
+      normalized.length > 140 ? `${normalized.slice(0, 137).trimEnd()}...` : normalized;
+    return [excerpt, renderFrameAnomalyAnnotations(entry.frame_anomalies)]
+      .filter(Boolean)
+      .join("\n");
   });
 
   return snippets.length === 0 ? null : `  citations: ${snippets.join(" | ")}`;
@@ -394,6 +407,23 @@ function verificationEvidenceCandidates(
             }),
       },
       payload: {
+        // Rows holding one stream entry's text (raw-stream hits, warm recalls of a
+        // single entry), and ahead of `text` deliberately: the payload is
+        // verbatim stream content, so a recalled entry that quotes a rendered
+        // block reproduces that block exactly. Every other field on the row is
+        // equally true of a quotation and of the thing quoted, which leaves the
+        // prose itself as the only evidence of what it is -- and prose that
+        // quotes a surface reads as that surface. These two say whose text it is
+        // and when it was written, in front of the text rather than after a
+        // payload the reader may never reach the end of. Labels, not a gate:
+        // nothing branches on them.
+        ...(item.streamEntryKind === undefined
+          ? {}
+          : { stream_entry_kind: item.streamEntryKind }),
+        ...(item.streamEntryAtMs === undefined
+          ? {}
+          : { stream_entry_at: new Date(item.streamEntryAtMs).toISOString() }),
+        ...frameAnomalyAnnotationFields(item.frame_anomalies),
         text: item.text,
         matched_terms: item.matchedTerms,
         image_label: item.imageLabel ?? null,
@@ -425,7 +455,11 @@ function verificationFallbackCandidates(
         narrative: result.episode.narrative,
         participants: result.episode.participants,
         tags: result.episode.tags,
-        citations: result.citationChain.map((entry) => ({ id: entry.id, content: entry.content })),
+        citations: result.citationChain.map((entry) => ({
+          id: entry.id,
+          content: entry.content,
+          ...frameAnomalyAnnotationFields(entry.frame_anomalies),
+        })),
       },
     };
   });
@@ -814,6 +848,9 @@ function summarizeEvidenceItem(item: EvidenceItem): string {
   return [
     `- ${item.source} [score=${item.score.toFixed(2)} intent=${item.recallIntentId}${terms}${sourceVisibility}${disclosure}]${provenance}`,
     `  ${text}`,
+    ...(item.frame_anomalies === undefined
+      ? []
+      : [renderFrameAnomalyAnnotations(item.frame_anomalies)]),
   ].join("\n");
 }
 

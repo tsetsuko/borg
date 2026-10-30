@@ -26,7 +26,14 @@ import { episodeIdSchema } from "../episodic/types.js";
 import { semanticNodeIdSchema } from "../semantic/types.js";
 import { goalBlockRecordSchema } from "./goal-blocks.js";
 
-export const goalStatusSchema = z.enum(["active", "done", "abandoned", "blocked"]);
+export const goalStatusSchema = z.enum(["active", "done", "superseded", "abandoned", "blocked"]);
+export const goalRetirementDispositionSchema = z.enum(["done", "superseded", "abandoned"]);
+
+export function isTerminalGoalStatus(
+  status: string,
+): status is z.infer<typeof goalRetirementDispositionSchema> {
+  return status === "done" || status === "superseded" || status === "abandoned";
+}
 export const identityStateSchema = z.enum(["candidate", "established"]);
 export const OPEN_QUESTION_STATUSES = ["open", "resolved", "abandoned"] as const;
 export const OPEN_QUESTION_SOURCES = [
@@ -311,6 +318,10 @@ export const openQuestionSchema = z.object({
   resolved_by_artifact_entry_id: openQuestionResolvedByArtifactEntryIdSchema.nullable().optional(),
   unresolved_rumination_ticks: z.number().int().nonnegative().default(0),
   last_ruminated_at: z.number().finite().nullable().default(null),
+  consecutive_refusals: z.number().int().nonnegative().default(0),
+  last_rumination_attempt_outcome: z.enum(["completed", "refused"]).nullable().default(null),
+  last_rumination_attempt_at: z.number().finite().nullable().default(null),
+  refusal_backoff_until: z.number().finite().nullable().default(null),
 });
 
 export const openQuestionRecordSchema = openQuestionSchema
@@ -320,9 +331,10 @@ export const openQuestionRecordSchema = openQuestionSchema
       value.related_semantic_node_ids.length > 0 ||
       value.provenance !== null,
     {
+      // Any one of the three arms satisfies this; addressing the issue to one of
+      // them would report the disjunction as a requirement on that field alone.
       message:
-        "Open question requires related_episode_ids, related_semantic_node_ids, or explicit provenance",
-      path: ["provenance"],
+        "Open question requires related_episode_ids, related_semantic_node_ids, or explicit provenance, any one alone",
     },
   )
   .refine(
@@ -331,8 +343,8 @@ export const openQuestionRecordSchema = openQuestionSchema
       value.resolution_evidence_episode_ids.length > 0 ||
       value.resolution_evidence_stream_entry_ids.length > 0,
     {
-      message: "Resolved open question requires episode or stream evidence",
-      path: ["resolution_evidence_episode_ids"],
+      message:
+        "Resolved open question requires episode or stream evidence: resolution_evidence_episode_ids or resolution_evidence_stream_entry_ids, either one alone",
     },
   );
 
@@ -394,6 +406,7 @@ export type OpenQuestionSearchCandidate = {
 export type OpenQuestionHandleLookupOptions = {
   streamEntryIds?: readonly string[];
   episodeIds?: readonly string[];
+  semanticNodeIds?: readonly string[];
   statuses?: readonly OpenQuestionStatus[];
   visibleToAudienceEntityId?: EntityId | null;
   limit?: number;
