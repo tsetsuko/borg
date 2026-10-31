@@ -289,6 +289,9 @@ function buildFinalizerCallOptions(
     },
     cacheableSystemPrompt: context.cacheableSystemPrompt,
     finalizerDynamicPromptCacheEnabled: options.finalizerDynamicPromptCacheEnabled ?? true,
+    ...(options.autonomousFinalizerMaxRounds === undefined
+      ? {}
+      : { autonomousFinalizerMaxRounds: options.autonomousFinalizerMaxRounds }),
     finalizerTransport: options.finalizerTransport ?? "unary",
     finalizerSurfaceVariant: configuredSurfaceVariant,
     finalizerContextCapture: options.finalizerContextCapture,

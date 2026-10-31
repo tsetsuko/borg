@@ -48,6 +48,7 @@ function makeOptions(setStopState: ReturnType<typeof vi.fn>) {
       attachments: {
         maxImagesPerLedger: 0,
       },
+      autonomy: {},
     },
     toolDispatcher: {},
     clock: new ManualClock(2_000),

@@ -404,6 +404,8 @@ export type DeliberatorOptions = {
   hostCapabilities?: string;
   promptBlocks?: Partial<Record<PromptKey, string>>;
   finalizerDynamicPromptCacheEnabled?: boolean;
+  /** autonomy.maxFinalizerRoundsPerWake; unset keeps the tool loop's own ceiling. */
+  autonomousFinalizerMaxRounds?: number;
   finalizerTransport?: FinalizerTransport;
   finalizerSurfaceVariant?: "compact" | "compact_conversational" | "legacy";
   planRequestedVerificationMembershipTokenBudget?: number;

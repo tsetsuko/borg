@@ -118,6 +118,9 @@ export async function runDeliberationPhase(input: {
     promptBlocks,
     finalizerDynamicPromptCacheEnabled:
       input.options.config.deliberation.finalizerDynamicPromptCacheEnabled,
+    ...(input.options.config.autonomy.maxFinalizerRoundsPerWake === undefined
+      ? {}
+      : { autonomousFinalizerMaxRounds: input.options.config.autonomy.maxFinalizerRoundsPerWake }),
     finalizerTransport: input.options.config.deliberation.finalizerTransport,
     finalizerSurfaceVariant: input.options.config.deliberation.finalizerSurfaceVariant,
     planRequestedVerificationMembershipTokenBudget:

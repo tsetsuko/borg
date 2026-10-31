@@ -98,6 +98,13 @@ export type ExecuteToolLoopOptions = {
   suppressRawTextStream?: LLMConverseOptions["suppressRawTextStream"];
   toolChoice?: LLMConverseOptions["tool_choice"];
   maxIterations?: number;
+  /**
+   * When the iteration cap is reached, offer only the terminal tools for one
+   * closing request instead of dropping every tool. Without it the closing
+   * request is text-only, which an emission-tool caller reads as a protocol
+   * failure.
+   */
+  closeWithTerminalTools?: boolean;
   maxToolCallsPerIteration?: number;
   clock?: Pick<Clock, "now">;
   terminalToolNames?: readonly string[];
@@ -321,6 +328,10 @@ export async function executeToolLoop(options: ExecuteToolLoopOptions): Promise<
   let iterations = 0;
   let toolsEnabled = anthropicTools.length > 0;
   let forcedTextOnly = false;
+  const terminalAnthropicTools = anthropicTools.filter((tool) => terminalToolNames.has(tool.name));
+  const closeWithTerminalTools =
+    options.closeWithTerminalTools === true && terminalAnthropicTools.length > 0;
+  let terminalOnly = closeWithTerminalTools && maxIterations <= 0;
   let lastResponseText = "";
   let usage: ToolLoopUsage = {
     input_tokens: 0,
@@ -377,7 +388,7 @@ export async function executeToolLoop(options: ExecuteToolLoopOptions): Promise<
         iteration: iterations + 1,
         model: options.model,
         promptCharCount: countConversePromptChars(options.systemPrompt, messages),
-        toolSchemas: summarizeToolSchemas(anthropicTools),
+        toolSchemas: summarizeToolSchemas(terminalOnly ? terminalAnthropicTools : anthropicTools),
         ...(options.tracer.includePayloads
           ? {
               prompt: toTraceJsonValue({
@@ -396,7 +407,7 @@ export async function executeToolLoop(options: ExecuteToolLoopOptions): Promise<
       messages,
       ...(toolsEnabled
         ? {
-            tools: anthropicTools,
+            tools: terminalOnly ? terminalAnthropicTools : anthropicTools,
             ...(options.toolChoice === undefined ? {} : { tool_choice: options.toolChoice }),
           }
         : {}),
@@ -475,7 +486,10 @@ export async function executeToolLoop(options: ExecuteToolLoopOptions): Promise<
       (block) => !allowedToolNames.has(block.name) || unavailableToolNames.has(block.name),
     );
     const deferTerminalAcceptance =
-      toolsEnabled && terminalToolCalls.length > 0 && unavailableToolCalls.length > 0;
+      toolsEnabled &&
+      !terminalOnly &&
+      terminalToolCalls.length > 0 &&
+      unavailableToolCalls.length > 0;
 
     if (traceEnabled && options.turnId !== undefined) {
       options.tracer?.emit("llm_call.completed", {
@@ -507,13 +521,13 @@ export async function executeToolLoop(options: ExecuteToolLoopOptions): Promise<
       };
     }
 
-    if (!toolsEnabled || toolUseBlocks.length === 0) {
+    if (!toolsEnabled || terminalOnly || toolUseBlocks.length === 0) {
       return {
         text: extractText(response.messageBlocks),
         iterations,
         toolCallsMade,
         terminalToolCalls: [],
-        stopReason: forcedTextOnly ? "max_iterations" : "text",
+        stopReason: forcedTextOnly || terminalOnly ? "max_iterations" : "text",
         usage,
       };
     }
@@ -775,8 +789,12 @@ export async function executeToolLoop(options: ExecuteToolLoopOptions): Promise<
     iterations += 1;
 
     if (iterations >= maxIterations) {
-      toolsEnabled = false;
-      forcedTextOnly = true;
+      if (closeWithTerminalTools) {
+        terminalOnly = true;
+      } else {
+        toolsEnabled = false;
+        forcedTextOnly = true;
+      }
     }
   }
 }

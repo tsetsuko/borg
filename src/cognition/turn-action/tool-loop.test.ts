@@ -124,6 +124,119 @@ describe("executeToolLoop", () => {
     expect(llm.converseRequests[0]?.tools).toBeUndefined();
   });
 
+  it("closes with only the terminal tools at the cap when asked, so the loop still ends in a terminal call", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    const dispatcher = createDispatcher(tempDir);
+    const interiorTool: ToolDefinition = {
+      name: "tool.test.loop",
+      description: "Loop helper.",
+      allowedOrigins: ["autonomous"],
+      writeScope: "read",
+      inputSchema: z.object({ value: z.string().min(1) }),
+      outputSchema: z.object({ echoed: z.string().min(1) }),
+      async invoke(input: { value: string }) {
+        return { echoed: input.value };
+      },
+    };
+    const terminalTool: ToolDefinition = {
+      name: "no_output",
+      description: "Terminal suppression signal.",
+      allowedOrigins: ["autonomous"],
+      writeScope: "read",
+      inputSchema: z.object({}).strict(),
+      outputSchema: z.object({}).strict(),
+      async invoke() {
+        throw new Error("terminal tools are not dispatched");
+      },
+    };
+    dispatcher.register(interiorTool);
+    const llm = new FakeLLMClient({
+      responses: [
+        [{ type: "tool_use", id: "toolu_1", name: "tool.test.loop", input: { value: "one" } }],
+        [{ type: "tool_use", id: "toolu_2", name: "tool.test.loop", input: { value: "two" } }],
+        [{ type: "tool_use", id: "toolu_end", name: "no_output", input: {} }],
+      ],
+    });
+
+    const result = await executeToolLoop({
+      llmClient: llm,
+      dispatcher,
+      sessionId: DEFAULT_SESSION_ID,
+      model: "fake",
+      systemPrompt: "be concise",
+      initialMessages: baseMessages(),
+      tools: [interiorTool, terminalTool],
+      terminalToolNames: ["no_output"],
+      origin: "autonomous",
+      budget: "test",
+      maxIterations: 2,
+      closeWithTerminalTools: true,
+    });
+
+    expect(result).toMatchObject({ iterations: 2, stopReason: "terminal_tool" });
+    expect(result.terminalToolCalls.map((call) => call.name)).toEqual(["no_output"]);
+    expect(llm.converseRequests).toHaveLength(3);
+    expect(llm.converseRequests[0]?.tools?.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["tool.test.loop", "no_output"]),
+    );
+    expect(llm.converseRequests[2]?.tools?.map((tool) => tool.name)).toEqual(["no_output"]);
+  });
+
+  it("ends without dispatching when the closing request still asks for an interior tool", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    const dispatcher = createDispatcher(tempDir);
+    const invoke = vi.fn(async (input: { value: string }) => ({ echoed: input.value }));
+    const interiorTool: ToolDefinition = {
+      name: "tool.test.loop",
+      description: "Loop helper.",
+      allowedOrigins: ["autonomous"],
+      writeScope: "read",
+      inputSchema: z.object({ value: z.string().min(1) }),
+      outputSchema: z.object({ echoed: z.string().min(1) }),
+      invoke,
+    };
+    const terminalTool: ToolDefinition = {
+      name: "no_output",
+      description: "Terminal suppression signal.",
+      allowedOrigins: ["autonomous"],
+      writeScope: "read",
+      inputSchema: z.object({}).strict(),
+      outputSchema: z.object({}).strict(),
+      async invoke() {
+        throw new Error("terminal tools are not dispatched");
+      },
+    };
+    dispatcher.register(interiorTool);
+    const llm = new FakeLLMClient({
+      responses: [
+        [{ type: "tool_use", id: "toolu_1", name: "tool.test.loop", input: { value: "one" } }],
+        [{ type: "tool_use", id: "toolu_2", name: "tool.test.loop", input: { value: "two" } }],
+      ],
+    });
+
+    const result = await executeToolLoop({
+      llmClient: llm,
+      dispatcher,
+      sessionId: DEFAULT_SESSION_ID,
+      model: "fake",
+      systemPrompt: "be concise",
+      initialMessages: baseMessages(),
+      tools: [interiorTool, terminalTool],
+      terminalToolNames: ["no_output"],
+      origin: "autonomous",
+      budget: "test",
+      maxIterations: 1,
+      closeWithTerminalTools: true,
+    });
+
+    expect(result).toMatchObject({ iterations: 1, stopReason: "max_iterations" });
+    expect(result.terminalToolCalls).toEqual([]);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(llm.converseRequests).toHaveLength(2);
+  });
+
   it("returns immediately when a terminal tool is called", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
     tempDirs.push(tempDir);

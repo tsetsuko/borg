@@ -878,6 +878,11 @@ const configBaseSchema = z.object({
         .partialRecord(z.enum(AUTONOMY_WAKE_SOURCE_NAMES), z.number().int().positive())
         .default({}),
       goalWakeBatchMax: z.number().int().positive().default(5),
+      // Finalizer rounds one wake may take. Each round re-reads the whole turn
+      // prompt, so a wake costs roughly rounds times the prompt. Unset keeps the
+      // tool loop's own ceiling and its text-only stop. Set, the last round
+      // offers only the emission tools, so the wake still ends in a decision.
+      maxFinalizerRoundsPerWake: z.number().int().positive().optional(),
       budgetWindowMs: z.number().int().positive().default(86_400_000),
       reservedContemplativeWakesPerWindow: z.number().int().nonnegative().default(1),
       proactiveOutbound: z

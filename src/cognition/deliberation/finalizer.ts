@@ -420,6 +420,8 @@ export type RunFinalizerOptions = {
   path: "system_1" | "system_2";
   additionalPromptSections?: readonly PromptSurfaceAdditionalSection[];
   cacheableSystemPrompt?: CacheableFinalizerSystemPrompt;
+  /** Rounds an autonomous finalizer may take; the last one offers only emission tools. */
+  autonomousFinalizerMaxRounds?: number;
   finalizerDynamicPromptCacheEnabled?: boolean;
   finalizerTransport?: FinalizerTransport;
   finalizerSurfaceVariant?: FinalizerSurfaceVariant;
@@ -1172,6 +1174,12 @@ export async function runFinalizer(options: RunFinalizerOptions): Promise<Finali
       initialMessages: options.initialMessages,
       tools: availableTools,
       origin: options.turnOrigin === "autonomous" ? "autonomous" : "deliberator",
+      ...(options.turnOrigin === "autonomous" && options.autonomousFinalizerMaxRounds !== undefined
+        ? {
+            maxIterations: options.autonomousFinalizerMaxRounds - 1,
+            closeWithTerminalTools: true,
+          }
+        : {}),
       turnOrigin: options.turnOrigin,
       currentSenderBorgRole: options.currentSenderBorgRole,
       sessionAudienceRole: options.sessionAudienceRole,

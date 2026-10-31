@@ -336,6 +336,15 @@ describe("config", () => {
     expect(config.deliberation.finalizerDynamicPromptCacheEnabled).toBe(false);
   });
 
+  it("leaves the autonomous finalizer round cap unset by default and accepts one", () => {
+    expect(configSchema.parse({}).autonomy.maxFinalizerRoundsPerWake).toBeUndefined();
+    expect(
+      configSchema.parse({ autonomy: { maxFinalizerRoundsPerWake: 3 } }).autonomy
+        .maxFinalizerRoundsPerWake,
+    ).toBe(3);
+    expect(() => configSchema.parse({ autonomy: { maxFinalizerRoundsPerWake: 0 } })).toThrow();
+  });
+
   it("lets the finalizer transport environment override take precedence", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
     tempDirs.push(tempDir);

@@ -81,6 +81,7 @@ async function runEmissionFinalizer(
     turnOrigin?: Parameters<typeof runFinalizer>[0]["turnOrigin"];
     registeredTools?: readonly ToolDefinition[];
     compactSurface?: Parameters<typeof runFinalizer>[0]["compactSurface"];
+    autonomousFinalizerMaxRounds?: number;
   } = {},
 ) {
   return runFinalizer({
@@ -141,6 +142,9 @@ async function runEmissionFinalizer(
     ...(options.compactSurface === undefined ? {} : { compactSurface: options.compactSurface }),
     ...(options.tracer === undefined ? {} : { tracer: options.tracer }),
     ...(options.turnId === undefined ? {} : { turnId: options.turnId }),
+    ...(options.autonomousFinalizerMaxRounds === undefined
+      ? {}
+      : { autonomousFinalizerMaxRounds: options.autonomousFinalizerMaxRounds }),
   });
 }
 
@@ -332,6 +336,51 @@ describe("runFinalizer emission tools", () => {
         text: ["Base dynamic prompt.", USER_ACTIVE_TOOL_AVAILABILITY].join("\n\n"),
       }),
     ]);
+  });
+
+  it("ends an autonomous finalizer at its round cap with only the emission tools on offer", async () => {
+    const llm = new FakeLLMClient({
+      responses: [
+        {
+          messageBlocks: [
+            { type: "tool_use", id: "toolu_read", name: "tool.episodic.get", input: {} },
+          ],
+          input_tokens: 4,
+          output_tokens: 2,
+          stop_reason: "tool_use",
+        },
+        {
+          messageBlocks: [
+            {
+              type: "tool_use",
+              id: "toolu_continue_thought",
+              name: "EmitContinueThought",
+              input: { text: "Keep it for later." },
+            },
+          ],
+          input_tokens: 4,
+          output_tokens: 2,
+          stop_reason: "tool_use",
+        },
+      ],
+    });
+
+    const result = await runEmissionFinalizer(llm, tempDirs, {
+      turnOrigin: "autonomous",
+      registeredTools: [fakeTool("tool.episodic.get", ["autonomous", "deliberator"])],
+      autonomousFinalizerMaxRounds: 2,
+    });
+
+    expect(llm.requests).toHaveLength(2);
+    expect(llm.requests[0]?.tools?.map((tool) => tool.name)).toContain("tool.episodic.get");
+    expect(llm.requests[1]?.tools?.map((tool) => tool.name)).toEqual([
+      "EmitAnswer",
+      "EmitObserve",
+      "EmitNoOutput",
+      "EmitSelfReport",
+      "EmitContinueThought",
+    ]);
+    expect(result.decision).toEqual({ kind: "continue_thought", text: "Keep it for later." });
   });
 
   it("exposes EmitContinueThought on autonomous turns", async () => {
