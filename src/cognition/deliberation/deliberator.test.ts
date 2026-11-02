@@ -41,6 +41,7 @@ import { createEpisodeFixture, createRetrievalScoreFixture } from "../../offline
 import type { EvidenceLedger } from "../evidence-ledger/index.js";
 import { renderEvidenceLedger } from "../evidence-ledger/index.js";
 import type { CognitionThinkingConfig } from "./types.js";
+import type { DeliberationSystem2Triggers } from "./path-selector.js";
 import type { TurnTraceData, TurnTraceEventName, TurnTracer } from "../../tracing/tracer.js";
 import { buildInvalidToolFinalizerRetryPromptSection, Deliberator } from "./deliberator.js";
 import {
@@ -236,6 +237,7 @@ function createDeliberator(
     clock?: Clock;
     goalPresentation?: GoalPresentationStore;
     planRequestedVerificationMembershipTokenBudget?: number;
+    system2Triggers?: DeliberationSystem2Triggers;
   } = {},
 ): Deliberator {
   return new Deliberator({
@@ -259,6 +261,7 @@ function createDeliberator(
           planRequestedVerificationMembershipTokenBudget:
             options.planRequestedVerificationMembershipTokenBudget,
         }),
+    ...(options.system2Triggers === undefined ? {} : { system2Triggers: options.system2Triggers }),
   });
 }
 
@@ -761,6 +764,42 @@ describe("deliberator", () => {
       { role: "assistant", content: "We rebuild the index first." },
       { role: "user", content: "And what about now?" },
     ]);
+  });
+
+  it("answers a reflective, low-confidence turn on S1 when both S2 triggers are off, and says so in the prompt", async () => {
+    const llm = new FakeLLMClient({
+      responses: [
+        emitFinalizerToolResponse({
+          id: "toolu_emit_answer",
+          name: "EmitAnswer",
+          input: { text: "Direct answer." },
+        }),
+      ],
+    });
+    const deliberator = createDeliberator(llm, tempDirs, {
+      system2Triggers: { reflectiveMode: false, lowRetrievalConfidence: false },
+    });
+
+    const result = await deliberator.run(
+      simpleDeliberationContext({
+        perception: {
+          entities: [],
+          mode: "reflective",
+          affectiveSignal: { valence: 0, arousal: 0, dominant_emotion: null },
+          temporalCue: null,
+        },
+        retrievalConfidence: makeRetrievalConfidence(0.2),
+      }),
+    );
+
+    expect(result.path).toBe("system_1");
+    expect(result.response).toBe("Direct answer.");
+    // One finalizer call and no planner call before it.
+    expect(llm.requests).toHaveLength(1);
+    const system = requestSystemText(llm.requests[0]?.system);
+    expect(system).toContain("does not choose the path in this deployment");
+    expect(system).toContain("reflective ones included");
+    expect(system).not.toContain("s2_floor");
   });
 
   it("keeps the current turn body separate from the resolved sender display name", async () => {

@@ -340,6 +340,18 @@ const deliberationConfigSchema = z
       .int()
       .nonnegative()
       .default(DEFAULT_CONTEXT_CAPTURE_ROTATION_KEEP),
+    // The natural signals that take a turn to S2. Both on is upstream's ladder.
+    // Either may be switched off for a deployment that does not want deeper
+    // reasoning on that signal; high stakes and the operational-contradiction
+    // override still take S2, and the prompt's confidence line describes the
+    // ladder actually in force.
+    system2Triggers: z
+      .object({
+        reflectiveMode: z.boolean().default(true),
+        lowRetrievalConfidence: z.boolean().default(true),
+      })
+      .strict()
+      .prefault({}),
   })
   .strict()
   .prefault({});

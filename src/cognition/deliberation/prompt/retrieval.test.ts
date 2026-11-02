@@ -262,6 +262,48 @@ describe("retrieval confidence prompt rendering", () => {
     }
   });
 
+  it("describes the ladder actually in force when S2 triggers are switched off", () => {
+    const low = makeRetrievalConfidence({ overall: 0.31, sampleSize: 4 });
+    const bothOff = summarizeRetrievalConfidence(low, {
+      reflectiveMode: false,
+      lowRetrievalConfidence: false,
+    });
+    const confidenceOff = summarizeRetrievalConfidence(low, {
+      reflectiveMode: true,
+      lowRetrievalConfidence: false,
+    });
+    const reflectiveOff = summarizeRetrievalConfidence(low, {
+      reflectiveMode: false,
+      lowRetrievalConfidence: true,
+    });
+
+    // With the confidence trigger off there is no routing floor to print.
+    expect(bothOff).toContain("overall=0.31 ");
+    expect(bothOff).not.toContain("s2_floor");
+    expect(bothOff).toContain(
+      `does not choose the path in this deployment; below ${DELIBERATION_S2_CONFIDENCE_FLOOR.toFixed(2)}`,
+    );
+    expect(bothOff).toContain("High stakes take S2");
+    expect(bothOff).toContain("reflective ones included");
+    // The weak-support line still fires on the same number.
+    expect(bothOff).toContain("Retrieval confidence is low");
+
+    expect(confidenceOff).toContain("Reflective mode and high stakes take S2");
+    expect(confidenceOff).not.toContain("reflective ones included");
+
+    expect(reflectiveOff).toContain("overall=0.31(s2_floor=0.45)");
+    expect(reflectiveOff).toContain("reflective mode does not");
+    expect(reflectiveOff).not.toContain("outranks all four");
+
+    // Each rendering agrees with the selector running the same triggers.
+    expect(
+      chooseDeliberationPath("reflective", "low", [], false, low, undefined, undefined, undefined, {
+        reflectiveMode: false,
+        lowRetrievalConfidence: false,
+      }).path,
+    ).toBe("system_1");
+  });
+
   it("pins the rendered routing floor to the constant the path ladder tests", () => {
     // Two literals at one value are indistinguishable from one boundary until
     // they drift, and the render asserts this number IS the routing floor.

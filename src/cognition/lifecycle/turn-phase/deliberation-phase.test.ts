@@ -172,6 +172,27 @@ describe("runDeliberationPhase", () => {
     );
   });
 
+  it("passes the configured S2 triggers to the deliberator", async () => {
+    const input = makeInput("user", vi.fn());
+    (input.options.config.deliberation as Record<string, unknown>).system2Triggers = {
+      reflectiveMode: false,
+      lowRetrievalConfidence: false,
+    };
+    deliberatorRun.mockResolvedValue({
+      response: "",
+      emissionRecommendation: "emit",
+      thoughtStreamEntryIds: [],
+    });
+
+    await runDeliberationPhase(input);
+
+    expect(deliberatorConstructor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        system2Triggers: { reflectiveMode: false, lowRetrievalConfidence: false },
+      }),
+    );
+  });
+
   it("arms S2 planner no_output stop state for user-origin turns", async () => {
     const nextWorkingMemory = createWorkingMemory(DEFAULT_SESSION_ID, 2_000);
     const setStopState = vi.fn(() => nextWorkingMemory);

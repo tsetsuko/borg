@@ -326,6 +326,17 @@ describe("config", () => {
     expect(configSchema.parse({})).toEqual(DEFAULT_CONFIG);
   });
 
+  it("keeps both S2 triggers on by default and lets a deployment switch each off", () => {
+    expect(configSchema.parse({}).deliberation.system2Triggers).toEqual({
+      reflectiveMode: true,
+      lowRetrievalConfidence: true,
+    });
+    expect(
+      configSchema.parse({ deliberation: { system2Triggers: { reflectiveMode: false } } }).deliberation
+        .system2Triggers,
+    ).toEqual({ reflectiveMode: false, lowRetrievalConfidence: true });
+  });
+
   it("allows the finalizer dynamic prompt cache breakpoint to be disabled", () => {
     const config = configSchema.parse({
       deliberation: {

@@ -121,6 +121,9 @@ export async function runDeliberationPhase(input: {
     ...(input.options.config.autonomy.maxFinalizerRoundsPerWake === undefined
       ? {}
       : { autonomousFinalizerMaxRounds: input.options.config.autonomy.maxFinalizerRoundsPerWake }),
+    ...(input.options.config.deliberation.system2Triggers === undefined
+      ? {}
+      : { system2Triggers: input.options.config.deliberation.system2Triggers }),
     finalizerTransport: input.options.config.deliberation.finalizerTransport,
     finalizerSurfaceVariant: input.options.config.deliberation.finalizerSurfaceVariant,
     planRequestedVerificationMembershipTokenBudget:

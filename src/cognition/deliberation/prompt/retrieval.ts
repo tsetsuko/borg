@@ -35,11 +35,16 @@ import {
   DELIBERATION_S2_CONFIDENCE_FLOOR,
 } from "../constants.js";
 import type { ContradictionRoutingTier } from "../types.js";
+import {
+  DEFAULT_DELIBERATION_SYSTEM2_TRIGGERS,
+  type DeliberationSystem2Triggers,
+} from "../path-selector.js";
 
 // Not a second threshold that happens to coincide with the routing floor: it is
 // the routing floor, read from the constant the path ladder tests against, so
 // the annotation below and the `s2_floor` printed on the line cannot say
-// different things about the same boundary.
+// different things about the same boundary. With the low-confidence trigger
+// off the same number only marks weak support, and the line says so instead.
 const LOW_RETRIEVAL_CONFIDENCE_THRESHOLD = DELIBERATION_S2_CONFIDENCE_FLOOR;
 export const PLAN_REQUESTED_VERIFICATION_MEMBERSHIP_BUDGET_MARKER =
   "membership_not_enumerated_budget";
@@ -84,8 +89,40 @@ export type RetrievedEvidenceSummaryInput = {
   }[];
 };
 
+// The path ladder in force, stated in outcomes. Upstream's ladder keeps its
+// sentence word for word; a deployment that switched a trigger off gets one that
+// names what still takes S2, so the prompt never describes a rule that is not
+// running.
+function describePathLadder(triggers: DeliberationSystem2Triggers): string {
+  if (triggers.lowRetrievalConfidence && triggers.reflectiveMode) {
+    return (
+      "`s2_floor` is where `overall` alone takes this turn to S2. It is not the only test in the path" +
+      " ladder: reflective mode and high stakes take S2 above the floor, idle mode" +
+      " takes S1 below it, and an operational-contradiction override outranks all four."
+    );
+  }
+
+  if (triggers.lowRetrievalConfidence) {
+    return (
+      "`s2_floor` is where `overall` alone takes this turn to S2. It is not the only test in the path" +
+      " ladder: high stakes take S2 above the floor, reflective mode does not, idle mode takes S1" +
+      " below it, and an operational-contradiction override outranks all of them."
+    );
+  }
+
+  const floor = DELIBERATION_S2_CONFIDENCE_FLOOR.toFixed(2);
+  return (
+    `\`overall\` does not choose the path in this deployment; below ${floor} it only marks` +
+    " the claims here as weakly supported. " +
+    (triggers.reflectiveMode ? "Reflective mode and high stakes take S2" : "High stakes take S2") +
+    ", an operational-contradiction override takes S2 regardless, and every other turn takes S1" +
+    (triggers.reflectiveMode ? "." : ", reflective ones included.")
+  );
+}
+
 export function summarizeRetrievalConfidence(
   confidence: RetrievalConfidence | null | undefined,
+  triggers: DeliberationSystem2Triggers = DEFAULT_DELIBERATION_SYSTEM2_TRIGGERS,
 ): string | null {
   if (confidence === null || confidence === undefined) {
     return null;
@@ -122,7 +159,9 @@ export function summarizeRetrievalConfidence(
     // number whose consequence is invisible cannot be read for its consequence
     // -- the distance to the boundary is the whole of what it decides, and
     // without the boundary the reader has a quantity and no scale.
-    `overall=${confidence.overall.toFixed(2)}(s2_floor=${DELIBERATION_S2_CONFIDENCE_FLOOR.toFixed(2)})`,
+    triggers.lowRetrievalConfidence
+      ? `overall=${confidence.overall.toFixed(2)}(s2_floor=${DELIBERATION_S2_CONFIDENCE_FLOOR.toFixed(2)})`
+      : `overall=${confidence.overall.toFixed(2)}`,
     `evidence=${confidence.evidenceStrength.toFixed(2)}(${evidenceComponents})`,
     // Both ratios print with the fraction they came from. Coverage divides the
     // projected episode count by a stable evidence target; diversity divides
@@ -158,9 +197,7 @@ export function summarizeRetrievalConfidence(
     // enumerates. An ordinal ("the fourth test") cannot be -- no enumeration
     // supplies evaluation order, so reordering the ladder would leave "all
     // four" true and the ordinal silently false.
-    "`s2_floor` is where `overall` alone takes this turn to S2. It is not the only test in the path" +
-      " ladder: reflective mode and high stakes take S2 above the floor, idle mode" +
-      " takes S1 below it, and an operational-contradiction override outranks all four.",
+    describePathLadder(triggers),
   ];
 
   // Policy text lives in EPISTEMIC_POSTURE_SECTION at the system-prompt

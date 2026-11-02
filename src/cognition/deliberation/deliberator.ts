@@ -928,6 +928,7 @@ export class Deliberator {
         cooldownTurns: context.contradictionRoutingConfig?.cooldownTurns,
         enabled: context.contradictionRoutingConfig?.enabled ?? true,
       },
+      this.options.system2Triggers,
     );
     effectiveContext = {
       ...effectiveContext,
@@ -943,6 +944,9 @@ export class Deliberator {
           : [],
       contradictionRoutingTier: decision.contradiction_tier,
       deliberationPath: decision.path,
+      ...(this.options.system2Triggers === undefined
+        ? {}
+        : { system2Triggers: this.options.system2Triggers }),
     };
     const allowedEmissions = allowedEmissionsForParticipationPolicy(
       effectiveContext.participationPolicy,

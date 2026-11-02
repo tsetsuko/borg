@@ -147,6 +147,127 @@ describe("chooseDeliberationPath", () => {
     expect(decision.path).toBe("system_2");
   });
 
+  it("keeps reflective and low-confidence turns on S1 when those S2 triggers are off", () => {
+    const off = { reflectiveMode: false, lowRetrievalConfidence: false };
+    const reflective = chooseDeliberationPath(
+      "reflective",
+      "low",
+      [makeEpisode(0.9)],
+      false,
+      makeConfidence(0.95),
+      undefined,
+      undefined,
+      undefined,
+      off,
+    );
+    const unsure = chooseDeliberationPath(
+      "relational",
+      "low",
+      [makeEpisode(0.9)],
+      false,
+      makeConfidence(0.2),
+      undefined,
+      undefined,
+      undefined,
+      off,
+    );
+    const both = chooseDeliberationPath(
+      "reflective",
+      "low",
+      [makeEpisode(0.9)],
+      false,
+      makeConfidence(0.2),
+      undefined,
+      undefined,
+      undefined,
+      off,
+    );
+
+    expect(reflective).toMatchObject({
+      path: "system_1",
+      reason: "Reflective mode does not take the deeper path in this deployment.",
+    });
+    expect(unsure).toMatchObject({
+      path: "system_1",
+      reason: "Low retrieval confidence does not take the deeper path in this deployment.",
+    });
+    expect(both.path).toBe("system_1");
+  });
+
+  it("switches each S2 trigger off on its own", () => {
+    const reflectiveOff = { reflectiveMode: false, lowRetrievalConfidence: true };
+    const confidenceOff = { reflectiveMode: true, lowRetrievalConfidence: false };
+
+    expect(
+      chooseDeliberationPath(
+        "reflective",
+        "low",
+        [],
+        false,
+        makeConfidence(0.2),
+        undefined,
+        undefined,
+        undefined,
+        reflectiveOff,
+      ),
+    ).toMatchObject({
+      path: "system_2",
+      reason: "Low retrieval confidence triggered deeper reasoning.",
+    });
+    expect(
+      chooseDeliberationPath(
+        "reflective",
+        "low",
+        [],
+        false,
+        makeConfidence(0.2),
+        undefined,
+        undefined,
+        undefined,
+        confidenceOff,
+      ),
+    ).toMatchObject({
+      path: "system_2",
+      reason: "Reflective mode always takes the deeper reasoning path.",
+    });
+  });
+
+  it("still takes S2 for high stakes and a forced contradiction with both triggers off", () => {
+    const off = { reflectiveMode: false, lowRetrievalConfidence: false };
+
+    expect(
+      chooseDeliberationPath(
+        "reflective",
+        "high",
+        [],
+        false,
+        makeConfidence(0.95),
+        undefined,
+        undefined,
+        undefined,
+        off,
+      ).path,
+    ).toBe("system_2");
+    expect(
+      chooseDeliberationPath(
+        "problem_solving",
+        "low",
+        [makeEpisode(0.9)],
+        false,
+        makeConfidence(0.9),
+        undefined,
+        {
+          forceSystem2: true,
+          reason: "open_question_contradiction",
+          forcedBy: "open_question_contradiction",
+          oqIds: ["oq_aaaaaaaaaaaaaaaa"],
+        } as never,
+        undefined,
+        off,
+      ).path,
+    ).toBe("system_2");
+  });
+
   it("routes to S1 in idle mode when confidence is high", () => {
     const decision = chooseDeliberationPath(
       "idle",

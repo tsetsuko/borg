@@ -1,5 +1,6 @@
 // Shared deliberation data shapes used by the orchestrator and extracted helpers.
 import type { LLMClient } from "../../llm/index.js";
+import type { DeliberationSystem2Triggers } from "./path-selector.js";
 import type { BorgUserContentBlock } from "../../attachments/index.js";
 import type { ExecutiveFocus } from "../../executive/index.js";
 import type { MoodHistoryEntry } from "../../memory/affective/index.js";
@@ -261,6 +262,8 @@ export type DeliberationContext = {
   contradictionRouting?: RetrievedContradictionRouting | null;
   contradictionRoutingTier?: ContradictionRoutingTier;
   deliberationPath?: "system_1" | "system_2";
+  /** The S2 triggers this turn's ladder ran with; the confidence line describes them. */
+  system2Triggers?: DeliberationSystem2Triggers;
   retrievalConfidence?: RetrievalConfidence | null;
   applicableCommitments?: readonly CommitmentRecord[];
   /** Store-read time for the active commitment membership assembled for this turn. */
@@ -406,6 +409,8 @@ export type DeliberatorOptions = {
   finalizerDynamicPromptCacheEnabled?: boolean;
   /** autonomy.maxFinalizerRoundsPerWake; unset keeps the tool loop's own ceiling. */
   autonomousFinalizerMaxRounds?: number;
+  /** deliberation.system2Triggers; unset keeps upstream's ladder. */
+  system2Triggers?: DeliberationSystem2Triggers;
   finalizerTransport?: FinalizerTransport;
   finalizerSurfaceVariant?: "compact" | "compact_conversational" | "legacy";
   planRequestedVerificationMembershipTokenBudget?: number;

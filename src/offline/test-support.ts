@@ -297,6 +297,10 @@ export function createTestConfig(
         ...DEFAULT_CONFIG.deliberation.contradictionRouting,
         ...overrides.deliberation?.contradictionRouting,
       },
+      system2Triggers: {
+        ...DEFAULT_CONFIG.deliberation.system2Triggers,
+        ...overrides.deliberation?.system2Triggers,
+      },
     },
     cognition: {
       ...DEFAULT_CONFIG.cognition,

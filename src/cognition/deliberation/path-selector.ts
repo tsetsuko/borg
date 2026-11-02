@@ -30,6 +30,21 @@ type NaturalDeliberationPathDecision = Pick<
   "path" | "reason" | "forced_by"
 >;
 
+/**
+ * The natural signals that take a turn to S2 (config `deliberation.system2Triggers`).
+ * Both on is upstream's ladder. High stakes and the operational-contradiction
+ * override take S2 whatever these say.
+ */
+export type DeliberationSystem2Triggers = {
+  reflectiveMode: boolean;
+  lowRetrievalConfidence: boolean;
+};
+
+export const DEFAULT_DELIBERATION_SYSTEM2_TRIGGERS: DeliberationSystem2Triggers = {
+  reflectiveMode: true,
+  lowRetrievalConfidence: true,
+};
+
 export type DeliberationPathTrace = {
   tracer: TurnTracer;
   turnId: string;
@@ -54,6 +69,7 @@ export function chooseDeliberationPath(
   trace?: DeliberationPathTrace,
   routingOverride?: DeliberationRoutingOverride | null,
   contradictionRoutingOptions?: DeliberationPathContradictionRoutingOptions,
+  triggers: DeliberationSystem2Triggers = DEFAULT_DELIBERATION_SYSTEM2_TRIGGERS,
 ): DeliberationPathDecision {
   const confidence = retrievalConfidence.overall;
   const contextContradiction =
@@ -118,7 +134,7 @@ export function chooseDeliberationPath(
 
   const naturalDecision = (): NaturalDeliberationPathDecision => {
     // Reflective always wins -- it's an explicit request for deeper thought.
-    if (mode === "reflective") {
+    if (mode === "reflective" && triggers.reflectiveMode) {
       return {
         path: "system_2",
         reason: "Reflective mode always takes the deeper reasoning path.",
@@ -143,9 +159,25 @@ export function chooseDeliberationPath(
     }
 
     if (confidence < DELIBERATION_S2_CONFIDENCE_FLOOR) {
+      return triggers.lowRetrievalConfidence
+        ? {
+            path: "system_2",
+            reason: "Low retrieval confidence triggered deeper reasoning.",
+            forced_by: null,
+          }
+        : {
+            path: "system_1",
+            reason: "Low retrieval confidence does not take the deeper path in this deployment.",
+            forced_by: null,
+          };
+    }
+
+    // Reached only when the reflective trigger is off; its own reason keeps the
+    // trace from claiming confidence decided a turn that reflection would have.
+    if (mode === "reflective") {
       return {
-        path: "system_2",
-        reason: "Low retrieval confidence triggered deeper reasoning.",
+        path: "system_1",
+        reason: "Reflective mode does not take the deeper path in this deployment.",
         forced_by: null,
       };
     }

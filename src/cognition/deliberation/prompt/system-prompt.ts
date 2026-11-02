@@ -1321,7 +1321,10 @@ function buildUntrustedBasePromptSections(
     },
     {
       tag: "borg_retrieval_confidence",
-      content: summarizeRetrievalConfidence(context.retrievalConfidence ?? null),
+      content: summarizeRetrievalConfidence(
+        context.retrievalConfidence ?? null,
+        context.system2Triggers,
+      ),
     },
     {
       tag: "contradiction_signal",
