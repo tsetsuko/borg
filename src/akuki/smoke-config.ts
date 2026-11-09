@@ -8,6 +8,15 @@ export const AKUKI_MODEL_SLOTS = [
   "BORG_MODEL_CREATOR_DIRECTIVE",
 ] as const;
 
+// Roles borg resolves from another slot when unset. Not required, but when one
+// is set it must still be Anthropic: the router would otherwise send it elsewhere.
+export const AKUKI_OPTIONAL_MODEL_SLOTS = [
+  "BORG_MODEL_PRE_TURN_EXTRACTION",
+  "BORG_MODEL_CORRECTIVE_PREFERENCE",
+  "BORG_MODEL_SHARED_STATE_COMPILER",
+  "BORG_MODEL_OFFLINE",
+] as const;
+
 const REQUIRED_EMBEDDING_SETTINGS = [
   "BORG_EMBEDDING_BASE_URL",
   "BORG_EMBEDDING_MODEL",
@@ -41,7 +50,7 @@ export function validateAkukiAnthropicOnlyModels(env: NodeJS.ProcessEnv): void {
     throw new Error(`AKUKI_ANTHROPIC_ONLY=1 requires model roles: ${missing.join(", ")}`);
   }
 
-  const nonAnthropic = AKUKI_MODEL_SLOTS.flatMap((slot) => {
+  const nonAnthropic = [...AKUKI_MODEL_SLOTS, ...AKUKI_OPTIONAL_MODEL_SLOTS].flatMap((slot) => {
     const model = env[slot]?.trim();
     return model !== undefined && !isAnthropicModel(model) ? [`${slot}=${model}`] : [];
   });

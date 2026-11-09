@@ -27,6 +27,24 @@ describe("Akuki Anthropic-only configuration", () => {
     ).toThrow(/BORG_MODEL_BACKGROUND=generative-apis\/qwen/u);
   });
 
+  it("accepts an optional model role that is Anthropic", () => {
+    expect(() =>
+      validateAkukiAnthropicOnlyModels({
+        ...anthropicModels(),
+        BORG_MODEL_OFFLINE: "claude-sonnet-5",
+      }),
+    ).not.toThrow();
+  });
+
+  it("rejects an optional model role that is not Anthropic", () => {
+    expect(() =>
+      validateAkukiAnthropicOnlyModels({
+        ...anthropicModels(),
+        BORG_MODEL_OFFLINE: "generative-apis/qwen",
+      }),
+    ).toThrow(/BORG_MODEL_OFFLINE=generative-apis\/qwen/u);
+  });
+
   it("accepts explicit proxy auth", () => {
     expect(() =>
       validateAkukiAnthropicOnlyModels({

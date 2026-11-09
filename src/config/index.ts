@@ -414,6 +414,11 @@ const anthropicModelsConfigSchema = z
     sharedStateCompiler: z.string().min(1).default("claude-sonnet-5"),
     creatorDirective: z.string().min(1).default("claude-sonnet-4-6"),
     imagePerception: z.string().min(1).default("claude-haiku-4-5-20251001"),
+    // Offline maintenance: the dream processes and the open-question review they
+    // feed. Resolved where the maintenance context is built, so an omitted slot
+    // keeps those processes on background (and extraction for the semantic
+    // extractor), exactly as before the slot existed.
+    offline: z.string().min(1).optional(),
   })
   .prefault({});
 
@@ -1438,6 +1443,11 @@ function loadEnvOverrides(env: NodeJS.ProcessEnv): ConfigOverrides {
     overrides,
     ["anthropic", "models", "creatorDirective"],
     readOptionalEnvString(env, "BORG_MODEL_CREATOR_DIRECTIVE"),
+  );
+  setConfigOverride(
+    overrides,
+    ["anthropic", "models", "offline"],
+    readOptionalEnvString(env, "BORG_MODEL_OFFLINE"),
   );
   setConfigOverride(
     overrides,

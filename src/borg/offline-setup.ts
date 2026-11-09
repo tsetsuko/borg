@@ -112,6 +112,31 @@ export type BuildOfflineSetupOptions = {
   tracer?: TurnTracer;
 };
 
+// Offline maintenance runs on its own model when anthropic.models.offline is set.
+// The processes read the background and extraction roles from ctx.config, so the
+// slot is applied once, here, to the config the maintenance context carries:
+// inside that context both roles resolve to the offline model. Live turns keep
+// the shared config, so a cheaper model for the dream processes never reaches
+// the in-turn calls that share the background role.
+export function offlineMaintenanceConfig(config: Config): Config {
+  const offline = config.anthropic.models.offline;
+  if (offline === undefined) {
+    return config;
+  }
+
+  return {
+    ...config,
+    anthropic: {
+      ...config.anthropic,
+      models: {
+        ...config.anthropic.models,
+        background: offline,
+        extraction: offline,
+      },
+    },
+  };
+}
+
 export function buildOfflineSetup(options: BuildOfflineSetupOptions): BorgOfflineSetup {
   const prepareSerializedEmbeddings = (payload: unknown) =>
     refreshSerializedEmbeddings(payload, options.embeddingClient, (id) =>
@@ -220,7 +245,7 @@ export function buildOfflineSetup(options: BuildOfflineSetupOptions): BorgOfflin
   const maintenanceOrchestrator = new MaintenanceOrchestrator({
     prepareSerializedEmbeddings,
     baseContext: {
-      config: options.config,
+      config: offlineMaintenanceConfig(options.config),
       clock: options.clock,
       entryIndex: options.entryIndex,
       sourceStreamAudienceDisclosureResolver: options.sourceStreamAudienceDisclosureResolver,

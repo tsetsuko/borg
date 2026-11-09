@@ -484,7 +484,9 @@ export async function buildBorgRepositories(
   };
   const reviewOpenQuestionExtractor = new ReviewOpenQuestionExtractor({
     llmClient: options.llmClient,
-    model: config.anthropic.models.background,
+    // Review handlers run inside offline maintenance (budget
+    // "offline-review-open-question"), so they follow the offline slot.
+    model: config.anthropic.models.offline ?? config.anthropic.models.background,
     onDegraded: reportReviewOpenQuestionExtractorDegraded,
   });
   const reviewHandlers = new ReviewQueueHandlerRegistry();

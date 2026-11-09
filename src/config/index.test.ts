@@ -1307,6 +1307,7 @@ describe("config", () => {
         BORG_MODEL_RECALL_EXPANSION: "env-recall",
         BORG_MODEL_CORRECTIVE_PREFERENCE: "env-corrective-preference",
         BORG_MODEL_SHARED_STATE_COMPILER: "env-shared-state-compiler",
+        BORG_MODEL_OFFLINE: "env-offline",
         BORG_ANTHROPIC_OAUTH_SSE_INACTIVITY_TIMEOUT_MS: "111",
         BORG_ANTHROPIC_OAUTH_SSE_FIRST_MESSAGE_EVENT_TIMEOUT_MS: "222",
         BORG_ANTHROPIC_OAUTH_SSE_MESSAGE_EVENT_GAP_TIMEOUT_MS: "333",
@@ -1328,6 +1329,7 @@ describe("config", () => {
     expect(config.anthropic.models.recallExpansion).toBe("env-recall");
     expect(config.anthropic.models.correctivePreference).toBe("env-corrective-preference");
     expect(config.anthropic.models.sharedStateCompiler).toBe("env-shared-state-compiler");
+    expect(config.anthropic.models.offline).toBe("env-offline");
     expect(config.anthropic.oauthSseInactivityTimeoutMs).toBe(111);
     expect(config.anthropic.oauthSseFirstMessageEventTimeoutMs).toBe(222);
     expect(config.anthropic.oauthSseMessageEventGapTimeoutMs).toBe(333);
