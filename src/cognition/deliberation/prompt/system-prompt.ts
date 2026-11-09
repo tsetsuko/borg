@@ -30,6 +30,10 @@ import type { MoodHistoryEntry } from "../../../memory/affective/index.js";
 import type { ReviewQueueItem } from "../../../memory/review-queue/index.js";
 import { createWorkingMemory, type WorkingMemory } from "../../../memory/working/index.js";
 import { escapeXmlText, scrubCreatorDirectiveInternalIds } from "../../../util/prompt-tags.js";
+import {
+  commitmentLedgerEntryId,
+  participantCommitmentEntryId,
+} from "../../evidence-ledger/audience-standing.js";
 import type { EvidenceLedgerEntry } from "../../evidence-ledger/types.js";
 import {
   MEMORY_DISCLOSURE_GUIDANCE_FOR_MODEL,
@@ -860,27 +864,6 @@ function renderLedgerEntryLines(tag: string, entry: EvidenceLedgerEntry, indent:
   return lines;
 }
 
-function commitmentPromptLine(
-  commitment: CommitmentRecord,
-  entityRepository: DeliberationContext["entityRepository"],
-): string {
-  const madeTo = entityNameForStanding(entityRepository, commitment.made_to_entity);
-  const audience = entityNameForStanding(entityRepository, commitment.restricted_audience);
-  const about = entityNameForStanding(entityRepository, commitment.about_entity);
-  const committedBy = entityNameForStanding(
-    entityRepository,
-    commitment.committed_by_entity_id ?? null,
-  );
-  const enforcementClass = effectiveCommitmentEnforcementClass(commitment);
-  const criticalDomain = effectiveCommitmentCriticalDomain(commitment);
-  const enforcement =
-    enforcementClass === "critical"
-      ? `CRITICAL${criticalDomain === null ? "" : `:${criticalDomain}`}`
-      : "ADVISORY guidance";
-
-  return `- [${enforcement} ${commitment.kind}/${commitment.type}] ${commitment.directive}${madeTo === null ? "" : ` made_to=${madeTo}`}${audience === null ? "" : ` audience=${audience}`}${about === null ? "" : ` about=${about}`}${committedBy === null ? "" : ` committed_by=${committedBy}`} ${summarizeProvenanceForPrompt(commitment.provenance)}`;
-}
-
 function renderCommitmentEntityRefLine(
   tag: string,
   entityId: CommitmentRecord["made_to_entity"],
@@ -917,8 +900,25 @@ function renderCommitmentDetailsLines(context: DeliberationContext, indent: stri
     `${indent}<commitment_scope_details>`,
     `${indent}  <summary_label>Active commitment / rule / preference / boundary records:</summary_label>`,
   ];
+  // This is the one full rendering of each commitment. The standing ledger's copy of the
+  // same row adds only its scope and persistence class, carried here as attributes.
+  const ledgerEntryById = new Map(
+    (context.evidenceLedger?.audienceStanding?.commitmentEntries ?? []).map((entry) => [
+      entry.id,
+      entry,
+    ]),
+  );
 
   for (const [index, commitment] of commitments.entries()) {
+    const ledgerEntry = ledgerEntryById.get(commitmentLedgerEntryId(commitment.id));
+    const ledgerAttributes =
+      ledgerEntry === undefined
+        ? ""
+        : ` scope="${escapeXmlAttribute(ledgerEntry.session_scope)}"${
+            ledgerEntry.persistence_class === undefined
+              ? ""
+              : ` persistence_class="${escapeXmlAttribute(ledgerEntry.persistence_class)}"`
+          }`;
     const detailIndent = `${indent}    `;
     const disclosure = renderMemoryDisclosureLabelForModel(
       commitmentMemoryDisclosureLabel(commitment),
@@ -951,8 +951,7 @@ function renderCommitmentDetailsLines(context: DeliberationContext, indent: stri
     ].filter((line): line is string => line !== null);
 
     lines.push(
-      `${indent}  <commitment_detail id="${escapeXmlAttribute(commitment.id)}" ordinal="${index + 1}">`,
-      `${detailIndent}<prompt_summary>${escapeXmlText(commitmentPromptLine(commitment, context.entityRepository))}</prompt_summary>`,
+      `${indent}  <commitment_detail id="${escapeXmlAttribute(commitment.id)}" ordinal="${index + 1}"${ledgerAttributes}>`,
       `${detailIndent}<directive>${escapeXmlText(commitment.directive)}</directive>`,
       `${detailIndent}<directive_family>${escapeXmlText(commitment.directive_family)}</directive_family>`,
       `${detailIndent}<disclosure>${escapeXmlText(disclosure)}</disclosure>`,
@@ -961,6 +960,7 @@ function renderCommitmentDetailsLines(context: DeliberationContext, indent: stri
       `${detailIndent}<commitment_enforcement_class>${escapeXmlText(effectiveCommitmentEnforcementClass(commitment))}</commitment_enforcement_class>`,
       `${detailIndent}<commitment_critical_domain>${escapeXmlText(effectiveCommitmentCriticalDomain(commitment) ?? "none")}</commitment_critical_domain>`,
       `${detailIndent}<created_at>${escapeXmlText(new Date(commitment.created_at).toISOString())}</created_at>`,
+      `${detailIndent}<last_reinforced_at>${escapeXmlText(new Date(commitment.last_reinforced_at).toISOString())}</last_reinforced_at>`,
       ...refs,
       `${detailIndent}<provenance>${escapeXmlText(summarizeProvenanceForPrompt(commitment.provenance))}</provenance>`,
       `${indent}  </commitment_detail>`,
@@ -991,6 +991,94 @@ function renderStandingEntryGroupLines(input: {
       renderLedgerEntryLines(input.entryTag, entry, `${input.indent}  `),
     ),
     `${input.indent}</${input.tag}>`,
+  ];
+}
+
+// The standing ledger's commitment entries are a 1:1 map of applicableCommitments, which
+// commitment_scope_details already renders in full. Only an entry that matches no
+// rendered commitment would add anything, so only such an entry is rendered here; when
+// every entry matched, the group is omitted rather than rendered as "none", which would
+// read as "no commitments".
+function renderCommitmentLedgerEntryGroupLines(
+  context: DeliberationContext,
+  indent: string,
+): string[] {
+  const entries = context.evidenceLedger?.audienceStanding?.commitmentEntries;
+
+  if (entries === undefined || entries.length === 0) {
+    return renderStandingEntryGroupLines({
+      tag: "commitment_ledger_entries",
+      entryTag: "commitment_entry",
+      entries,
+      indent,
+    });
+  }
+
+  const renderedIds = new Set(
+    (context.applicableCommitments ?? []).map((commitment) =>
+      commitmentLedgerEntryId(commitment.id),
+    ),
+  );
+  const unmatched = entries.filter((entry) => !renderedIds.has(entry.id));
+
+  return unmatched.length === 0
+    ? []
+    : renderStandingEntryGroupLines({
+        tag: "commitment_ledger_entries",
+        entryTag: "commitment_entry",
+        entries: unmatched,
+        indent,
+      });
+}
+
+// A participant's commitments are the same rows commitment_scope_details renders in
+// full. What the relational group adds is only that the commitment concerns this
+// participant, so it gets a pointer carrying that and the commitment id. An entry this
+// render cannot map back to a rendered commitment is rendered in full, so a mismatch
+// costs tokens, never the commitment.
+function renderRelationalLedgerEntryGroupLines(
+  context: DeliberationContext,
+  indent: string,
+): string[] {
+  const entries = context.evidenceLedger?.audienceStanding?.relationalEntries;
+
+  if (entries === undefined || entries.length === 0) {
+    return renderStandingEntryGroupLines({
+      tag: "relational_ledger_entries",
+      entryTag: "relational_entry",
+      entries,
+      indent,
+    });
+  }
+
+  const commitmentIdByEntryId = new Map<string, string>();
+
+  for (const participant of context.activeParticipants ?? []) {
+    for (const commitment of context.applicableCommitments ?? []) {
+      commitmentIdByEntryId.set(
+        participantCommitmentEntryId(participant.entityId, commitment.id),
+        commitment.id,
+      );
+    }
+  }
+
+  return [
+    `${indent}<relational_ledger_entries>`,
+    ...entries.flatMap((entry) => {
+      const commitmentId = commitmentIdByEntryId.get(entry.id);
+
+      if (commitmentId === undefined) {
+        return renderLedgerEntryLines("relational_entry", entry, `${indent}  `);
+      }
+
+      const subject = entry.state_metadata?.subject_display_name;
+      return [
+        `${indent}  <relational_entry id="${escapeXmlAttribute(entry.id)}" source_type="${escapeXmlAttribute(entry.source_type)}"${
+          typeof subject === "string" ? ` subject="${escapeXmlAttribute(subject)}"` : ""
+        } commitment_ref="${escapeXmlAttribute(commitmentId)}" />`,
+      ];
+    }),
+    `${indent}</relational_ledger_entries>`,
   ];
 }
 
@@ -1090,18 +1178,12 @@ function renderCommitmentsAndConductLines(context: DeliberationContext, indent: 
       ? [`${indent}  <interpretation>${escapeXmlText(COMMITMENTS_INTERPRETATION)}</interpretation>`]
       : []),
     ...renderCommitmentDetailsLines(context, `${indent}  `),
-    ...renderStandingEntryGroupLines({
-      tag: "commitment_ledger_entries",
-      entryTag: "commitment_entry",
-      entries: standing?.commitmentEntries,
-      indent: `${indent}  `,
-    }),
+    ...renderCommitmentLedgerEntryGroupLines(context, `${indent}  `),
     `${indent}</commitments_and_conduct>`,
   ];
 }
 
 function renderRelationalIdentityLines(context: DeliberationContext, indent: string): string[] {
-  const standing = context.evidenceLedger?.audienceStanding;
   const constraints = summarizeRelationalSlotConstraints(
     context.relationalSlots ?? [],
     context.activeParticipants,
@@ -1116,12 +1198,7 @@ function renderRelationalIdentityLines(context: DeliberationContext, indent: str
           `${indent}    <text>${escapeXmlText(constraints)}</text>`,
           `${indent}  </relational_slot_constraints>`,
         ]),
-    ...renderStandingEntryGroupLines({
-      tag: "relational_ledger_entries",
-      entryTag: "relational_entry",
-      entries: standing?.relationalEntries,
-      indent: `${indent}  `,
-    }),
+    ...renderRelationalLedgerEntryGroupLines(context, `${indent}  `),
     `${indent}</relational_identity>`,
   ];
 }
@@ -1196,21 +1273,11 @@ export function measureStandingWithAudienceParts(
   const groups: Array<[string, readonly string[]]> = [
     [
       "commitments_and_conduct.commitment_ledger_entries",
-      renderStandingEntryGroupLines({
-        tag: "commitment_ledger_entries",
-        entryTag: "commitment_entry",
-        entries: standing?.commitmentEntries,
-        indent: "    ",
-      }),
+      renderCommitmentLedgerEntryGroupLines(context, "    "),
     ],
     [
       "relational_identity.relational_ledger_entries",
-      renderStandingEntryGroupLines({
-        tag: "relational_ledger_entries",
-        entryTag: "relational_entry",
-        entries: standing?.relationalEntries,
-        indent: "    ",
-      }),
+      renderRelationalLedgerEntryGroupLines(context, "    "),
     ],
     [
       "cross_session_awareness.session_status_snapshot",

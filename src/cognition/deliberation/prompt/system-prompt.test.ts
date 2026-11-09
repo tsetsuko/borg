@@ -42,6 +42,7 @@ import {
   renderMemoryDisclosureLabelForModel,
   selfPrivateMemoryDisclosureLabel,
 } from "../../../retrieval/index.js";
+import { participantCommitmentEntryId } from "../../evidence-ledger/audience-standing.js";
 import type { EvidenceLedger } from "../../evidence-ledger/types.js";
 import { FixedClock } from "../../../util/clock.js";
 import { openDatabase } from "../../../storage/sqlite/index.js";
@@ -1383,6 +1384,22 @@ describe("buildBaseSystemPrompt", () => {
         ],
         relationalEntries: [
           {
+            id: participantCommitmentEntryId(audienceId, commitmentId),
+            source_type: "commitment",
+            session_scope: "current_session",
+            actor: "memory",
+            trust_rank: 82,
+            text: commitment.directive,
+            value: `Sam:${commitment.directive_family}`,
+            state: "active",
+            state_metadata: {
+              subject_display_name: "Sam",
+              subject_role: "audience",
+              commitment_kind: "boundary",
+            },
+            taint: "none",
+          },
+          {
             id: `relational_slot:${createRelationalSlotId()}`,
             source_type: "relational_slot",
             session_scope: "current_session",
@@ -1467,6 +1484,7 @@ describe("buildBaseSystemPrompt", () => {
         ],
       },
       applicableCommitments: [commitment],
+      activeParticipants: [{ entityId: audienceId, displayName: "Sam", role: "audience" }],
       operatorSessionSnapshot: makeOperatorSessionSnapshot(),
       evidenceLedger,
     });
@@ -1479,8 +1497,15 @@ describe("buildBaseSystemPrompt", () => {
       "<canonical_fact>Sam may be told the launch codename.</canonical_fact>",
     );
     expect(block).toContain("<commitments_and_conduct>");
-    expect(block).toContain("Do not discuss Atlas with Sam.");
-    expect(block).toContain(`id="commitment:${commitmentId}"`);
+    // One full rendering per commitment: the standing ledger's copy and the participant
+    // copy add only scope and "concerns Sam", carried as attributes and a pointer.
+    expect(block.split("Do not discuss Atlas with Sam.").length - 1).toBe(1);
+    expect(block).toContain(
+      `<commitment_detail id="${commitmentId}" ordinal="1" scope="current_session">`,
+    );
+    expect(block).not.toContain(`id="commitment:${commitmentId}"`);
+    expect(block).not.toContain("<commitment_ledger_entries");
+    expect(block).toContain(`subject="Sam" commitment_ref="${commitmentId}" />`);
     expect(block).toContain("<relational_identity>");
     expect(block).toContain("preferred_address=Sam");
     expect(block).toContain("<cross_session_awareness>");
@@ -1518,6 +1543,9 @@ describe("buildBaseSystemPrompt", () => {
     expect(sizes.borg_standing_with_audience).toBe(block.length);
     expect(
       sizes["borg_standing_with_audience.commitments_and_conduct.commitment_ledger_entries"],
+    ).toBe(0);
+    expect(
+      sizes["borg_standing_with_audience.relational_identity.relational_ledger_entries"],
     ).toBeGreaterThan(0);
     expect(
       sizes["borg_standing_with_audience.cross_session_awareness.recent_lived_experience"],

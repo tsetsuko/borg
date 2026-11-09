@@ -181,7 +181,7 @@ function buildCommitmentEntries(context: BuilderSectionContext): EvidenceLedgerE
     const disclosureLabel = commitmentDisclosureLabel(commitment);
 
     return cappedTrustRank({
-      id: `commitment:${commitment.id}`,
+      id: commitmentLedgerEntryId(commitment.id),
       source_type: "commitment",
       session_scope: commitmentScope(commitment, context.resolver),
       actor: "memory",
@@ -226,6 +226,22 @@ function buildCommitmentEntries(context: BuilderSectionContext): EvidenceLedgerE
       ),
     });
   });
+}
+
+// The id of the commitment-standing entry for one active commitment.
+export function commitmentLedgerEntryId(commitmentId: CommitmentRecord["id"]): string {
+  return `commitment:${commitmentId}`;
+}
+
+// The id of the relational-standing entry that lists one active commitment under one
+// participant. The legacy prompt renders those commitments in full once, in
+// commitment_scope_details, and keys the participant pointer off this id, so the format
+// lives here and nowhere else.
+export function participantCommitmentEntryId(
+  participantEntityId: EntityId,
+  commitmentId: CommitmentRecord["id"],
+): string {
+  return `participant_commitment:${participantEntityId}:${commitmentId}`;
 }
 
 function buildRelationalEntries(context: BuilderSectionContext): EvidenceLedgerEntry[] {
@@ -310,7 +326,7 @@ function buildRelationalEntries(context: BuilderSectionContext): EvidenceLedgerE
       const disclosureLabel = commitmentDisclosureLabel(commitment);
       entries.push(
         cappedTrustRank({
-          id: `participant_commitment:${participant.entityId}:${commitment.id}`,
+          id: participantCommitmentEntryId(participant.entityId, commitment.id),
           source_type: "commitment",
           session_scope: commitmentScope(commitment, context.resolver),
           actor: "memory",

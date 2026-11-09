@@ -4995,9 +4995,14 @@ describe("deliberator", () => {
       expect(system).toContain(
         "- Why does Atlas fail after rollback? (urgency=0.80, source=reflection, disclosure_class=self_private private-to=unknown; I can use this internally; I do not disclose it to the current audience unless authorized) (from ep_aaaaaaaaaaaaaaaa)",
       );
+      // The commitment is rendered once, as structured fields (no one-line summary).
+      expect(system).toContain("<directive>Do not discuss Atlas with Sam</directive>");
       expect(system).toContain(
-        "- [CRITICAL:audience_scope boundary/boundary] Do not discuss Atlas with Sam audience=Sam about=Atlas (manual)",
+        "<commitment_critical_domain>audience_scope</commitment_critical_domain>",
       );
+      expect(system).toContain(">Sam</audience>");
+      expect(system).toContain(">Atlas</about>");
+      expect(system).toContain("<provenance>(manual)</provenance>");
     } finally {
       db.close();
     }
@@ -5229,15 +5234,19 @@ describe("deliberator", () => {
       expect(system).toContain("Active commitment / rule / preference / boundary records:");
       expect(system).toContain("Do not discuss Atlas with Sam");
       expect(system).toContain(
-        "- [CRITICAL:audience_scope boundary/boundary] Do not discuss Atlas with Sam audience=Sam about=Atlas (manual)",
+        "<commitment_enforcement_class>critical</commitment_enforcement_class>",
       );
       expect(system).toContain(
-        "- [ADVISORY guidance process_norm/preference] Skip preambles. (manual)",
+        "<commitment_critical_domain>audience_scope</commitment_critical_domain>",
+      );
+      expect(system).toContain("<directive>Skip preambles.</directive>");
+      expect(system).toContain(
+        "<commitment_enforcement_class>advisory</commitment_enforcement_class>",
       );
       expect(system).toContain("</commitments_and_conduct>");
       expect(system).not.toContain("<borg_commitment_records>");
-      expect(requestSystemText(llm.requests[0]?.system)).toContain("audience=Sam");
-      expect(requestSystemText(llm.requests[0]?.system)).toContain("about=Atlas");
+      expect(requestSystemText(llm.requests[0]?.system)).toContain(">Sam</audience>");
+      expect(requestSystemText(llm.requests[0]?.system)).toContain(">Atlas</about>");
       expect(system.indexOf("<commitments_and_conduct>")).toBeGreaterThan(
         system.indexOf(TRUSTED_GUIDANCE_PREAMBLE),
       );
