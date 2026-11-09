@@ -47,6 +47,7 @@ function baseExtractionPhaseInput(input: {
     turnInput: { userMessage: "message", origin: "user" } as never,
     isUserTurn: true,
     assessOnly: false,
+    senderKind: null,
     cognitionInput: "message",
     perception: {
       mode: "relational",
@@ -112,6 +113,7 @@ describe("runExtractionPhase", () => {
       },
       isUserTurn: false,
       assessOnly: false,
+      senderKind: null,
       cognitionInput: "Internal outbound composition instruction",
       perception: {
         mode: "relational",
@@ -209,6 +211,7 @@ describe("runExtractionPhase", () => {
       },
       isUserTurn: true,
       assessOnly: false,
+      senderKind: null,
       cognitionInput: "<inbound_batch>...</inbound_batch>",
       perception: {
         mode: "relational",
@@ -288,6 +291,39 @@ describe("runExtractionPhase", () => {
     const assessed = baseExtractionPhaseInput({ sessionId, workingMemory, extractActionState });
     await runExtractionPhase({ ...assessed, assessOnly: true });
     expect(assessed.options.turnGoalPromotionService.extractAndPersist).not.toHaveBeenCalled();
+  });
+
+  it("takes no standing rule and no goal from another bot's message", async () => {
+    const sessionId = createSessionId();
+    const workingMemory = createWorkingMemory(sessionId, 1_000);
+    const extractActionState = vi.fn(async () => []);
+    const emit = vi.fn();
+
+    for (const senderKind of [null, "person"] as const) {
+      const fromPerson = baseExtractionPhaseInput({ sessionId, workingMemory, extractActionState });
+      await runExtractionPhase({ ...fromPerson, senderKind });
+      expect(
+        fromPerson.options.correctivePreferenceTurnService.extractAndApply,
+      ).toHaveBeenCalledTimes(1);
+      expect(fromPerson.options.turnGoalPromotionService.extractAndPersist).toHaveBeenCalledTimes(1);
+    }
+
+    const fromBot = baseExtractionPhaseInput({ sessionId, workingMemory, extractActionState });
+    const result = await runExtractionPhase({
+      ...fromBot,
+      options: { ...fromBot.options, tracer: { enabled: true, emit } } as never,
+      senderKind: "bot",
+    });
+    expect(fromBot.options.correctivePreferenceTurnService.extractAndApply).not.toHaveBeenCalled();
+    expect(fromBot.options.turnGoalPromotionService.extractAndPersist).not.toHaveBeenCalled();
+    expect(result.correctiveCommitment).toBeNull();
+    // Only the two rule-setting extractors are skipped; the others still run.
+    expect(fromBot.options.creatorDirectiveTurnService.extractAndPersist).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledWith("extraction.bot_author.skipped", {
+      turnId: "turn-speaker",
+      session_id: sessionId,
+      skipped: ["corrective_preference", "goal_promotion"],
+    });
   });
 
   it("skips action-state extraction when the config turns it off", async () => {
@@ -563,6 +599,7 @@ describe("runExtractionPhase", () => {
       },
       isUserTurn: true,
       assessOnly: false,
+      senderKind: null,
       cognitionInput: "<inbound_batch>...</inbound_batch>",
       perception: {
         mode: "relational",

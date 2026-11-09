@@ -608,6 +608,10 @@ export class TurnPhaseCoordinator {
         code: "ASSESS_ONLY_REQUIRES_SINGLE_USER_MESSAGE",
       });
     }
+    const senderKind =
+      "senderKind" in rawTurnInput && rawTurnInput.senderKind !== undefined
+        ? rawTurnInput.senderKind
+        : null;
     const sessionRecord = this.options.sessionsRepository?.get(sessionId) ?? null;
     const effectiveAudience =
       batchEntryIds !== null &&
@@ -1141,6 +1145,7 @@ export class TurnPhaseCoordinator {
           turnInput,
           isUserTurn,
           assessOnly,
+          senderKind,
           cognitionInput,
           perception,
           workingMemory,

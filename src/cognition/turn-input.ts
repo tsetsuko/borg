@@ -58,6 +58,8 @@ export type HydratedInboundImagePerception = {
 
 export type TurnLockMode = "block" | "try" | { timeoutMs: number };
 
+export type TurnSenderKind = "person" | "bot" | "system";
+
 export type SingleMessageTurnInput = TurnInputBase & {
   userMessage: string;
   attachments?: readonly TurnInputAttachment[];
@@ -74,6 +76,15 @@ export type SingleMessageTurnInput = TurnInputBase & {
    * the newest gets a full turn. User origin only.
    */
   assessOnly?: boolean;
+  /**
+   * Who wrote the message, when the transport knows: a person, another bot, or
+   * the platform itself. A bot's message is stored, perceived, appraised and can
+   * be answered, but the being takes no standing rule (corrective preference) and
+   * no goal from it: another agent describing or prescribing practice is
+   * evidence about that agent, not a rule this being has accepted. Absent means
+   * the transport does not say, and the message is treated as a person's.
+   */
+  senderKind?: TurnSenderKind;
   /**
    * Called once, with the final reply text, as soon as a message emission is
    * persisted -- after every guard that can change or withhold it, and before

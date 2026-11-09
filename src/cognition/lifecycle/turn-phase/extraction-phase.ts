@@ -12,7 +12,7 @@ import type { BorgRole } from "../../../memory/commitments/index.js";
 import type { SessionAudienceRole } from "../../../sessions/index.js";
 import { runsExtraction } from "../../types.js";
 import { isCreatorInOperatorContext } from "../../authority.js";
-import type { CurrentTurnUserInputSenderAttribution } from "../../turn-input.js";
+import type { CurrentTurnUserInputSenderAttribution, TurnSenderKind } from "../../turn-input.js";
 import type { TurnPhaseCoordinatorOptions, TurnPhaseInput } from "./types.js";
 import type { AppendHookFailureEvent } from "./utils.js";
 import type { PredictionExtractionResult } from "../../predictions/index.js";
@@ -111,6 +111,9 @@ export async function runExtractionPhase(input: {
   // A message heard in a queue but not answered. Durable corrections are taken
   // only from a message Akuki actually answers.
   assessOnly: boolean;
+  // Who wrote the message, when the transport says. A bot's message sets no
+  // standing rule and no goal; see SingleMessageTurnInput.senderKind.
+  senderKind: TurnSenderKind | null;
   cognitionInput: string;
   perception: PerceptionResult;
   workingMemory: WorkingMemory;
@@ -214,6 +217,25 @@ export async function runExtractionPhase(input: {
         )
       : [];
 
+  // Standing rules and goals come only from a message the being answers, and
+  // never from another bot's: a bot's description of its own practice is evidence
+  // about that bot, not a rule for this one. The message itself is still stored,
+  // perceived and appraised below.
+  const takesStandingRulesAndGoals =
+    input.currentTurnFrameAnomaly === null && !input.assessOnly && input.senderKind !== "bot";
+  if (
+    input.currentTurnFrameAnomaly === null &&
+    !input.assessOnly &&
+    input.senderKind === "bot" &&
+    input.options.tracer.enabled
+  ) {
+    input.options.tracer.emit("extraction.bot_author.skipped", {
+      turnId: input.turnId,
+      session_id: input.sessionId,
+      skipped: ["corrective_preference", "goal_promotion"],
+    });
+  }
+
   const [
     correctivePreferenceTurn,
     createdActionIds,
@@ -222,7 +244,7 @@ export async function runExtractionPhase(input: {
     predictions,
     domainTrust,
   ] = await Promise.all([
-    input.currentTurnFrameAnomaly === null && !input.assessOnly
+    takesStandingRulesAndGoals
       ? input.options.correctivePreferenceTurnService.extractAndApply({
           llmClient: input.llmClient,
           turnId: input.turnId,
@@ -277,8 +299,8 @@ export async function runExtractionPhase(input: {
           frameAnomaly: input.currentTurnFrameAnomaly,
         }),
     // Like corrective preferences: a goal is promoted only from a message that
-    // is answered, never from one the turn only assesses.
-    input.currentTurnFrameAnomaly === null && !input.assessOnly
+    // is answered, never from one the turn only assesses, and never from a bot's.
+    takesStandingRulesAndGoals
       ? input.options.turnGoalPromotionService.extractAndPersist({
           llmClient: input.llmClient,
           turnId: input.turnId,
