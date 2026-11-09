@@ -20,6 +20,7 @@ import { BudgetExceededError, StorageError } from "../../util/errors.js";
 
 import type { ReverserRegistry } from "../audit-log.js";
 import { getBudgetErrorTokens, withBudget } from "../budget.js";
+import { isEpisodeEngaged, ownActionEntryIds } from "../engagement.js";
 import { extractedEpisodeIds } from "../extracted-episodes.js";
 import { offlineProcessError } from "../process-errors.js";
 import type {
@@ -192,6 +193,7 @@ function emitSemanticInsertSkipped(
   });
 }
 
+const DAY_MS = 24 * 60 * 60 * 1_000;
 const ESTIMATED_INPUT_TOKENS_PER_NARRATIVE_CHAR = 1 / 4;
 const ESTIMATED_INPUT_TOKENS_PER_EPISODE_OVERHEAD = 256;
 
@@ -225,22 +227,32 @@ type EpisodeExtractionSelection = {
 async function selectEpisodesForExtraction(
   ctx: OfflineContext,
 ): Promise<EpisodeExtractionSelection> {
-  const maxEpisodesPerRun = ctx.config.offline.semanticExtractor.maxEpisodesPerRun;
-  const maxInputTokensPerRun = ctx.config.offline.semanticExtractor.maxInputTokensPerRun;
+  const { maxEpisodesPerRun, maxInputTokensPerRun, engagedOnly, minEpisodeAgeDays } =
+    ctx.config.offline.semanticExtractor;
   const processed = await processedEpisodeIds(ctx);
-  const episodes = (await ctx.episodicRepository.listEffectivelyVisible()).sort(
-    compareEpisodesOldestFirst,
+  const ripeBeforeMs = ctx.clock.now() - minEpisodeAgeDays * DAY_MS;
+  const ripe = (await ctx.episodicRepository.listEffectivelyVisible()).filter(
+    (episode) => !processed.has(episode.id) && episode.created_at <= ripeBeforeMs,
   );
+  let episodes = ripe;
+
+  if (engagedOnly) {
+    // An episode the being never came back to and never acted in is left for the
+    // curator to archive, so it costs no extraction call.
+    const statsById = ctx.episodicRepository.getStatsMany(ripe.map((episode) => episode.id));
+    const ownActions = ownActionEntryIds(ctx, ripe);
+    episodes = ripe.filter((episode) =>
+      isEpisodeEngaged(episode, statsById.get(episode.id) ?? null, ownActions),
+    );
+  }
+
+  episodes.sort(compareEpisodesOldestFirst);
   const selected: Episode[] = [];
   let selectedInputTokens = 0;
   let eligibleCount = 0;
   let selectionClosed = false;
 
   for (const episode of episodes) {
-    if (processed.has(episode.id)) {
-      continue;
-    }
-
     eligibleCount += 1;
 
     if (selectionClosed) {

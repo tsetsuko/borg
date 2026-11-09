@@ -19,6 +19,7 @@ import type { Clock } from "../../util/clock.js";
 import { clamp, halfLifeDecay } from "../../util/math.js";
 
 import type { ReverserRegistry } from "../audit-log.js";
+import { isEpisodeEngaged, ownActionEntryIds } from "../engagement.js";
 import { extractedEpisodeIds } from "../extracted-episodes.js";
 import type {
   OfflineChange,
@@ -284,6 +285,7 @@ function buildEpisodeItems(
   ctx: OfflineContext,
   episodes: readonly Episode[],
   extractedEpisodes: ReadonlySet<Episode["id"]>,
+  ownActions: ReadonlySet<string>,
 ): CuratorPlan["items"] {
   const nowMs = ctx.clock.now();
   const items: CuratorPlan["items"] = [];
@@ -350,13 +352,23 @@ function buildEpisodeItems(
       continue;
     }
 
+    const { archiveAgeDays, archiveMinHeat, unengagedArchiveAgeDays } = ctx.config.offline.curator;
+    // Gist kept: the facts were extracted and the episode has gone cold.
+    const coldAndExtracted =
+      extractedEpisodes.has(episode.id) &&
+      heat < archiveMinHeat &&
+      ageMs >= archiveAgeDays * DAY_MS;
+    // Never engaged with: not recalled since, and not built from the being's own acts.
+    const neverEngaged =
+      unengagedArchiveAgeDays !== null &&
+      ageMs >= unengagedArchiveAgeDays * DAY_MS &&
+      !isEpisodeEngaged(episode, stats, ownActions);
+
     if (
       !stats.archived &&
       (episode.episode_kind ?? "raw") === "raw" &&
-      extractedEpisodes.has(episode.id) &&
       compareTiers(stats.tier, "T2") <= 0 &&
-      heat < ctx.config.offline.curator.archiveMinHeat &&
-      ageMs >= ctx.config.offline.curator.archiveAgeDays * DAY_MS
+      (coldAndExtracted || neverEngaged)
     ) {
       items.push({
         action: "archive",
@@ -483,9 +495,13 @@ async function buildItems(
 ): Promise<CuratorPlan["items"]> {
   const retrievalLogPruneItem = buildRetrievalLogPruneItem(ctx);
   const extractedEpisodes = await extractedEpisodeIds(ctx);
+  const ownActions =
+    ctx.config.offline.curator.unengagedArchiveAgeDays === null
+      ? new Set<string>()
+      : ownActionEntryIds(ctx, episodes);
 
   return [
-    ...buildEpisodeItems(ctx, episodes, extractedEpisodes),
+    ...buildEpisodeItems(ctx, episodes, extractedEpisodes, ownActions),
     ...buildTraitDecayItems(ctx),
     ...buildMoodItems(ctx),
     ...buildSocialItems(ctx),
@@ -645,7 +661,7 @@ export class CuratorProcess implements OfflineProcess<CuratorPlan> {
         if (item.action === "archive") {
           ctx.episodicRepository.archiveEpisode(item.episode_id, {
             caller: "curator.apply",
-            reason: "curator archived a low-heat extracted episode",
+            reason: "curator archived a cold extracted episode or one never engaged with",
             process: this.name,
             runId: ctx.runId,
           });

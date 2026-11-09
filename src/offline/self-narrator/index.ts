@@ -465,6 +465,7 @@ export class SelfNarratorProcess implements OfflineProcess<SelfNarratorPlan> {
     const nowMs = ctx.clock.now();
     const configuredLabel = typeof opts.params?.label === "string" ? opts.params.label.trim() : "";
     const currentPeriod = ctx.autobiographicalRepository.currentPeriod();
+    const noveltySinceMs = ctx.noveltySinceMs;
     const candidateEpisodes = (await ctx.episodicRepository.listEffectivelyVisible())
       .filter(
         (episode) =>
@@ -472,6 +473,9 @@ export class SelfNarratorProcess implements OfflineProcess<SelfNarratorPlan> {
           episode.start_time >= currentPeriod.start_ts ||
           episode.end_time >= currentPeriod.start_ts,
       )
+      // With a novelty floor the narrator reads only what is new since the previous
+      // heavy pass; the story written so far reaches it as prior context.
+      .filter((episode) => noveltySinceMs === undefined || episode.created_at >= noveltySinceMs)
       .sort((left, right) => left.start_time - right.start_time || left.id.localeCompare(right.id));
     const minSupportEpisodes = ctx.config.offline.selfNarrator.minSupportEpisodes;
     const maxObservationsPerRun = ctx.config.offline.selfNarrator.maxObservationsPerRun;

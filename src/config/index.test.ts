@@ -118,7 +118,11 @@ describe("config", () => {
       maxEpisodesPerRun: 8,
       maxInputTokensPerRun: 150_000,
       budget: 60_000,
+      engagedOnly: false,
+      minEpisodeAgeDays: 0,
     });
+    expect(config.offline.curator.unengagedArchiveAgeDays).toBeNull();
+    expect(config.maintenance.noveltyWindow).toBe(false);
     expect(config.offline.associator).toEqual({
       episodesPerSample: 8,
       maxSamplesPerRun: 2,

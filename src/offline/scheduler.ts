@@ -46,6 +46,7 @@ export type MaintenanceSchedulerOptions = {
   heavyProcesses: readonly OfflineProcessName[];
   lightBudget?: number | null;
   heavyBudget?: number | null;
+  noveltyWindow?: boolean;
   processOverrides?: Partial<
     Record<MaintenanceCadence, NonNullable<MaintenanceRunOptions["opts"]>["processOverrides"]>
   >;
@@ -174,6 +175,17 @@ export class MaintenanceScheduler {
       cadenceWatermarkProcessName(cadence),
       MAINTENANCE_CADENCE_WATERMARK_SESSION_ID,
     );
+  }
+
+  // The heavy watermark still holds the previous pass here: it is rewritten only
+  // after this pass succeeds. A first-ever pass has no watermark and stays whole.
+  private noveltyFor(cadence: MaintenanceCadence): { noveltySinceMs?: number } {
+    if (cadence !== "heavy" || this.options.noveltyWindow !== true) {
+      return {};
+    }
+
+    const previous = this.readCadenceWatermark("heavy");
+    return previous === null ? {} : { noveltySinceMs: previous.lastTs };
   }
 
   private isCadenceDue(cadence: MaintenanceCadence, nowMs: number): boolean {
@@ -417,6 +429,7 @@ export class MaintenanceScheduler {
       result = await this.options.orchestrator.run({
         processes: offlineProcesses,
         cadence,
+        ...this.noveltyFor(cadence),
         opts: {
           budget: this.options[`${cadence}Budget`] ?? undefined,
           processOverrides: this.options.processOverrides?.[cadence],

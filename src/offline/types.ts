@@ -88,6 +88,10 @@ export type OfflineProcessPlan = {
 export type OfflineContext = {
   config: Config;
   runId: MaintenanceRunId;
+  // Set only for a scheduled heavy pass with maintenance.noveltyWindow on: the
+  // start of the previous heavy pass. Processes that honour it start from
+  // episodes created at or after it. Absent means work on the whole memory.
+  noveltySinceMs?: number;
   clock: Clock;
   auditLog: AuditLog;
   streamWriter: StreamWriter;

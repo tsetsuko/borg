@@ -290,6 +290,38 @@ describe("MaintenanceScheduler", () => {
     ]);
   });
 
+  it("gives a heavy pass the start of the previous heavy pass only when the novelty window is on", async () => {
+    for (const noveltyWindow of [false, true]) {
+      const clock = new ManualClock(1_000);
+      const spy = createFakeOrchestrator();
+      const scheduler = new MaintenanceScheduler(
+        withSchedulerDefaults({
+          enabled: true,
+          lightIntervalMs: 10_000,
+          heavyIntervalMs: 60_000,
+          lightProcesses: ["curator"],
+          heavyProcesses: ["reflector"],
+          noveltyWindow,
+          orchestrator: spy.orchestrator,
+          processRegistry: createFakeProcessRegistry(),
+          clock,
+        }),
+      );
+
+      await scheduler.tick("heavy");
+      clock.advance(70_000);
+      await scheduler.tick("light");
+      await scheduler.tick("heavy");
+
+      // The first heavy pass has no predecessor; light passes never get a floor.
+      expect(spy.runCalls.map((call) => [call.cadence, call.noveltySinceMs])).toEqual([
+        ["heavy", undefined],
+        ["light", undefined],
+        ["heavy", noveltyWindow ? 1_000 : undefined],
+      ]);
+    }
+  });
+
   it("selects heavy processes when heavy cadence is requested", async () => {
     const clock = new ManualClock(1_000);
     const spy = createFakeOrchestrator();

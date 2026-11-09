@@ -290,6 +290,7 @@ function collectReflectionClusters(
   goalSimilarityThreshold: number,
   maxEpisodesPerCluster: number,
   maxClusterInputTokens: number,
+  noveltySinceMs?: number,
 ): ReflectionCluster[] {
   const byKey = new Map<string, Episode[]>();
   const tagGroupByTag = new Map<string, string>();
@@ -332,6 +333,14 @@ function collectReflectionClusters(
         ),
     }))
     .filter((cluster) => cluster.episodes.length >= minSupport)
+    // With a novelty floor, only groups that gained an episode since the previous
+    // heavy pass are worth a new look. The group keeps all its members, old ones
+    // included, so a pattern spanning months stays visible.
+    .filter(
+      (cluster) =>
+        noveltySinceMs === undefined ||
+        cluster.episodes.some((episode) => episode.created_at >= noveltySinceMs),
+    )
     .sort((left, right) => right.episodes.length - left.episodes.length)
     .slice(0, maxInsightsPerRun)
     .map((cluster) => ({
@@ -682,6 +691,7 @@ export class ReflectorProcess implements OfflineProcess {
       thresholds.reflectionGoalAndTagGrouping,
       ctx.config.offline.reflector.maxEpisodesPerCluster,
       ctx.config.offline.reflector.maxClusterInputTokens,
+      ctx.noveltySinceMs,
     );
     let tokensUsed = 0;
     let budgetExhausted = false;

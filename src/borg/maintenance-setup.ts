@@ -38,6 +38,7 @@ export function buildMaintenanceScheduler(
     heavyProcesses: options.config.maintenance.heavyProcesses,
     lightBudget: options.config.maintenance.lightBudget,
     heavyBudget: options.config.maintenance.heavyBudget,
+    noveltyWindow: options.config.maintenance.noveltyWindow,
     processOverrides: options.config.maintenance.processOverrides,
     orchestrator: options.orchestrator,
     processRegistry: options.processRegistry,

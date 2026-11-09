@@ -33,6 +33,7 @@ export type MaintenanceOrchestratorOptions = {
 export type MaintenanceRunOptions = {
   cadence?: MaintenanceCadence;
   runId?: MaintenanceRunId;
+  noveltySinceMs?: number;
   processes: OfflineProcess[];
   afterRun?: (result: OrchestratorResult) => Promise<void>;
   opts?: {
@@ -102,10 +103,12 @@ export class MaintenanceOrchestrator {
   private createContext(
     runId: ReturnType<typeof createMaintenanceRunId>,
     streamWriter: StreamWriter,
+    noveltySinceMs?: number,
   ) {
     return {
       ...this.options.baseContext,
       runId,
+      ...(noveltySinceMs === undefined ? {} : { noveltySinceMs }),
       auditLog: this.options.auditLog,
       streamWriter,
     } satisfies OfflineContext;
@@ -196,7 +199,7 @@ export class MaintenanceOrchestrator {
 
       for (const process of input.processes) {
         const override = input.opts?.processOverrides?.[process.name];
-        const context = this.createContext(runId, streamWriter);
+        const context = this.createContext(runId, streamWriter, input.noveltySinceMs);
         const startedAt = performance.now();
 
         if (context.tracer?.enabled === true) {

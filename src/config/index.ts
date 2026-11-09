@@ -666,6 +666,12 @@ const configBaseSchema = z.object({
           maxEpisodesPerRun: z.number().int().positive().default(8),
           maxInputTokensPerRun: z.number().int().positive().default(150_000),
           budget: z.number().int().positive().default(60_000),
+          // Extract only from episodes the being engaged with: recalled in a
+          // later turn, or built from its own utterance or tool call.
+          engagedOnly: z.boolean().default(false),
+          // An episode waits this long before extraction, so a later recall has
+          // time to count as engagement.
+          minEpisodeAgeDays: z.number().nonnegative().default(0),
         })
         .prefault({}),
       proceduralSynthesizer: z
@@ -687,6 +693,10 @@ const configBaseSchema = z.object({
           t3DemoteHeat: z.number().positive().default(3),
           archiveAgeDays: z.number().positive().default(45),
           archiveMinHeat: z.number().nonnegative().default(1),
+          // Archive a raw episode the being never engaged with (never recalled,
+          // no own utterance or tool call in it) after this many days, without
+          // waiting for semantic extraction. Null leaves only the rule above.
+          unengagedArchiveAgeDays: z.number().positive().nullable().default(null),
           episodeDecayIntervalMs: z
             .number()
             .positive()
@@ -843,6 +853,12 @@ const configBaseSchema = z.object({
       optimizeStorage: z.boolean().default(true),
       lightBudget: z.number().int().positive().nullable().default(null),
       heavyBudget: z.number().int().positive().nullable().default(null),
+      // When on, a scheduled heavy pass starts only from what is new since the
+      // previous heavy pass: the reflector works on groups that gained a new
+      // episode, the associator anchors every sample on a new episode, and the
+      // self-narrator reads only new episodes beside the story so far. What they
+      // compare against stays the whole memory. Off keeps every pass whole.
+      noveltyWindow: z.boolean().default(false),
       processOverrides: z
         .object({
           light: maintenanceProcessOverridesSchema.default({

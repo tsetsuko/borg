@@ -451,6 +451,19 @@ async function collectAssociationSamples(ctx: OfflineContext): Promise<Associati
   }
 
   const records = await buildSamplingRecords(ctx, episodes);
+  // With a novelty floor every sample is anchored on an episode new since the
+  // previous heavy pass; its partners still come from the whole memory, so new
+  // experience meets distant old experience. Nothing new means nothing to do.
+  const noveltySinceMs = ctx.noveltySinceMs;
+  const newRecords =
+    noveltySinceMs === undefined
+      ? null
+      : records.filter((record) => record.episode.created_at >= noveltySinceMs);
+
+  if (newRecords !== null && newRecords.length === 0) {
+    return [];
+  }
+
   const byBucket = new Map<string, EpisodeSamplingRecord[]>();
 
   for (const record of records) {
@@ -466,6 +479,24 @@ async function collectAssociationSamples(ctx: OfflineContext): Promise<Associati
   for (let sampleIndex = 0; sampleIndex < maxSamplesPerRun; sampleIndex += 1) {
     const selected: EpisodeSamplingRecord[] = [];
     const selectedIds = new Set<Episode["id"]>();
+
+    if (newRecords !== null) {
+      const anchor = selectFromBucket({
+        bucket: newRecords,
+        selectedIds,
+        usedIds,
+        prefer: "anchor",
+        random,
+      });
+
+      if (anchor === null) {
+        break;
+      }
+
+      selected.push(anchor);
+      selectedIds.add(anchor.episode.id);
+    }
+
     const sampleBucketKeys = shuffleDeterministic(
       bucketKeys,
       createPrng(`${seed}:sample:${sampleIndex}`),
