@@ -1040,6 +1040,7 @@ export async function runRetrievalPhase(input: {
       currentSessionPreviousTurnAt,
     },
     windowStartMs: recentLivedExperienceSinceMs,
+    collapseCrossSessionActivity: recentLivedExperienceConfig.collapseCrossSessionActivity,
   });
   const mostRecentOtherSessionActivityAt =
     input.options.activityRepository?.getMostRecentOtherActiveSessionEventOccurredAt?.({

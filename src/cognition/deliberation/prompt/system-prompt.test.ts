@@ -1723,6 +1723,80 @@ describe("buildBaseSystemPrompt", () => {
     expect(selfPrompt).toBe(baselineSelfPrompt);
   });
 
+  it("prints each recent lived experience row as one line with its label and no metadata", () => {
+    const occurredAt = Date.UTC(2026, 5, 17, 10, 0, 0);
+    const row = (input: {
+      id: string;
+      text: string;
+      stateMetadata: Record<string, unknown>;
+      state?: string;
+    }) => ({
+      id: input.id,
+      source_type: "system_metadata" as const,
+      session_scope: "global" as const,
+      actor: "system" as const,
+      trust_rank: 84,
+      text: input.text,
+      value: "cross_session_activity",
+      ...(input.state === undefined ? {} : { state: input.state }),
+      state_metadata: { occurred_at: occurredAt, ...input.stateMetadata },
+      taint: "none" as const,
+    });
+    const evidenceLedger = {
+      sections: [],
+      audienceStanding: {
+        commitmentEntries: [],
+        relationalEntries: [],
+        observedEventIntrospectionEntries: [],
+        recentLivedExperienceEntries: [
+          row({
+            id: "recent_lived_experience:1",
+            text: "Borg replied to Kira 2h ago in another active session.",
+            stateMetadata: {
+              lived_experience_kind: "cross_session_activity",
+              session_id: "sess_aaaaaaaaaaaaaaaa",
+              disclosure_label: {
+                disclosure_class: "self_private",
+                origin_audience_entity_ids: [],
+                private_to_entity_ids: [],
+                public_to_entity_ids: [],
+              },
+              disclosure_note:
+                "I can use this internally; I do not disclose it to the current audience unless authorized",
+            },
+          }),
+          // A metadata label that does not parse still leaves the row its label from `state`.
+          row({
+            id: "recent_lived_experience:2",
+            text: "Kira contacted Borg 1h ago in another active session.",
+            state:
+              "active disclosure_class=relationship_private private-to=unknown; I can use this internally; I do not disclose it to the current audience unless authorized",
+            stateMetadata: { lived_experience_kind: "cross_session_activity", disclosure_label: "?" },
+          }),
+        ],
+        renderRecentLivedExperience: true,
+      },
+    } as unknown as EvidenceLedger;
+    const block = extractBlock(
+      buildBaseSystemPrompt(
+        makeContext({ isSelfAudience: true, audienceEntityId: null, evidenceLedger }),
+        PROMPT_OPTIONS,
+      ),
+      "borg_standing_with_audience",
+    );
+
+    expect(block).toContain(
+      "- Borg replied to Kira 2h ago in another active session. [disclosure_class=self_private private-to=unknown]",
+    );
+    expect(block).toContain(
+      "- Kira contacted Borg 1h ago in another active session. [disclosure_class=relationship_private private-to=unknown]",
+    );
+    expect(block.split("I can use this internally").length - 1).toBe(1);
+    expect(block).not.toContain("<recent_lived_experience_entry");
+    expect(block).not.toContain("sess_aaaaaaaaaaaaaaaa");
+    expect(block).not.toContain("trust_rank");
+  });
+
   it("renders recent lived experience chronologically with UTC day boundaries", () => {
     const firstDayAt = Date.UTC(2026, 5, 15, 20, 0, 0);
     const secondDayAt = Date.UTC(2026, 5, 17, 10, 0, 0);

@@ -43,6 +43,10 @@ import {
 } from "../../../retrieval/index.js";
 import { isCreatorInOperatorContext } from "../../authority.js";
 import {
+  MEMORY_DISCLOSURE_INTERNAL_USE_NOTE,
+  renderMemoryDisclosureLabelFieldsForModel,
+} from "../../../memory/common/disclosure-label.js";
+import {
   actionMemoryDisclosureLabel,
   correctionMemoryDisclosureLabel,
   commitmentMemoryDisclosureLabel,
@@ -1078,6 +1082,40 @@ function entryOccurredAt(entry: EvidenceLedgerEntry): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+// One line per row: what happened and when (both are in the row's text), plus the row's
+// disclosure label when it is not public. The entry's id, ranks, state and metadata block stay
+// on the object for code and are not printed; the internal-use sentence is said once in the
+// block's interpretation.
+function renderRecentLivedExperienceRow(entry: EvidenceLedgerEntry): string {
+  const fields = recentLivedExperienceDisclosureFields(entry);
+  const disclosure = fields === null ? "" : ` [${fields}]`;
+
+  return `- ${escapeXmlText(entry.text ?? entry.value ?? "")}${escapeXmlText(disclosure)}`;
+}
+
+// The label's fields, from the metadata object when it parses, else from the label the builder
+// rendered into `state`; null for a public row. Falling back to `state` keeps a row from losing
+// its label if the metadata shape ever changes.
+function recentLivedExperienceDisclosureFields(entry: EvidenceLedgerEntry): string | null {
+  const label = memoryDisclosureLabelFromMetadata(entry.state_metadata?.disclosure_label);
+
+  if (label !== null) {
+    return label.disclosureClass === "public"
+      ? null
+      : renderMemoryDisclosureLabelFieldsForModel(label);
+  }
+
+  const start = entry.state?.indexOf("disclosure_class=") ?? -1;
+
+  if (entry.state === undefined || start < 0) {
+    return null;
+  }
+
+  const fields = entry.state.slice(start).split(";")[0]!.trim();
+
+  return fields.startsWith("disclosure_class=public") ? null : fields;
+}
+
 function renderRecentLivedExperienceLines(input: {
   entries: readonly EvidenceLedgerEntry[] | undefined;
   render: boolean | undefined;
@@ -1099,7 +1137,9 @@ function renderRecentLivedExperienceLines(input: {
   });
   const lines = [
     `${input.indent}<recent_lived_experience>`,
-    `${input.indent}  <interpretation>Session-agnostic recent lived experience since I last engaged this current session. Rows are disclosure-labeled density or introspection metadata; other-audience message text is not rendered here.</interpretation>`,
+    `${input.indent}  <interpretation>${escapeXmlText(
+      `Session-agnostic recent lived experience since I last engaged this current session, one line per row; other-audience message text is not rendered here. A row with a disclosure_class other than public: ${MEMORY_DISCLOSURE_INTERNAL_USE_NOTE}.`,
+    )}</interpretation>`,
   ];
   let currentDayKey: string | null = null;
 
@@ -1119,9 +1159,7 @@ function renderRecentLivedExperienceLines(input: {
       }
     }
 
-    lines.push(
-      ...renderLedgerEntryLines("recent_lived_experience_entry", entry, `${input.indent}  `),
-    );
+    lines.push(`${input.indent}  ${renderRecentLivedExperienceRow(entry)}`);
   }
 
   lines.push(`${input.indent}</recent_lived_experience>`);

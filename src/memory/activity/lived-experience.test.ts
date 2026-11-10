@@ -144,6 +144,56 @@ describe("selectRecentLivedExperienceRows", () => {
     });
   });
 
+  it("shows other sessions' activity only as density lines, today included, when collapsing", () => {
+    const nowMs = Date.UTC(2026, 5, 17, 12, 0, 0);
+    const recentActivityAt = Date.UTC(2026, 5, 17, 10, 0, 0);
+    const audienceEntityId = createEntityId();
+    const sessionId = createSessionId();
+    const input = {
+      nowMs,
+      crossSessionSelfActivity: [
+        {
+          kind: "user_contact" as const,
+          occurredAt: recentActivityAt,
+          sessionId,
+          relativeAge: "2h ago",
+          text: "Lunaria contacted Borg 2h ago in another active session.",
+          originAudienceEntityIds: [audienceEntityId],
+          sourceStreamEntryIds: [createStreamEntryId()],
+        },
+      ],
+      selfDecisionIntrospection: [],
+      activityDensity: [
+        {
+          dayKey: "2026-06-17",
+          dayStartMs: Date.UTC(2026, 5, 17),
+          sessionId,
+          sessionLabel: "Arena thread",
+          audienceLabel: "BotArena group",
+          audienceEntityId,
+          eventCount: 64,
+          conversationTurnCount: 19,
+          kindCounts: { userContact: 36, borgReplied: 9, turnCompleted: 19 },
+          firstOccurredAt: Date.UTC(2026, 5, 17, 9, 0, 0),
+          lastOccurredAt: recentActivityAt,
+        },
+      ],
+      selfDecisionDensity: [],
+    };
+
+    expect(selectRecentLivedExperienceRows(input).map((row) => row.kind)).toEqual([
+      "cross_session_activity",
+    ]);
+
+    const collapsed = selectRecentLivedExperienceRows({
+      ...input,
+      collapseCrossSessionActivity: true,
+    });
+
+    expect(collapsed.map((row) => row.kind)).toEqual(["cross_session_activity_density"]);
+    expect(collapsed[0]?.text).toContain("[Jun 17] 19 conversation turns with BotArena group");
+  });
+
   it("collapses older activity detail by UTC day and session, not day alone", () => {
     const nowMs = Date.UTC(2026, 5, 17, 12, 0, 0);
     const oldActivityAt = Date.UTC(2026, 5, 15, 10, 0, 0);

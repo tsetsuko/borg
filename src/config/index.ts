@@ -217,6 +217,9 @@ const recentLivedExperienceConfigSchema = z
       .default(DEFAULT_RECENT_LIVED_EXPERIENCE_RECENCY_WINDOW_MS),
     cap: z.number().int().positive().default(DEFAULT_RECENT_LIVED_EXPERIENCE_CAP),
     densityCap: z.number().int().positive().default(DEFAULT_RECENT_LIVED_EXPERIENCE_DENSITY_CAP),
+    // True: other sessions' recent activity is one line per session and day (counts and time
+    // span) instead of one row per contact, reply and turn.
+    collapseCrossSessionActivity: z.boolean().default(false),
     gapThresholdMs: z
       .number()
       .int()

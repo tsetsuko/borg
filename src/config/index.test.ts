@@ -257,6 +257,7 @@ describe("config", () => {
         recencyWindowMs: 3 * 24 * 60 * 60_000,
         cap: 64,
         densityCap: 48,
+        collapseCrossSessionActivity: false,
         gapThresholdMs: 3 * 60 * 60_000,
       },
       sectionOptions: {},
@@ -1379,6 +1380,7 @@ describe("config", () => {
       recencyWindowMs: 172_800_000,
       cap: 72,
       densityCap: 24,
+      collapseCrossSessionActivity: false,
       gapThresholdMs: 60_000,
     });
     expect(config.generation.evidenceLedger.decisionArtifact).toMatchObject({

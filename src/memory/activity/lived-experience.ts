@@ -92,6 +92,10 @@ export type RecentLivedExperienceProjectionInput = {
   dailySpineWindowMs?: number;
   periodCap?: number;
   windowStartMs?: number;
+  // True: other sessions' activity is shown only as one density line per session and day,
+  // including today, instead of one row per contact, reply and turn. Per-event order and
+  // time inside a day are not shown.
+  collapseCrossSessionActivity?: boolean;
 };
 
 function promptSafeLabel(value: string): string {
@@ -291,6 +295,7 @@ export function selectRecentLivedExperienceRows(
 
   for (const row of input.crossSessionSelfActivity) {
     if (
+      input.collapseCrossSessionActivity === true ||
       collapsedActivityDayKeys.has(activityCollapseKey(utcDayKey(row.occurredAt), row.sessionId))
     ) {
       continue;
@@ -346,7 +351,10 @@ export function selectRecentLivedExperienceRows(
       continue;
     }
 
-    if (!isUtcDayBefore(row.lastOccurredAt, individualCutoffMs)) {
+    if (
+      input.collapseCrossSessionActivity !== true &&
+      !isUtcDayBefore(row.lastOccurredAt, individualCutoffMs)
+    ) {
       continue;
     }
 
