@@ -15,7 +15,7 @@ import {
 } from "../prompts/prompt-surface-registry.js";
 import { renderTaggedPromptBlock } from "../deliberation/prompt/sections.js";
 import { emptySectionCountRecord } from "./budget.js";
-import { renderSection } from "./section-rendering.js";
+import { LEDGER_DISCLOSURE_GUIDANCE, renderSection } from "./section-rendering.js";
 import type {
   EvidenceLedger,
   EvidenceLedgerEntry,
@@ -94,6 +94,7 @@ const COMPACT_PLANNER_LEDGER_GUIDANCE = [
   "Dialogue messages carry the conversational transcript; this compact ledger carries locked state, constraints, participant context, quarantines, and action threads.",
   "Quarantined/contested/assistant-seeded values are not facts.",
   "In goal state_metadata, counterparty_entity_id is the participant the responsibility runs toward, not an owner or an audience.",
+  LEDGER_DISCLOSURE_GUIDANCE,
 ].join("\n");
 
 export function truncateTextForCompactPlannerLedger(

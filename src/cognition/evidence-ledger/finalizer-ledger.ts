@@ -10,7 +10,7 @@ import {
   type PromptSurfaceRenderContext,
 } from "../prompts/prompt-surface-registry.js";
 import { renderTaggedPromptBlock } from "../deliberation/prompt/sections.js";
-import { renderSection } from "./section-rendering.js";
+import { LEDGER_DISCLOSURE_GUIDANCE, renderSection } from "./section-rendering.js";
 import type { EvidenceLedger } from "./types.js";
 
 const HIERARCHY_GUIDANCE = [
@@ -42,9 +42,9 @@ export function renderEvidenceLedger(
   const content = [
     "EvidenceLedger: prioritized evidence substrate for the final response.",
     HIERARCHY_GUIDANCE,
+    LEDGER_DISCLOSURE_GUIDANCE,
     renderImageAttachmentLabels(ledger),
     transcriptStatus,
-    `estimated_tokens=${ledger.estimatedTokens}`,
     renderSharedStateArtifact(ledger.sharedState, options.sharedState),
     ...ledger.sections.map((section) => renderSection(section)),
   ]

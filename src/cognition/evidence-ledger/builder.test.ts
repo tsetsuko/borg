@@ -2670,7 +2670,7 @@ describe("EvidenceLedgerBuilder", () => {
     ]);
     expect(rendered).toContain("Should I ask Alice about the private launch timing?");
     expect(rendered).toContain("disclosure_class=relationship_private");
-    expect(rendered).toContain(`private_to_entity_ids":["${alice}"]`);
+    expect(rendered).toContain(`private-to=${alice}`);
   });
 
   it("merges retrieved open-question metadata into the lifecycle row before omission accounting", async () => {
@@ -3780,6 +3780,56 @@ describe("EvidenceLedgerBuilder", () => {
     expect(
       ledger.sections.find((section) => section.id === "current_user_message")?.entries[0]?.text,
     ).toBe("Atlas needs a rollback plan.");
+  });
+
+  it("leaves the action-states section out when the action lifecycle is switched off", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    const writer = new StreamWriter({
+      dataDir: tempDir,
+      sessionId: DEFAULT_SESSION_ID,
+      clock: new FixedClock(NOW_MS),
+    });
+    const userEntry = await writer.append({
+      kind: "user_msg",
+      content: "I need to write the harness doc.",
+    });
+    const action = makeAction(userEntry.id, {
+      description: "write the harness presentation",
+      actor: "user",
+      state: "committed_to_do",
+      created_at: NOW_MS,
+      updated_at: NOW_MS,
+      committed_at: NOW_MS,
+      scheduled_at: null,
+    });
+    const build = (includeActionStates: boolean | undefined) =>
+      new EvidenceLedgerBuilder({
+        createStreamReader: (sessionId) => new StreamReader({ dataDir: tempDir, sessionId }),
+        relationalSlotRepository: { list: () => [] },
+        actionRepository: { list: () => [action] },
+        currentSessionTranscriptTokenBudget: 50_000,
+        ...(includeActionStates === undefined ? {} : { includeActionStates }),
+      }).build({
+        sessionId: DEFAULT_SESSION_ID,
+        audienceEntityId: null,
+        currentUserMessage: String(userEntry.content),
+        currentUserEntry: userEntry,
+        workingMemory: makeWorkingMemory(),
+        applicableCommitments: [],
+        retrievedEvidence: [],
+        retrievedEpisodes: [],
+        retrievedSemantic: null,
+        openQuestions: [],
+        pendingCorrections: [],
+        frameAnomaly: null,
+      });
+    const actionEntries = (ledger: Awaited<ReturnType<typeof build>>) =>
+      ledger.sections.find((section) => section.id === "action_states")?.entries ?? [];
+
+    expect(actionEntries(await build(undefined))).toHaveLength(1);
+    expect(actionEntries(await build(true))).toHaveLength(1);
+    expect(actionEntries(await build(false))).toHaveLength(0);
   });
 
   it("renders one action thread for same-goal similar action transitions", async () => {

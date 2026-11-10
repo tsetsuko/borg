@@ -1,30 +1,89 @@
+import {
+  MEMORY_DISCLOSURE_INTERNAL_USE_NOTE,
+  SEMANTIC_SOURCE_DISCLOSURE_INTERNAL_USE_NOTE,
+  memoryDisclosureLabelFromMetadata,
+  renderMemoryDisclosureLabelFieldsForModel,
+} from "../../memory/common/disclosure-label.js";
 import { renderFrameAnomalyAnnotations } from "../../stream/frame-anomaly.js";
-import type {
-  EvidenceLedgerEntry,
-  EvidenceLedgerSection,
-  EvidenceLedgerSectionFramingCounts,
-} from "./types.js";
+import type { EvidenceLedgerEntry, EvidenceLedgerSection } from "./types.js";
 
+// The internal-use sentences, said once for the whole ledger instead of on every labelled row.
+// Builders attach a row's disclosure label twice -- rendered into `state` and as a
+// `disclosure_label` object in `state_metadata` -- and each copy carries one of these sentences.
+// The row keeps one copy of the label's fields; the sentence lives here. The object stays on the
+// entry for code that reads it (the compact finalizer layout); only the printed row drops it.
+export const LEDGER_DISCLOSURE_GUIDANCE = [
+  `Rows with a disclosure_class other than public: ${MEMORY_DISCLOSURE_INTERNAL_USE_NOTE}.`,
+  `Rows marked source_details=private are ${SEMANTIC_SOURCE_DISCLOSURE_INTERNAL_USE_NOTE}.`,
+].join("\n");
+
+const PRINTED_DISCLOSURE_METADATA_KEYS = new Set(["disclosure_label", "disclosure_note"]);
+
+function rowDisclosure(entry: EvidenceLedgerEntry): {
+  state: string | undefined;
+  stateMetadata: Record<string, unknown> | undefined;
+} {
+  const metadata = entry.state_metadata;
+  const semanticSource =
+    metadata?.["disclosure_note"] === SEMANTIC_SOURCE_DISCLOSURE_INTERNAL_USE_NOTE ||
+    entry.state?.includes(SEMANTIC_SOURCE_DISCLOSURE_INTERNAL_USE_NOTE) === true;
+  let state = entry.state
+    ?.replace(`; ${SEMANTIC_SOURCE_DISCLOSURE_INTERNAL_USE_NOTE}`, "")
+    .replace(`; ${MEMORY_DISCLOSURE_INTERNAL_USE_NOTE}`, "");
+  const label =
+    metadata === undefined ? null : memoryDisclosureLabelFromMetadata(metadata["disclosure_label"]);
+
+  // A row whose label sits only in the metadata object still prints it once.
+  if (
+    label !== null &&
+    label.disclosureClass !== "public" &&
+    state?.includes("disclosure_class=") !== true
+  ) {
+    const fields = renderMemoryDisclosureLabelFieldsForModel(label);
+    state = state === undefined || state.length === 0 ? fields : `${state} ${fields}`;
+  }
+
+  if (semanticSource) {
+    state =
+      state === undefined || state.length === 0
+        ? "source_details=private"
+        : `${state} source_details=private`;
+  }
+
+  const rest =
+    metadata === undefined
+      ? {}
+      : Object.fromEntries(
+          Object.entries(metadata).filter(([key]) => !PRINTED_DISCLOSURE_METADATA_KEYS.has(key)),
+        );
+
+  return { state, stateMetadata: Object.keys(rest).length === 0 ? undefined : rest };
+}
+
+// Printed for the model only; code reads the entry object, never this text. What a row
+// prints is who and where it comes from, its source handles, its state and disclosure label,
+// and taint or self-report class when they carry information. Ranking and bookkeeping fields
+// (trust_rank, citation_type, stream_index, salience_class, via_retrieval, taint=none) stay on
+// the entry and are not printed: section order already ranks sources, and the hierarchy
+// guidance says it in words.
 export function renderEntry(entry: EvidenceLedgerEntry): string {
+  const disclosure = rowDisclosure(entry);
   const stateMetadata =
-    entry.state_metadata === undefined ? undefined : JSON.stringify(entry.state_metadata);
+    disclosure.stateMetadata === undefined ? undefined : JSON.stringify(disclosure.stateMetadata);
   const metadata = [
     `id=${entry.id}`,
     `source_type=${entry.source_type}`,
     `scope=${entry.session_scope}`,
     `actor=${entry.actor}`,
-    `trust_rank=${entry.trust_rank}`,
     entry.citations === undefined || entry.citations.length === 0
       ? null
       : `[citation: ${entry.citations.join(", ")}]`,
-    entry.citation_type === undefined ? null : `citation_type=${entry.citation_type}`,
-    entry.stream_index === undefined ? null : `stream_index=${entry.stream_index}`,
-    entry.state === undefined ? null : `state=${entry.state}`,
-    entry.salience_class === undefined ? null : `salience_class=${entry.salience_class}`,
+    disclosure.state === undefined || disclosure.state.length === 0
+      ? null
+      : `state=${disclosure.state}`,
     stateMetadata === undefined ? null : `state_metadata=${stateMetadata}`,
-    entry.taint === undefined ? null : `taint=${entry.taint}`,
+    entry.taint === undefined || entry.taint === "none" ? null : `taint=${entry.taint}`,
     entry.persistence_class === undefined ? null : `persistence_class=${entry.persistence_class}`,
-    entry.via_retrieval === true ? "via_retrieval=true" : null,
   ].filter((part): part is string => part !== null);
   const body = [
     renderFrameAnomalyAnnotations(entry.frame_anomalies) || null,
@@ -35,54 +94,10 @@ export function renderEntry(entry: EvidenceLedgerEntry): string {
   return [`- ${metadata.join(" ")}`, ...body].join("\n");
 }
 
-// A framing count can be misread on two independent axes, and naming one leaves the other running.
-//
-// Stage: the counts are taken when a section is assembled, upstream of both reductions the ledger
-// then applies to it -- provenance dedupe folding an entry into a higher-priority section, and
-// budget omission -- and are never recomputed against what survived. The per-entry
-// autobiographical_recall_cap.rendered_count IS recomputed, twice, so the two numbers on the same
-// section are measured at different stages and can disagree without either being wrong. Naming the
-// stage explained a shortfall without sizing it: the budget reduction announced itself as an
-// evidence_ledger_omitted entry and the dedupe half left no count anywhere, so a page could show
-// forty-eight assembled, seven printed and seventeen omitted and leave the other twenty-four
-// unaccountable in either direction. The dedupe stage now writes its own per-section drop count
-// back onto the framing, so both reductions subtract from the population to the page. What remains
-// deliberately unclaimed is that the subtraction always closes: a section can carry an omission
-// entry from a stage earlier than either -- recent_lived_experience prints the compiler's own
-// detail-omission breadcrumb -- so a residue names a third reduction rather than a lost row.
-//
-// Partition: every key counts a named subset, and until the population was printed beside them a
-// reader had no denominator. autobiographical_recall counts one kind out of the twelve it can
-// assemble, so a page carrying ten rows of other kinds prints a figure of zero above them: not a
-// shortfall at all, and unreachable by any amount of stage-naming. rows_assembled is the fix and
-// it is required by the type rather than agreed by convention, so a subset figure cannot be
-// printed without the population it was taken over.
-const FRAMING_COUNTS_SCOPE =
-  "framing_counts_scope: rows_assembled is the population this section was assembled from, and every other figure counts one named subset of that population, so the figures need not sum to it, need not cover it, and one of them can sit below the number of rows printed here without a row having gone missing. Two reductions run between that count and this page and both report themselves: folded_out_by_provenance counts rows dropped because a higher-priority section carries the same evidence or because they merged into a sibling row here, and the omitted-entries row below counts what the finalizer ledger budget then cut. That key is written by the dedupe stage itself, so a render taken before that stage carries no such key at all and its absence there is not a zero. Those two are fates rather than content classes, so they crosscut the other subsets instead of joining them, and subtracting both from rows_assembled should leave the rows printed here; a residue is a reduction neither of them names, which is what an omission row from an earlier stage counts.";
-
-function orderedFramingCounts(
-  counts: EvidenceLedgerSectionFramingCounts,
-): EvidenceLedgerSectionFramingCounts {
-  const { rows_assembled: rowsAssembled, ...subsets } = counts;
-
-  return { rows_assembled: rowsAssembled, ...subsets };
-}
-
 export function renderSection(section: EvidenceLedgerSection): string {
-  const framingLines =
-    section.framing === undefined
-      ? []
-      : [
-          `framing: ${section.framing.text}`,
-          ...(section.framing.counts === undefined
-            ? []
-            : [
-                // The population leads the object wherever the call site happens to put it, so the
-                // key the scope line names is never buried between the subsets it bounds.
-                `framing_counts: ${JSON.stringify(orderedFramingCounts(section.framing.counts))}`,
-                FRAMING_COUNTS_SCOPE,
-              ]),
-        ];
+  // framing.counts (rows assembled, folded out, omitted) is pipeline bookkeeping for the trace;
+  // it is not printed for the model.
+  const framingLines = section.framing === undefined ? [] : [`framing: ${section.framing.text}`];
 
   if (section.entries.length === 0) {
     return [`## ${section.label}`, ...framingLines, "No entries."].join("\n");

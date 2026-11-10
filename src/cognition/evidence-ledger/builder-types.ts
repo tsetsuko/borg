@@ -47,6 +47,9 @@ export type EvidenceLedgerBuilderOptions = {
     "findByHandles" | "countRuminations" | "countByStatus"
   >;
   currentSessionTranscriptTokenBudget: number;
+  // False leaves the action-states section out of the ledger (the action
+  // lifecycle is switched off for this being). Absent means included.
+  includeActionStates?: boolean;
   actionThreadRenderLimit?: number;
   actionThreadSimilarityThreshold?: number;
   actionThreadSourceRecordLimit?: number;

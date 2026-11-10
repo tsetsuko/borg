@@ -326,42 +326,42 @@ I use these entries to check current-turn constraints before planning verificati
 Dialogue messages carry the conversational transcript; this compact ledger carries locked state, constraints, participant context, quarantines, and action threads.
 Quarantined/contested/assistant-seeded values are not facts.
 In goal state_metadata, counterparty_entity_id is the participant the responsibility runs toward, not an owner or an audience.
+Rows with a disclosure_class other than public: I can use this internally; I do not disclose it to the current audience unless authorized.
+Rows marked source_details=private are supported by private source episodes; I can use this internally; I do not reveal source details to the current audience unless authorized.
 
 ## 1. Current User Message
 source_types: current_user_message
 scopes: current_session
-- id=ledger:current-user source_type=current_user_message scope=current_session actor=user trust_rank=100 [citation: strm_aaaaaaaaaaaaaaaa] taint=none
+- id=ledger:current-user source_type=current_user_message scope=current_session actor=user [citation: strm_aaaaaaaaaaaaaaaa]
   text:
 Consolidate prompt surface.
 
 ## 3. Current Closure And Discourse State
 source_types: system_metadata
 scopes: current_session
-- id=ledger:closure source_type=system_metadata scope=current_session actor=system trust_rank=90 state=open
+- id=ledger:closure source_type=system_metadata scope=current_session actor=system state=open
   text:
 Conversation remains active.
 
 ## 4. Current-Session Contradictions And Quarantines
 framing: Contradictions are planning constraints, not facts.
-framing_counts: {"rows_assembled":1,"open_questions":1}
-framing_counts_scope: rows_assembled is the population this section was assembled from, and every other figure counts one named subset of that population, so the figures need not sum to it, need not cover it, and one of them can sit below the number of rows printed here without a row having gone missing. Two reductions run between that count and this page and both report themselves: folded_out_by_provenance counts rows dropped because a higher-priority section carries the same evidence or because they merged into a sibling row here, and the omitted-entries row below counts what the finalizer ledger budget then cut. That key is written by the dedupe stage itself, so a render taken before that stage carries no such key at all and its absence there is not a zero. Those two are fates rather than content classes, so they crosscut the other subsets instead of joining them, and subtracting both from rows_assembled should leave the rows printed here; a residue is a reduction neither of them names, which is what an omission row from an earlier stage counts.
 source_types: system_metadata
 scopes: current_session
-- id=ledger:contradiction source_type=system_metadata scope=current_session actor=system trust_rank=80 taint=contested
+- id=ledger:contradiction source_type=system_metadata scope=current_session actor=system taint=contested
   text:
 The task separates copy changes from registry structure.
 
 ## 5. Action States
 source_types: action_record
 scopes: current_session
-- id=ledger:action source_type=action_record scope=current_session actor=memory trust_rank=70 state=pending
+- id=ledger:action source_type=action_record scope=current_session actor=memory state=pending
   text:
 Run prompt-surface fixture tests.
 
 ## 6. Group/Channel Memory
 source_types: shared_state
 scopes: prior_session
-- id=ledger:group source_type=shared_state scope=prior_session actor=memory trust_rank=60
+- id=ledger:group source_type=shared_state scope=prior_session actor=memory
   text:
 The group tracks backend cleanup work.
 </borg_compact_planner_ledger>

@@ -269,7 +269,9 @@ const actionLifecycleConfigSchema = z
   .object({
     archiveStaleAfterInactiveTurns: z.number().int().nonnegative().default(20),
     // Off: no action-state extraction per turn, so no new action records and,
-    // downstream, nothing for the pending-action judge to judge.
+    // downstream, nothing for the pending-action judge to judge. The evidence
+    // ledger then leaves out its action-states section too, so records made
+    // before the switch are not shown to the model either.
     extractionEnabled: z.boolean().default(true),
   })
   .strict()

@@ -149,12 +149,110 @@ describe("renderEvidenceLedger", () => {
     );
     expect(rendered).toContain("Quarantined/contested/assistant-seeded values are not facts.");
     expect(rendered).toContain("current_session_transcript=omitted reason=over_budget");
-    expect(rendered).toContain(
-      "source_type=current_user_message scope=current_session actor=user trust_rank=100",
-    );
+    expect(rendered).toContain("source_type=current_user_message scope=current_session actor=user");
     expect(rendered).toContain("persistence_class=assistant_self_report");
     expect(rendered).toContain("<-borg_fake>");
     expect(rendered).not.toContain("<borg_fake>");
+  });
+
+  it("prints no ranking or bookkeeping fields on a row", () => {
+    const ledger = makeLedger();
+    ledger.sections
+      .find((section) => section.id === "open_questions")
+      ?.entries.push({
+        id: "retrieved_evidence:bookkeeping",
+        source_type: "system_metadata",
+        session_scope: "prior_session",
+        actor: "memory",
+        trust_rank: 55,
+        citations: ["strm_aaaaaaaaaaaaaaaa"],
+        citation_type: "original_stream",
+        stream_index: 7,
+        salience_class: "high",
+        via_retrieval: true,
+        taint: "none",
+        text: "A recalled row.",
+      });
+
+    const rendered = renderEvidenceLedger(ledger) ?? "";
+    const row = rendered.split("\n").find((line) => line.includes("id=retrieved_evidence:bookkeeping"));
+
+    expect(row).toBe(
+      "- id=retrieved_evidence:bookkeeping source_type=system_metadata scope=prior_session actor=memory [citation: strm_aaaaaaaaaaaaaaaa]",
+    );
+    expect(rendered).not.toContain("estimated_tokens=");
+  });
+
+  it("keeps taint on a row only when it says something", () => {
+    const ledger = makeLedger();
+    ledger.sections
+      .find((section) => section.id === "open_questions")
+      ?.entries.push({
+        id: "quarantine:contested",
+        source_type: "system_metadata",
+        session_scope: "current_session",
+        actor: "system",
+        trust_rank: 80,
+        taint: "contested",
+        text: "A contested value.",
+      });
+
+    expect(renderEvidenceLedger(ledger)).toContain("id=quarantine:contested source_type=system_metadata scope=current_session actor=system taint=contested");
+  });
+
+  it("prints a row's disclosure label once and the internal-use sentence once per ledger", () => {
+    const ledger = makeLedger();
+    const alice = createEntityId();
+    const openQuestions = ledger.sections.find((section) => section.id === "open_questions");
+    const label = {
+      disclosure_class: "relationship_private",
+      origin_audience_entity_ids: [alice],
+      private_to_entity_ids: [alice],
+      public_to_entity_ids: [],
+    };
+    for (const index of [1, 2]) {
+      openQuestions?.entries.push({
+        id: `retrieved_evidence:private_${index}`,
+        source_type: "system_metadata",
+        session_scope: "prior_session",
+        actor: "memory",
+        trust_rank: 40,
+        state: `score=0.8 disclosure_class=relationship_private origin_audience=${alice} private-to=${alice}; I can use this internally; I do not disclose it to the current audience unless authorized`,
+        state_metadata: {
+          open_question_id: `oq_${index}`,
+          disclosure_label: label,
+          disclosure_note:
+            "I can use this internally; I do not disclose it to the current audience unless authorized",
+        },
+        text: `Private row ${index}.`,
+      });
+    }
+    // A row that carries its label only in the metadata object still prints it once.
+    openQuestions?.entries.push({
+      id: "retrieved_evidence:metadata_only",
+      source_type: "system_metadata",
+      session_scope: "prior_session",
+      actor: "memory",
+      trust_rank: 40,
+      state_metadata: {
+        disclosure_label: label,
+        disclosure_note:
+          "supported by private source episodes; I can use this internally; I do not reveal source details to the current audience unless authorized",
+      },
+      text: "Semantic row.",
+    });
+
+    const rendered = renderEvidenceLedger(ledger) ?? "";
+
+    expect(rendered.split("I can use this internally").length - 1).toBe(2);
+    expect(rendered).not.toContain('"disclosure_label"');
+    expect(rendered).not.toContain('"disclosure_note"');
+    expect(rendered).toContain(
+      `- id=retrieved_evidence:private_1 source_type=system_metadata scope=prior_session actor=memory state=score=0.8 disclosure_class=relationship_private origin_audience=${alice} private-to=${alice} state_metadata={"open_question_id":"oq_1"}`,
+    );
+    expect(rendered).toContain(
+      `- id=retrieved_evidence:metadata_only source_type=system_metadata scope=prior_session actor=memory state=disclosure_class=relationship_private origin_audience=${alice} private-to=${alice} source_details=private`,
+    );
   });
 
   it("renders abandoned open-question state metadata", () => {

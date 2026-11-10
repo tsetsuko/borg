@@ -421,9 +421,8 @@ describe("AutobiographicalRecallService", () => {
         }),
       ]),
     );
-    expect(renderSection(section!)).toContain('framing_counts: {"rows_assembled":2,');
-    expect(renderSection(section!)).toContain('"self_decision":1');
-    expect(renderSection(section!)).toContain('"observed_social_event":1');
+    // The counts stay on the section for the trace; the finalizer page does not print them.
+    expect(renderSection(section!)).not.toContain("framing_counts");
   });
 
   it("renders goal terminal conditions on the autobiographical surface", async () => {
@@ -1722,15 +1721,7 @@ describe("AutobiographicalRecallService", () => {
 
     const rendered = renderEvidenceLedger(compacted.ledger) ?? "";
 
-    expect(rendered).toContain(
-      'framing_counts: {"rows_assembled":3,"self_decision":3,"folded_out_by_provenance":1}',
-    );
-    expect(rendered).toContain(
-      "framing_counts_scope: rows_assembled is the population this section was assembled from",
-    );
-    expect(rendered).toContain(
-      "subtracting both from rows_assembled should leave the rows printed here",
-    );
+    expect(rendered).not.toContain("framing_counts");
   });
 
   it("decomposes the assembled population by the kinds actually present", () => {
@@ -1792,23 +1783,18 @@ describe("AutobiographicalRecallService", () => {
       stream_reflection: 8,
       observed_presence: 2,
     });
-    expect(renderSection(section!)).toContain(
-      'framing_counts: {"rows_assembled":10,"stream_reflection":8,"observed_presence":2}',
-    );
 
     // The kind keys are a decomposition of the population, so they close against it exactly; a
-    // kind absent from the object contributed zero, which the section framing says outright
-    // rather than leaving absence to be read as unmeasured.
+    // kind absent from the object contributed zero.
     const { rows_assembled: rowsAssembled, ...kinds } = section!.framing!.counts!;
 
     expect(Object.values(kinds).reduce((total, value) => total + value, 0)).toBe(rowsAssembled);
     expect(kinds.self_decision).toBeUndefined();
-    expect(section?.framing?.text).toContain(
-      "the framing counts here are the source kinds present in the assembly, one key per kind, so they sum to rows_assembled exactly",
-    );
+    // The counts are not printed, so the framing text no longer explains them.
+    expect(section?.framing?.text).not.toContain("framing counts");
   });
 
-  it("leads the counts object with the population whatever order the section wrote it in", () => {
+  it("prints the section framing text but not its counts or their scope paragraph", () => {
     const rendered = renderSection({
       id: "autobiographical_recall",
       label: "14. Autobiographical Recall",
@@ -1825,40 +1811,8 @@ describe("AutobiographicalRecallService", () => {
       ],
     });
 
-    expect(rendered).toContain('framing_counts: {"rows_assembled":10,"self_decision":0}');
-    expect(rendered).toContain("need not sum to it, need not cover it");
-    // This section never went through dedupe, so the fold key is absent rather than zero, and the
-    // scope line has to say which of the two it is or the reader supplies the wrong one.
-    expect(rendered).not.toContain('folded_out_by_provenance":');
-    expect(rendered).toContain("carries no such key at all and its absence there is not a zero");
-  });
-
-  it("prints the framing-counts scope only where a count is printed", () => {
-    const framing = { text: "Framing without counts." };
-    const entry = {
-      id: "autobiographical_recall:probe",
-      source_type: "system_metadata" as const,
-      session_scope: "global" as const,
-      actor: "memory" as const,
-      trust_rank: 60,
-      text: "Probe",
-    };
-
-    expect(
-      renderSection({
-        id: "autobiographical_recall",
-        label: "14. Autobiographical Recall",
-        framing,
-        entries: [entry],
-      }),
-    ).not.toContain("framing_counts_scope:");
-    expect(
-      renderSection({
-        id: "autobiographical_recall",
-        label: "14. Autobiographical Recall",
-        framing: { ...framing, counts: { rows_assembled: 1, self_decision: 0 } },
-        entries: [entry],
-      }),
-    ).toContain("framing_counts_scope:");
+    expect(rendered).toContain("framing: Framing.");
+    expect(rendered).not.toContain("framing_counts");
+    expect(rendered).not.toContain("rows_assembled");
   });
 });

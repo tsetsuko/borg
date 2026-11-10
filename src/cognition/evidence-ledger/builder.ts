@@ -235,7 +235,9 @@ export class EvidenceLedgerBuilder {
     addAttributionMatrixSection(context);
     addDiscourseStateSection(context);
     addContradictionsAndQuarantinesSection(context);
-    await addActionStatesSection(context);
+    if (this.options.includeActionStates !== false) {
+      await addActionStatesSection(context);
+    }
     addGroupChannelMemorySection(context);
     addSharedStateRecallSection(context);
     // Sprint 8d.6.3: stream IDs covered by the current_session_transcript
