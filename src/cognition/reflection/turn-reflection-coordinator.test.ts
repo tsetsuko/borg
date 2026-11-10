@@ -487,3 +487,109 @@ describe("TurnReflectionCoordinator", () => {
     });
   });
 });
+
+describe("TurnReflectionCoordinator after a silent turn", () => {
+  function setup(reflectAfterSilentTurn: boolean | undefined) {
+    const sessionId = createSessionId();
+    const workingMemory = createWorkingMemory(sessionId, 1_000);
+    const effects = {
+      createdActionIds: [],
+      createdExecutiveStepIds: [],
+      createdOpenQuestionIds: [],
+      updatedExecutiveSteps: [],
+      updatedGoals: [],
+      retiredGoalIds: [],
+      resolvedOpenQuestions: [],
+      updatedEpisodeStats: [],
+    };
+    const reflect = vi.fn(async () => ({ workingMemory, effects }));
+    const recordInteractionWithId = vi.fn(() => ({ interaction_id: 7 }) as never);
+    const moodUpdate = vi.fn(() => ({ valence: 0.2, arousal: 0.1 }) as never);
+    const emit = vi.fn();
+    const save = vi.fn();
+    const trackReflectionEffects = vi.fn();
+    const coordinator = new TurnReflectionCoordinator({
+      moodRepository: { update: moodUpdate },
+      socialRepository: { recordInteractionWithId },
+      openQuestionsRepository: { list: vi.fn(() => []) },
+      workingMemoryStore: { save },
+      pendingProceduralAttemptTracker: { update: vi.fn(() => []) },
+      createReflector: vi.fn(() => ({ reflect }) as unknown as Reflector),
+      ...(reflectAfterSilentTurn === undefined ? {} : { reflectAfterSilentTurn }),
+      clock: new FixedClock(1_000),
+      tracer: { enabled: true, includePayloads: false, emit },
+    });
+    const run = (emissionKind: "message" | "observed" | "suppressed") =>
+      coordinator.run({
+        llmClient: {} as never,
+        sessionId,
+        turnId: "turn-silent",
+        origin: "user",
+        userMessage: "@Sol something for Sol",
+        perception: {
+          affectiveSignal: { valence: 0.3, arousal: 0.2, dominant_emotion: "joy" },
+          affectiveSignalDegraded: false,
+        } as PerceptionResult,
+        workingMood: { valence: 0, arousal: 0, dominant_emotion: "neutral" },
+        postActionWorkingMemory: workingMemory,
+        selfSnapshot: {} as never,
+        deliberation: { retrievedEpisodes: [] } as never,
+        actionResult: { response: "", tool_calls: [], intents: [], workingMemory },
+        emissionKind,
+        retrievedEpisodes: [],
+        retrievalConfidence: { confidence: 1, degraded: false, reason: null } as never,
+        executiveFocus: null as never,
+        selectedSkill: null,
+        proceduralContext: null,
+        audienceEntityId: null,
+        socialInteractionEntityId: createEntityId(),
+        pendingSocialAttribution: null,
+        suppressionSet: { snapshot: () => [] } as never,
+        persistedUserEntryId: createStreamEntryId(),
+        persistedAgentEntry: {
+          id: createStreamEntryId(),
+          timestamp: 1_000,
+          session_id: sessionId,
+        } as StreamEntry,
+        isUserTurn: true,
+        streamWriter: {} as never,
+        onHookFailure: vi.fn(),
+        trackReflectionEffects,
+      });
+    return { run, reflect, recordInteractionWithId, moodUpdate, emit, save, trackReflectionEffects };
+  }
+
+  it("records the contact and the mood but makes no reflector call when switched off", async () => {
+    for (const kind of ["observed", "suppressed"] as const) {
+      const t = setup(false);
+      await t.run(kind);
+
+      expect(t.reflect).not.toHaveBeenCalled();
+      // M3 reads familiarity from recorded contacts, so silence must still count.
+      expect(t.recordInteractionWithId).toHaveBeenCalledTimes(1);
+      expect(t.moodUpdate).toHaveBeenCalledTimes(1);
+      expect(t.save).toHaveBeenCalledTimes(1);
+      expect(t.trackReflectionEffects).toHaveBeenCalledWith(
+        expect.objectContaining({ createdOpenQuestionIds: [], updatedGoals: [] }),
+      );
+      expect(t.emit).toHaveBeenCalledWith(
+        "reflection.skipped_after_silence",
+        expect.objectContaining({ turnId: "turn-silent", emission: kind }),
+      );
+    }
+  });
+
+  it("still reflects on a turn that spoke", async () => {
+    const t = setup(false);
+    await t.run("message");
+
+    expect(t.reflect).toHaveBeenCalledTimes(1);
+  });
+
+  it("reflects after silence by default, as upstream does", async () => {
+    const t = setup(undefined);
+    await t.run("observed");
+
+    expect(t.reflect).toHaveBeenCalledTimes(1);
+  });
+});

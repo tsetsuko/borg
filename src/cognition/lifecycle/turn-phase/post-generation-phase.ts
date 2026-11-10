@@ -897,6 +897,7 @@ export async function runPostGenerationPhase(input: {
         selfSnapshot: input.retrievalPhase.selfSnapshot,
         deliberation,
         actionResult,
+        emissionKind: actionEmission.kind,
         retrievedEpisodes: deliberation.retrievedEpisodes,
         recalledOpenQuestions: input.retrievalPhase.retrieval.open_questions,
         retrievalConfidence: input.retrievalPhase.retrieval.confidence,

@@ -193,6 +193,7 @@ export type TurnTraceEventName =
   | "internal_identifier_guard.completed"
   | "closure_pressure_audit.degraded"
   | "reflection.completed"
+  | "reflection.skipped_after_silence"
   | "session.completed"
   | "turn.rollback_incomplete"
   | "turn.rejected";

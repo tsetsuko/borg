@@ -150,6 +150,7 @@ export const TRACE_EVENT_TAXONOMY = {
   discourse: ["discourse_state.transitioned", "discourse_state.rejected"],
   reflection: [
     "reflection.completed",
+    "reflection.skipped_after_silence",
     "open_question_resolution.started",
     "open_question_resolution.degraded",
     "open_question_resolution.transitioned",

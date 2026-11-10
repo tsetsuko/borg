@@ -274,9 +274,19 @@ const actionLifecycleConfigSchema = z
   })
   .strict()
   .prefault({});
+const reflectionConfigSchema = z
+  .object({
+    // Off: a full turn that ends in silence (observed or suppressed) records the
+    // contact and the mood it moved, but makes no reflector call, so it yields no
+    // trait demonstration, goal progress, open question or skill outcome.
+    afterSilentTurn: z.boolean().default(true),
+  })
+  .strict()
+  .prefault({});
 const cognitionConfigSchema = z
   .object({
     actionLifecycle: actionLifecycleConfigSchema,
+    reflection: reflectionConfigSchema,
   })
   .strict()
   .prefault({});

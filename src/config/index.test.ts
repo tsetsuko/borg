@@ -341,6 +341,14 @@ describe("config", () => {
     ).toEqual({ reflectiveMode: false, lowRetrievalConfidence: true });
   });
 
+  it("reflects after silent turns by default and lets a deployment switch it off", () => {
+    expect(configSchema.parse({}).cognition.reflection).toEqual({ afterSilentTurn: true });
+    expect(
+      configSchema.parse({ cognition: { reflection: { afterSilentTurn: false } } }).cognition
+        .reflection,
+    ).toEqual({ afterSilentTurn: false });
+  });
+
   it("allows the finalizer dynamic prompt cache breakpoint to be disabled", () => {
     const config = configSchema.parse({
       deliberation: {

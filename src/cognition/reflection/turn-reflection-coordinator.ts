@@ -12,6 +12,7 @@ import type { StreamEntry, StreamWriter } from "../../stream/index.js";
 import type { Clock } from "../../util/clock.js";
 import type { EntityId, SessionId, StreamEntryId } from "../../util/ids.js";
 import type { ActionResult } from "../turn-action/index.js";
+import type { PendingTurnEmission } from "../generation/types.js";
 import type { SuppressionSet } from "../attention/index.js";
 import type { DeliberationResult, SelfSnapshot } from "../deliberation/deliberator.js";
 import type { ExecutiveFocus } from "../../executive/index.js";
@@ -64,9 +65,15 @@ export type TurnReflectionCoordinatorOptions = {
   workingMemoryStore: Pick<WorkingMemoryStore, "save">;
   pendingProceduralAttemptTracker: Pick<PendingProceduralAttemptTracker, "update">;
   createReflector: (llmClient: LLMClient) => Reflector;
+  /** cognition.reflection.afterSilentTurn; unset keeps upstream's reflect-on-every-turn. */
+  reflectAfterSilentTurn?: boolean;
   clock: Clock;
   tracer: TurnTracer;
 };
+
+function isSilentEmission(kind: PendingTurnEmission["kind"] | undefined): boolean {
+  return kind === "observed" || kind === "suppressed";
+}
 
 export type RunTurnReflectionInput = {
   llmClient: LLMClient;
@@ -81,6 +88,8 @@ export type RunTurnReflectionInput = {
   selfSnapshot: SelfSnapshot;
   deliberation: DeliberationResult;
   actionResult: ActionResult;
+  /** What the turn emitted; a silent turn may skip the reflector (reflectAfterSilentTurn). */
+  emissionKind?: PendingTurnEmission["kind"];
   retrievedEpisodes: DeliberationResult["retrievedEpisodes"];
   // The open questions this turn's retrieval recalled, the set its evidence ledger draws from.
   recalledOpenQuestions?: readonly OpenQuestion[];
@@ -124,62 +133,12 @@ export class TurnReflectionCoordinator {
     }
 
     const { moodSnapshot, interactionRecord } = await this.recordReception(input);
+    const skipReflector =
+      this.options.reflectAfterSilentTurn === false && isSilentEmission(input.emissionKind);
+    const reflection = skipReflector
+      ? this.skipReflectorAfterSilence(input)
+      : await this.reflect(input, moodSnapshot);
 
-    const reflector = this.options.createReflector(input.llmClient);
-    const activeOpenQuestions = reflectionOpenQuestions(
-      input.recalledOpenQuestions ?? [],
-      this.options.openQuestionsRepository.list({
-        status: "open",
-        limit: OPEN_QUESTIONS_REFLECTION_LIMIT,
-      }),
-    );
-    const reflection = await reflector.reflect(
-      {
-        turnId: input.turnId,
-        sessionId: input.sessionId,
-        actionLifecycleTurnCounter: input.actionLifecycleTurnCounter ?? null,
-        origin: input.origin ?? "user",
-        userMessage: input.userMessage,
-        perception: input.perception,
-        workingMemory: {
-          ...input.postActionWorkingMemory,
-          mood: moodSnapshot,
-        },
-        selfSnapshot: input.selfSnapshot,
-        deliberationResult: input.deliberation,
-        actionResult: {
-          ...input.actionResult,
-          workingMemory: input.postActionWorkingMemory,
-        },
-        retrievedEpisodes: input.retrievedEpisodes,
-        retrievalConfidence: input.retrievalConfidence,
-        executiveFocus: input.executiveFocus,
-        selectedSkillId: input.selectedSkill?.skill.id ?? null,
-        audienceEntityId: input.audienceEntityId,
-        audienceIsGroup: input.audienceIsGroup ?? false,
-        senderEntityId: input.senderEntityId ?? null,
-        activeOpenQuestions,
-        suppressionSet: input.suppressionSet,
-        frameAnomaly: input.frameAnomaly ?? null,
-        currentTurnStreamEntryIds: [
-          ...(input.sourceUserEntryIds ??
-            (input.persistedUserEntryId === undefined ? [] : [input.persistedUserEntryId])),
-          ...(input.persistedUserEntryId === undefined &&
-          (input.sourceUserEntryIds === undefined || input.sourceUserEntryIds.length === 0)
-            ? [input.persistedPerceptionEntry?.id]
-            : []),
-          input.persistedAgentEntry.id,
-        ].filter((entryId): entryId is StreamEntryId => entryId !== undefined),
-        currentTurnProducedStreamEntryIds: [input.persistedAgentEntry.id],
-        currentTurnInboundStreamEntryIds:
-          (input.origin ?? "user") === "user"
-            ? (input.sourceUserEntryIds ??
-              (input.persistedUserEntryId === undefined ? [] : [input.persistedUserEntryId]))
-            : [],
-        currentTurnJournalEntryIds: input.currentTurnJournalEntryIds ?? [],
-      },
-      input.streamWriter,
-    );
     input.trackReflectionEffects(reflection.effects);
 
     const reflectedWorkingMemory = reflection.workingMemory;
@@ -240,6 +199,88 @@ export class TurnReflectionCoordinator {
     });
 
     return reflection;
+  }
+
+  private async reflect(
+    input: RunTurnReflectionInput,
+    moodSnapshot: AffectiveSignal,
+  ): Promise<ReflectionResult> {
+    const reflector = this.options.createReflector(input.llmClient);
+      const activeOpenQuestions = reflectionOpenQuestions(
+        input.recalledOpenQuestions ?? [],
+        this.options.openQuestionsRepository.list({
+          status: "open",
+          limit: OPEN_QUESTIONS_REFLECTION_LIMIT,
+        }),
+      );
+      return reflector.reflect(
+        {
+          turnId: input.turnId,
+          sessionId: input.sessionId,
+          actionLifecycleTurnCounter: input.actionLifecycleTurnCounter ?? null,
+          origin: input.origin ?? "user",
+          userMessage: input.userMessage,
+          perception: input.perception,
+          workingMemory: {
+            ...input.postActionWorkingMemory,
+            mood: moodSnapshot,
+          },
+          selfSnapshot: input.selfSnapshot,
+          deliberationResult: input.deliberation,
+          actionResult: {
+            ...input.actionResult,
+            workingMemory: input.postActionWorkingMemory,
+          },
+          retrievedEpisodes: input.retrievedEpisodes,
+          retrievalConfidence: input.retrievalConfidence,
+          executiveFocus: input.executiveFocus,
+          selectedSkillId: input.selectedSkill?.skill.id ?? null,
+          audienceEntityId: input.audienceEntityId,
+          audienceIsGroup: input.audienceIsGroup ?? false,
+          senderEntityId: input.senderEntityId ?? null,
+          activeOpenQuestions,
+          suppressionSet: input.suppressionSet,
+          frameAnomaly: input.frameAnomaly ?? null,
+          currentTurnStreamEntryIds: [
+            ...(input.sourceUserEntryIds ??
+              (input.persistedUserEntryId === undefined ? [] : [input.persistedUserEntryId])),
+            ...(input.persistedUserEntryId === undefined &&
+            (input.sourceUserEntryIds === undefined || input.sourceUserEntryIds.length === 0)
+              ? [input.persistedPerceptionEntry?.id]
+              : []),
+            input.persistedAgentEntry.id,
+          ].filter((entryId): entryId is StreamEntryId => entryId !== undefined),
+          currentTurnProducedStreamEntryIds: [input.persistedAgentEntry.id],
+          currentTurnInboundStreamEntryIds:
+            (input.origin ?? "user") === "user"
+              ? (input.sourceUserEntryIds ??
+                (input.persistedUserEntryId === undefined ? [] : [input.persistedUserEntryId]))
+              : [],
+          currentTurnJournalEntryIds: input.currentTurnJournalEntryIds ?? [],
+        },
+        input.streamWriter,
+      );
+  }
+
+  /**
+   * A full turn that ended in silence, with reflection after silence switched off:
+   * the contact and the mood were already recorded by recordReception, so only the
+   * reflector's model call is left out. The trace says so, which keeps a missing
+   * reflection distinguishable from a failed one.
+   */
+  private skipReflectorAfterSilence(input: RunTurnReflectionInput): ReflectionResult {
+    if (this.options.tracer.enabled) {
+      this.options.tracer.emit("reflection.skipped_after_silence", {
+        turnId: input.turnId,
+        ...(input.sessionId !== undefined ? { session_id: input.sessionId } : {}),
+        emission: input.emissionKind ?? "unknown",
+      });
+    }
+
+    return {
+      workingMemory: input.postActionWorkingMemory,
+      effects: emptyReflectionEffects(),
+    };
   }
 
   /**

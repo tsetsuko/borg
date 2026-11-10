@@ -309,6 +309,10 @@ export function createTestConfig(
         ...DEFAULT_CONFIG.cognition.actionLifecycle,
         ...overrides.cognition?.actionLifecycle,
       },
+      reflection: {
+        ...DEFAULT_CONFIG.cognition.reflection,
+        ...overrides.cognition?.reflection,
+      },
     },
     generation: {
       ...DEFAULT_CONFIG.generation,

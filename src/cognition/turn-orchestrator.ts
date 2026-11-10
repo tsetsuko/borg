@@ -423,6 +423,7 @@ export class TurnOrchestrator {
       workingMemoryStore: options.workingMemoryStore,
       pendingProceduralAttemptTracker,
       createReflector: (llmClient) => options.createReflector(llmClient),
+      reflectAfterSilentTurn: options.config.cognition.reflection.afterSilentTurn,
       clock: this.clock,
       tracer: this.tracer,
     });
