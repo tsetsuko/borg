@@ -1,5 +1,4 @@
 import { goalBlockStateAttribute } from "../../../memory/self/goal-blocks.js";
-import { renderAnsweredWindowEvidence } from "../../../stream/answered-window.js";
 // Assembles the base deliberation system prompt from memory, state, and guidance sections.
 import { summarizeProvenanceForPrompt, type Provenance } from "../../../memory/common/index.js";
 import { operatorAttentionPromptRow } from "../../../memory/operator-attention/disclosure.js";
@@ -103,17 +102,8 @@ import {
   summarizeRetrievalConfidence,
 } from "./retrieval.js";
 import { renderTaggedPromptSection, type TaggedPromptSection } from "./sections.js";
-import {
-  RECENT_REGENERATIONS_LIMIT,
-  RECENT_SUPPRESSIONS_LIMIT,
-} from "../../generation/discourse-state.js";
+import { RECENT_SUPPRESSIONS_LIMIT } from "../../generation/discourse-state.js";
 import { classifySuppressionReason } from "../../generation/suppression-outcome.js";
-import {
-  FINALIZER_NO_OUTPUT_CATEGORIES,
-  FINALIZER_NO_OUTPUT_PRIMARY_REASONS,
-  FINALIZER_NO_OUTPUT_SEMANTIC_CATEGORIES,
-  FINALIZER_NO_OUTPUT_STRUCTURAL_CATEGORIES,
-} from "../../generation/types.js";
 import { LIVE_TURN_READ_FINALIZER_TOOL_MENU } from "../autonomous-finalizer-tools.js";
 
 export { formatRelativeAge } from "../../../util/relative-time.js";
@@ -2683,46 +2673,6 @@ function renderWakeErrorReasonLines(
 const WAKE_SILENT_OUTCOME_CLASSES =
   "deliberate-silence (you closed the wake), emission-failed (an emission was attempted and did not come out), guard-blocked (a post-generation guard stopped it), observed, outbound-undelivered (you posted to another session and it did not come back delivered, so the wake is silent because carriage failed rather than because you closed it)";
 
-/**
- * Same reason as the constant above, one layer in: the silences list renders whichever classes
- * its own entries happen to carry, and a ring that is all one class reads as if that class were
- * the only outcome a suppression can have. Name the set so the rendered subset cannot pass for it.
- */
-const SUPPRESSION_OUTCOME_CLASSES =
-  "deliberate-silence (the turn was mine to close and I closed it), emission-failed (an emission was attempted and did not come out), guard-blocked (a post-generation guard stopped a draft I had already produced), observed, unknown (a code this mapping does not cover)";
-
-/**
- * primary_no_output_reason and no_output_categories render side by side on a no-output
- * entry, and the provenance line said only where each comes from -- not that they are
- * drawn from different enums. The primary list covers the semantic categories and adds
- * values the category enum has no member for, so those can never appear in
- * no_output_categories however the silence was classified, and a reader comparing the
- * two fields has no way to tell that from the two disagreeing. Derive the gap from the
- * enums so an edit to either carries the sentence with it.
- */
-const NO_OUTPUT_PRIMARY_REASONS_WITHOUT_CATEGORY = FINALIZER_NO_OUTPUT_PRIMARY_REASONS.filter(
-  (reason) => !(FINALIZER_NO_OUTPUT_CATEGORIES as readonly string[]).includes(reason),
-);
-
-const NO_OUTPUT_DIAGNOSTIC_PROVENANCE = `no_output_categories: model-supplied (${FINALIZER_NO_OUTPUT_SEMANTIC_CATEGORIES.join(
-  ", ",
-)}); harness-added (${FINALIZER_NO_OUTPUT_STRUCTURAL_CATEGORIES.join(
-  ", ",
-)}). structural_no_output_flags share those harness counts: with_state_delta/current_turn_state_delta and with_open_question/open_question_rendered. borg_directly_addressed derives from when_borg_addressed. primary_no_output_reason is model-supplied or derived from those semantic ones, from a wider list: ${NO_OUTPUT_PRIMARY_REASONS_WITHOUT_CATEGORY.join(
-  " and ",
-)} have no category to appear as, so a primary of either is absent by vocabulary, not disagreement.`;
-
-/**
- * A `tool_name: none` diagnostic says the attempt emitted no terminal tool call. It does
- * not say whether the attempt wrote anything, and those are two different endings: prose
- * without the tool call leaves a draft the harness captures, a halt before any text leaves
- * nothing to capture. Both print the same reason string, so read off the reason code alone
- * the second ending is indistinguishable from the first -- which invites exactly the wrong
- * account of the silence, that the turn did its work and only the delivery died. `text_chars`
- * is that discriminator and it is already on the entry; name what it decides.
- */
-const FINALIZER_INVALID_TOOL_TEXT_PROVENANCE = `A finalizer_invalid_tool diagnostic reading tool_name=none means that attempt made no terminal emission tool call; it does not by itself say whether the attempt produced anything. text_chars on the same diagnostic is that count, and it is a length of my own output, not a judgement of it. text_chars=0 means the attempt halted before writing a character; above 0 means I wrote and omitted the call. A non-empty draft is captured as undelivered_draft and surfaces in my recency window until it ages out, so its absence there dates the draft rather than denying it. A diagnostic with no text_chars at all predates the field: unrecorded, which is not zero. Without this count the two endings read alike, and I do not describe a turn that wrote nothing as one whose reasoning survived and whose delivery failed.`;
-
 const WAKE_INTERRUPTED_PROVENANCE =
   "interrupted provenance: scheduler = turn completed, bookkeeping failed; startup reconciliation = outcome was NULL and wake ts was older than the startup grace window. The reconciliation stamp dates the sweep; whether that turn ran is unknown.";
 
@@ -2801,6 +2751,10 @@ function renderWakeSilentReasonLines(
   ];
 }
 
+// What the being reads about its own recent mechanism history. For a social bot this keeps
+// the one part that is self-knowledge -- when and why it went quiet in this conversation --
+// and drops harness bookkeeping: the answered-window edge, the wake scheduler's state when
+// the scheduler is switched off, and the commitment guard's regeneration ring with its notes.
 function summarizeMechanismEvidence(
   context: DeliberationContext,
   promptNowMs?: number,
@@ -2816,33 +2770,16 @@ function summarizeMechanismEvidence(
             ? {}
             : { sourceStreamEntryId: entry.source_stream_entry_id }),
         })) ?? [],
-      recentRegenerations:
-        context.workingMemory.discourse_state?.recent_regenerations?.map((entry) => ({
-          turnId: entry.turn_id,
-          mechanism: entry.mechanism,
-          ts: entry.ts,
-          ...(entry.source_stream_entry_id === undefined
-            ? {}
-            : { sourceStreamEntryId: entry.source_stream_entry_id }),
-          ...(entry.commitments === undefined ? {} : { commitments: entry.commitments }),
-        })) ?? [],
+      recentRegenerations: [],
     };
   const recentSuppressions = evidence.recentSuppressions.slice(-RECENT_SUPPRESSIONS_LIMIT);
-  const recentRegenerations = evidence.recentRegenerations.slice(-RECENT_REGENERATIONS_LIMIT);
   const lines: string[] = [];
   const schedulerState = evidence.autonomySchedulerState;
-  lines.push(
-    evidence.answeredWindow === undefined
-      ? "Answered-window edge: evidence unavailable on this capture; absence of a basis is not evidence of zero outside entries. Labels only."
-      : renderAnsweredWindowEvidence(evidence.answeredWindow),
-  );
-  // Both lists below are count-capped rings, not time windows (RECENT_*_LIMIT, capNewest): an entry
-  // stays until that many newer ones displace it, however long that takes. Without an age the oldest
-  // and newest read alike, so a fossil from a guard that has since been scoped off this session
-  // renders as if it fired this hour. The ts is on every entry; render it.
   const renderNowMs = promptNowMs ?? context.nowMs;
 
-  if (schedulerState !== undefined) {
+  // A switched-off scheduler fires nothing, so its budget and sources describe nothing the
+  // being can act on or be woken by.
+  if (schedulerState !== undefined && schedulerState.enabled) {
     lines.push(
       summarizeAutonomySchedulerState(
         schedulerState,
@@ -2853,68 +2790,12 @@ function summarizeMechanismEvidence(
   }
 
   if (recentSuppressions.length > 0) {
-    // Both rings live in this session's working memory (working/<session_id>.json), so
-    // each is scoped to one conversation. Unstated, that scope is invisible: the list
-    // reads as a record of my silences, and a day with a suppression in another
-    // conversation renders here as a day I spoke. Say the scope on the line.
-    const invalidToolNote = recentSuppressions.some(
-      (entry) => entry.diagnostic?.finalizerInvalidTool !== undefined,
-    )
-      ? ` ${FINALIZER_INVALID_TOOL_TEXT_PROVENANCE}`
-      : "";
     lines.push(
-      `Recent silences from my side (newest last; this conversation only -- this list is this session's working memory, so a turn of mine suppressed in another conversation is absent here by scope and its absence says nothing about whether I went quiet there; it keeps the newest ${RECENT_SUPPRESSIONS_LIMIT} however old they are, so an age here is the entry's age, not a window): ${recentSuppressions
+      `Recent silences from my side (newest last; this conversation only): ${recentSuppressions
         .map((entry) => renderRecentSuppressionMechanismEvidence(entry, renderNowMs))
         .join(
           ", ",
-        )}. The bracketed token after each reason code is that code's outcome class, and the whole contrast set is ${SUPPRESSION_OUTCOME_CLASSES} -- so a list showing only one of them is a fact about these entries, not about which classes can occur. The class is not recoverable from the reason code by reading it: sibling codes in one enum fall on opposite sides of the line, and both leave the same blank. If asked about going quiet, I attribute it to the actual reason code, its outcome class, and the rendered diagnostic. I do not invent network failures, latency spikes, or technical errors, and I do not report my own closure as something done to me. ${NO_OUTPUT_DIAGNOSTIC_PROVENANCE}${invalidToolNote}`,
-    );
-  }
-
-  if (recentRegenerations.length > 0) {
-    // The gloss on each entry is a write-time snapshot, and this ring evicts by
-    // displacement rather than by clock, so an entry outlives the row it names.
-    // Test each id against this turn's active commitment draw so the page says
-    // which of the two records is stale instead of leaving that to a join the
-    // reader has to run against a block that omits for its own reasons.
-    //
-    // The liveness token tests row membership, and supersession -- the dominant
-    // ending in the live store -- replaces a row while the directive it carried
-    // continues under a successor id. So no_longer_active retires the id, not
-    // necessarily the constraint, and the note must not license the second
-    // reading from the first.
-    const activeCommitmentIds = activeCommitmentIdsForLiveness(context);
-    const namedCommitmentNote = recentRegenerations.some(
-      (entry) => (entry.commitments ?? []).length > 0,
-    )
-      ? " A named commitment there is the row that gated that draft, not a class of them: it is evidence about which of my own constraints is biting, not scheduler or network weather. Each id carries two tokens from two separate reads. The first is what the write could resolve: kind/domain/family are the row's labels as captured when the guard fired. The guard is handed one array of commitment records, and the writer resolves the ids it emits against that same array, in the same scope, before anything awaits; ids the judge invents are dropped before they reach the emission. So unresolved_at_capture has no path that produces it, and if it prints it marks a defect in that writer rather than a state of the row -- labels are what every reachable entry carries. The second token is tested at render, and it is membership in this turn's active-commitment draw and nothing finer: every row not revoked, not superseded, and not past an expiry, and this store has no deletion path at all. The two draws differ in one way that matters: the capture draw is narrowed by audience, the liveness draw is not. So no_longer_active on a labeled id is an ending -- a row that was in the narrower set is absent from the wider one -- though it does not say which ending caused it; still_active says the row is somewhere in the global draw and not that it is in force for the audience I am speaking to, which nothing on this line carries; liveness_unchecked means this turn carried no draw to test against. Entries leave this list only when newer ones displace them, never by clock, so a no_longer_active entry records a past firing. What ended is the row, not necessarily the constraint: supersession is one of those three endings and it replaces a row rather than ending what the row required, so that id can be dead while the directive continues under a successor this line does not name. The token is membership now, so it cannot date the ending: an id that had already left the draw before this line first rendered reads exactly like one this list watched leave, and no single read separates them. What a second read settles depends on which ending it was, and the token does not say which: revocation and expiry are one-way under every path my own loop has, so on those the value is pinned for the rest of the entry's life here and re-reading it confirms nothing that the first read did not; supersession is the reversible one -- the offline duplicate-merge rollback clears it -- so a flip back to still_active is a real event rather than a defect."
-      : "";
-    const bareEntryNote = recentRegenerations.some(
-      (entry) => entry.commitments === undefined || entry.commitments.length === 0,
-    )
-      ? " An entry that names no commitment says which of two silences it is. commitments_unrecorded means the write that made that entry kept no commitment field at all, so the ids existed when the guard fired and nothing carried them here; it is silent about which constraint bit, not evidence that none did. guard_named_no_commitment means the firing itself named none. Neither token licenses the reading that the regeneration had no cause."
-      : "";
-    // This ring is not a record of regenerations; it is a record of regenerations that
-    // then survived to be emitted. The breadcrumb is minted only under
-    // `finalAnswerRegenerated && guardedEmission.kind === "message"`
-    // (turn-action/turn-action-coordinator.ts), and the append is reached only on the
-    // message branch of the post-generation phase -- the suppressed branch returns
-    // before it. So the two lists are disjoint by construction, never by coincidence,
-    // and the disjointness is at its most misleading exactly where the two would
-    // otherwise meet: a draft the commitment guard regenerated and a guard then
-    // suppressed is in the silences list and nowhere here. Two suppression reason codes
-    // still carry the fact themselves; under any other one it survives in neither list.
-    // Verified on the live store (2026-08-27): zero shared turn ids across all nine
-    // sessions' rings, and one session holding seven `commitment_violation_after_regenerate`
-    // silences alongside a full regeneration ring naming none of them.
-    const emittedOnlyNote = ` This list covers regenerations whose redrafted answer was then emitted; a regeneration the guards suppressed afterwards leaves no entry here at all, so absence from this list is not evidence that a turn was not regenerated. Those turns appear in the silences list above instead, and two reason codes there name the redraft themselves -- commitment_violation_after_regenerate for this same guard's second pass, invalid_tool_after_regenerate for the finalizer's own retry, which is a different mechanism. Under any other reason code the redraft is recorded in neither list.`;
-    lines.push(
-      `Regenerated final answers from my side (newest last; this conversation only, same session working memory as above; newest ${RECENT_REGENERATIONS_LIMIT} kept): ${recentRegenerations
-        .map(
-          (entry) =>
-            `${escapeXmlText(entry.turnId)}: an internal commitment guard regenerated this turn's final answer${renderRegenerationCommitmentsSuffix(entry, activeCommitmentIds)}${renderRelativeAgeSuffix(entry.ts, renderNowMs)}`,
-        )
-        .join(", ")}.${emittedOnlyNote}${namedCommitmentNote}${bareEntryNote}`,
+        )}. If asked about going quiet, I attribute it to the actual reason code, its outcome class, and the rendered diagnostic. I do not invent network failures, latency spikes, or technical errors, and I do not report my own closure as something done to me.`,
     );
   }
 
@@ -2923,93 +2804,6 @@ function summarizeMechanismEvidence(
 
 function renderRelativeAgeSuffix(ts: number, renderNowMs: number | undefined): string {
   return renderNowMs === undefined ? "" : ` (${formatRelativeAge(ts, renderNowMs)})`;
-}
-
-// `applicableCommitments` is the whole active set for this turn -- the cognition
-// draw is `list({activeOnly: true})`, global and uncapped, so an id missing from
-// it was dropped by an active-set predicate rather than by a budget or an audience.
-// That makes membership a sound liveness test, and the only one available here.
-//
-// It is a differently-drawn set from the one the entry was captured against, and
-// the difference is directional. Capture runs off `actionApplicableCommitments`
-// (`getApplicable({audience})` = `list({activeOnly: true, audience})`, retrieval-phase
-// `coordinate()`), which is this same predicate plus an audience narrowing at the same
-// `nowMs` -- so the capture set is a subset of this one. Absence here of an id that was
-// present there is therefore an ending and cannot be a scoping artifact, which is what
-// makes `no_longer_active` the stronger of the two verdicts. Presence is correspondingly
-// weaker: it reports the row is active globally, never that it still applies to the
-// audience being spoken to. Cognition is the right place for the global read (recall is
-// global to the being), so the fix for the gap is to name the scope on the rendered line,
-// not to narrow this set.
-// Undefined when the turn carries no draw at all; the caller must then say so
-// rather than guess, so keep the absence distinguishable from an empty set.
-function activeCommitmentIdsForLiveness(
-  context: DeliberationContext,
-): ReadonlySet<string> | undefined {
-  const commitments = context.applicableCommitments;
-  return commitments === undefined
-    ? undefined
-    : new Set(commitments.map((commitment) => commitment.id));
-}
-
-// A bare mechanism name reads as harness weather. The commitment that actually
-// gated the draft is the whole content of the entry, so name it: id for the
-// cross-reference, kind/domain/family for what it is without one.
-//
-// Those labels are captured when the guard fires and never re-read, and this ring
-// evicts by displacement rather than by clock, so an entry keeps naming a row for
-// however long it takes N newer regenerations to arrive -- past the point where the
-// row is revoked. A joinable id with no liveness on it is worse than none: the join
-// lands on an absence, and absence from the commitments block has several causes.
-// So state the verdict here, in the negative as well as the positive, and say when
-// there was nothing to test against; an unmarked id reads exactly like a live one.
-//
-// An entry with no named commitment is two different facts, and printing nothing for
-// both made the absence of a suffix do double duty: an entry whose write kept no
-// commitment field at all (it predates this ring carrying ids) reads identically to a
-// firing that named none. Both are silences about which constraint bit, but only the
-// second is a statement about the firing. Name which one this is.
-//
-// The same collapse ran one level down, on entries that do name ids. The writer
-// files an id it could not resolve as a bare id (`regenerationCommitmentDescriptors`),
-// and a resolved descriptor always carries at least kind and directive_family, both
-// non-optional on the record, so no labels at all is a write-time signal rather than
-// a thin row. Printing only the liveness token made such an id read exactly like a row
-// that was live and has since ended -- the render asserting an ending where the test
-// only observed an absence.
-//
-// That branch is defensive, not a state: the guard is invoked with
-// `input.applicableCommitments` and the descriptors are resolved against that same
-// array in the same scope, before the regeneration await
-// (`turn-action-coordinator.ts`), while `checker.ts` drops any id the judge returns
-// that is not in the set it was given. Every id that reaches here therefore has a row
-// in the map by construction. The map miss stays handled because a `Map.get` is
-// `T | undefined` and a silent wrong label is worse than a loud one, but the rendered
-// token must not describe it as a condition of the row -- which is what the earlier
-// copy did, explaining `unresolved_at_capture` as an audience-scoped-away row. Capture
-// IS audience-scoped, but that cannot separate the guard's set from this map, because
-// they are the same array.
-function renderRegenerationCommitmentsSuffix(
-  entry: NonNullable<DeliberationContext["turnMechanismEvidence"]>["recentRegenerations"][number],
-  activeCommitmentIds: ReadonlySet<string> | undefined,
-): string {
-  const commitments = entry.commitments;
-  if (commitments === undefined) return " (commitments_unrecorded)";
-  if (commitments.length === 0) return " (guard_named_no_commitment)";
-  const rendered = commitments.map((commitment) => {
-    const descriptors = [commitment.kind, commitment.critical_domain, commitment.directive_family]
-      .filter((value): value is string => value !== undefined)
-      .join("/");
-    const liveness =
-      activeCommitmentIds === undefined
-        ? "liveness_unchecked"
-        : activeCommitmentIds.has(commitment.id)
-          ? "still_active"
-          : "no_longer_active";
-    const capture = descriptors.length === 0 ? "unresolved_at_capture" : descriptors;
-    return `${escapeXmlText(commitment.id)} (${escapeXmlText(`${capture}, ${liveness}`)})`;
-  });
-  return ` over commitment ${rendered.join(" and ")}`;
 }
 
 function renderRecentSuppressionMechanismEvidence(

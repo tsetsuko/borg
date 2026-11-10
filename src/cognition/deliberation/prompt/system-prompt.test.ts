@@ -8,11 +8,6 @@ import {
   HEADWAY_EMISSION_KINDS,
   type AutonomySchedulerDescription,
 } from "../../../autonomy/index.js";
-import {
-  FINALIZER_NO_OUTPUT_CATEGORIES,
-  FINALIZER_NO_OUTPUT_PRIMARY_REASONS,
-  FINALIZER_NO_OUTPUT_SEMANTIC_CATEGORIES,
-} from "../../generation/types.js";
 import type { MoodHistoryEntry } from "../../../memory/affective/index.js";
 import type { CommitmentRecord } from "../../../memory/commitments/index.js";
 import type { SocialProfile } from "../../../memory/social/index.js";
@@ -2889,8 +2884,7 @@ describe("buildBaseSystemPrompt", () => {
     // The class, not just the code: finalizer_no_output is my own closure, and its enum sibling
     // commitment_violation is a guard. Nothing in either name says which, so the page has to.
     expect(block).toContain("turn-autonomous-silence:finalizer_no_output[deliberate-silence]");
-    expect(block).toContain("deliberate-silence (the turn was mine to close and I closed it)");
-    expect(block).toContain("guard-blocked (a post-generation guard stopped a draft");
+    expect(block).not.toContain("deliberate-silence (the turn was mine to close and I closed it)");
     expect(block).toContain("I do not report my own closure as something done to me");
   });
 
@@ -4605,7 +4599,7 @@ describe("buildBaseSystemPrompt", () => {
     );
   });
 
-  it("labels edge evidence as unavailable when scheduler and turn-mechanism state are absent", () => {
+  it("prints no answered-window edge and no block when there is nothing of mine to report", () => {
     const prompt = buildBaseSystemPrompt(
       makeContext({
         turnMechanismEvidence: {
@@ -4616,7 +4610,34 @@ describe("buildBaseSystemPrompt", () => {
       { ...PROMPT_OPTIONS, nowMs: NOW_MS },
     );
 
-    expect(prompt).toContain("Answered-window edge: evidence unavailable on this capture");
+    expect(prompt).not.toContain("Answered-window edge");
+    expect(prompt).not.toContain("<borg_mechanism_evidence>");
+  });
+
+  it("prints no scheduler state when the scheduler is switched off", () => {
+    const schedulerState = {
+      observedAt: NOW_MS,
+      enabled: false,
+      tickInFlight: false,
+      intervalMs: 60_000,
+      droppedIntervalFires: { since_interval_armed: 0, current_tick: null },
+      intervalArmedAt: NOW_MS - 3_600_000,
+      sources: [],
+      nextTickAt: null,
+      scheduledTickAt: null,
+    };
+    const prompt = buildBaseSystemPrompt(
+      makeContext({
+        turnMechanismEvidence: {
+          recentSuppressions: [],
+          recentRegenerations: [],
+          autonomySchedulerState: schedulerState as never,
+        },
+      }),
+      { ...PROMPT_OPTIONS, nowMs: NOW_MS },
+    );
+
+    expect(prompt).not.toContain("Harness scheduler state");
   });
 
   it("renders closure-loop finalizer guidance in trusted discourse control", () => {
@@ -4736,44 +4757,7 @@ describe("buildBaseSystemPrompt", () => {
     expect(block).toContain(
       "turn-fresh:commitment_violation_after_regenerate[guard-blocked] (30m ago)",
     );
-    expect(block).toContain(
-      "turn-regenerated: an internal commitment guard regenerated this turn's final answer (commitments_unrecorded) (3h ago)",
-    );
-    expect(block).toContain("keeps the newest 10 however old they are");
-  });
-
-  it("distinguishes a regeneration entry that recorded no commitments from one that named none", () => {
-    const prompt = buildBaseSystemPrompt(
-      makeContext({
-        nowMs: NOW_MS,
-        workingMemory: {
-          ...makeContext().workingMemory,
-          discourse_state: {
-            stop_until_substantive_content: null,
-            recent_regenerations: [
-              {
-                turn_id: "turn-unrecorded",
-                mechanism: "commitment_guard_regeneration" as const,
-                ts: NOW_MS - 60 * 60_000,
-              },
-              {
-                turn_id: "turn-named-none",
-                mechanism: "commitment_guard_regeneration" as const,
-                ts: NOW_MS - 30 * 60_000,
-                commitments: [],
-              },
-            ],
-          },
-        },
-      }),
-      PROMPT_OPTIONS,
-    );
-    const block = extractBlock(prompt, "borg_mechanism_evidence");
-
-    expect(block).toContain("turn-unrecorded: an internal commitment guard regenerated");
-    expect(block).toContain("(commitments_unrecorded) (1h ago)");
-    expect(block).toContain("(guard_named_no_commitment) (30m ago)");
-    expect(block).toContain("says which of two silences it is");
+    expect(block).not.toContain("turn-regenerated");
   });
 
   it("renders hydrated suppression diagnostics from mechanism evidence", () => {
@@ -4811,24 +4795,7 @@ describe("buildBaseSystemPrompt", () => {
     expect(block).toContain("structural_no_output_flags=");
     expect(block).toContain("finalizer_invalid_tool=");
     expect(block).toContain("schema_error");
-    // The accepted-value list is built from the tool's own enum rather than restated, so a
-    // category added to the schema cannot silently fall out of the sentence naming it.
-    for (const category of FINALIZER_NO_OUTPUT_SEMANTIC_CATEGORIES) {
-      expect(block).toContain(category);
-    }
-    // This entry is the case the reader trips on: its primary is "other", which no category
-    // can carry, so the two fields cannot agree however the silence was classified. Derive
-    // the gap here as the render does -- an edit moving a value across the two enums carries
-    // both, and one that empties the gap fails here rather than leaving a prompt sentence
-    // claiming a wider list that no longer exists.
-    const primaryReasonsWithoutCategory = FINALIZER_NO_OUTPUT_PRIMARY_REASONS.filter(
-      (reason) => !(FINALIZER_NO_OUTPUT_CATEGORIES as readonly string[]).includes(reason),
-    );
-    expect(primaryReasonsWithoutCategory.length).toBeGreaterThan(0);
-    expect(primaryReasonsWithoutCategory).toContain("other");
-    expect(block).toContain(
-      `${primaryReasonsWithoutCategory.join(" and ")} have no category to appear as`,
-    );
+    expect(block).not.toContain("have no category to appear as");
   });
 
   // tool_name=none with no text and tool_name=none with a dropped call print the same
@@ -4836,7 +4803,7 @@ describe("buildBaseSystemPrompt", () => {
   // them has to reach the page, and the page has to say which ending it marks -- otherwise
   // a turn that wrote nothing reads as a turn whose reasoning survived and whose delivery
   // failed, which is the more flattering of the two and the wrong one.
-  it("names what text_chars discriminates when an invalid-tool diagnostic is on the list", () => {
+  it("keeps the text_chars count on an invalid-tool entry without the explanatory note", () => {
     const withInvalidTool = extractBlock(
       buildBaseSystemPrompt(
         makeContext({
@@ -4866,9 +4833,7 @@ describe("buildBaseSystemPrompt", () => {
     );
 
     expect(withInvalidTool).toContain('"text_chars":0');
-    expect(withInvalidTool).toContain("text_chars=0 means the attempt halted before writing");
-    expect(withInvalidTool).toContain("A non-empty draft is captured as undelivered_draft");
-    expect(withInvalidTool).toContain("A diagnostic with no text_chars at all predates the field");
+    expect(withInvalidTool).not.toContain("text_chars=0 means the attempt halted before writing");
 
     // The note is inert on a list with no invalid-tool entry, and copy that explains a
     // field nothing on the page carries is one more thing to mistake for evidence.
@@ -4897,205 +4862,26 @@ describe("buildBaseSystemPrompt", () => {
     expect(withoutInvalidTool).not.toContain("text_chars");
   });
 
-  it("renders regeneration breadcrumbs without draft or guard-internal content", () => {
+  it("does not print the commitment guard's regeneration ring", () => {
     const prompt = buildBaseSystemPrompt(
       makeContext({
-        workingMemory: {
-          ...makeContext().workingMemory,
-          discourse_state: {
-            stop_until_substantive_content: null,
-            recent_regenerations: [
-              {
-                turn_id: "turn-regenerated",
-                mechanism: "commitment_guard_regeneration",
-                ts: NOW_MS,
-                source_stream_entry_id: "strm_bbbbbbbbbbbbbbbb" as never,
-              },
-            ],
-          },
-        },
-      }),
-      PROMPT_OPTIONS,
-    );
-    const block = extractBlock(prompt, "borg_mechanism_evidence");
-
-    expect(block).toContain("Regenerated final answers from my side");
-    expect(block).toContain(
-      "turn-regenerated: an internal commitment guard regenerated this turn's final answer",
-    );
-    expect(block).not.toContain("ORCHID-17");
-    expect(block).not.toContain("violating_span");
-  });
-
-  const makeGatingCommitment = (id: ReturnType<typeof createCommitmentId>): CommitmentRecord => ({
-    id,
-    type: "rule",
-    kind: "participant_preference",
-    enforcement_class: "critical",
-    critical_domain: "explicit_no_disclosure",
-    directive_family: "rollout_privacy",
-    closure_pressure_relevance: "neutral",
-    directive: "Do not repeat the rollout details outside the room they were given in.",
-    priority: 9,
-    made_to_entity: null,
-    restricted_audience: null,
-    about_entity: null,
-    committed_by_entity_id: null,
-    provenance: { kind: "manual" },
-    source_stream_entry_ids: [],
-    created_at: NOW_MS,
-    expires_at: null,
-    expired_at: null,
-    revoked_at: null,
-    revoked_reason: null,
-    revoke_provenance: null,
-    superseded_by: null,
-    canonicalized_by_artifact_entry_id: null,
-    last_reinforced_at: NOW_MS,
-  });
-
-  const makeRegenerationRingContext = (
-    commitmentId: string,
-    applicableCommitments: CommitmentRecord[] | undefined,
-  ) =>
-    makeContext({
-      ...(applicableCommitments === undefined ? {} : { applicableCommitments }),
-      workingMemory: {
-        ...makeContext().workingMemory,
-        discourse_state: {
-          stop_until_substantive_content: null,
-          recent_regenerations: [
+        turnMechanismEvidence: {
+          recentSuppressions: [],
+          recentRegenerations: [
             {
-              turn_id: "turn-regenerated",
+              turnId: "turn-regenerated",
               mechanism: "commitment_guard_regeneration",
               ts: NOW_MS,
-              commitments: [
-                {
-                  id: commitmentId,
-                  kind: "participant_preference",
-                  critical_domain: "explicit_no_disclosure",
-                  directive_family: "rollout_privacy",
-                },
-              ],
+              commitments: [{ id: "cmt_aaaaaaaaaaaaaaaa", kind: "boundary" }],
             },
           ],
         },
-      },
-    });
-
-  it("names the commitment a regeneration was gated on and marks it still active", () => {
-    const commitmentId = createCommitmentId();
-    const prompt = buildBaseSystemPrompt(
-      makeRegenerationRingContext(commitmentId, [makeGatingCommitment(commitmentId)]),
-      PROMPT_OPTIONS,
-    );
-    const block = extractBlock(prompt, "borg_mechanism_evidence");
-
-    expect(block).toContain(
-      `over commitment ${commitmentId} (participant_preference/explicit_no_disclosure/rollout_privacy, still_active)`,
-    );
-    expect(block).toContain("which of my own constraints is biting");
-    // The liveness draw carries no audience predicate while the capture draw does,
-    // so the positive token is the weaker of the two and must say so on the line.
-    expect(block).toContain("not that it is in force for the audience I am speaking to");
-  });
-
-  // The ring evicts by displacement, so an entry keeps naming a commitment after the
-  // row is revoked. Without the marker the id reads as live and the reader has to
-  // discover the death by a join that returns an absence with no cause.
-  it("marks a regeneration's commitment no longer active once it leaves the active draw", () => {
-    const commitmentId = createCommitmentId();
-    const prompt = buildBaseSystemPrompt(
-      makeRegenerationRingContext(commitmentId, [makeGatingCommitment(createCommitmentId())]),
-      PROMPT_OPTIONS,
-    );
-    const block = extractBlock(prompt, "borg_mechanism_evidence");
-
-    expect(block).toContain(
-      `over commitment ${commitmentId} (participant_preference/explicit_no_disclosure/rollout_privacy, no_longer_active)`,
-    );
-    expect(block).toContain("records a past firing");
-    // Supersession is one of the endings the token covers, and it replaces a row
-    // without ending what the row required. The note must not let a dead id read
-    // as a dead constraint.
-    expect(block).toContain("What ended is the row, not necessarily the constraint");
-    expect(block).toContain("the directive continues under a successor this line does not name");
-  });
-
-  it("claims neither liveness state when the turn carries no active commitment draw", () => {
-    const commitmentId = createCommitmentId();
-    const prompt = buildBaseSystemPrompt(
-      makeRegenerationRingContext(commitmentId, undefined),
-      PROMPT_OPTIONS,
-    );
-    const block = extractBlock(prompt, "borg_mechanism_evidence");
-
-    expect(block).toContain(
-      `over commitment ${commitmentId} (participant_preference/explicit_no_disclosure/rollout_privacy, liveness_unchecked)`,
-    );
-    expect(block).not.toContain("rollout_privacy, still_active");
-    expect(block).not.toContain("rollout_privacy, no_longer_active");
-  });
-
-  // The writer files an id it could not resolve as a bare id, and such an id fails
-  // the membership test exactly like a row that has since ended, so rendering only
-  // the liveness token asserted an ending where the test observed an absence. The
-  // branch is unreachable in production -- the guard and the descriptor map take the
-  // same array -- so this pins the defensive shape, not a state the ring can hold.
-  it("separates an id that never resolved at capture from one that has since ended", () => {
-    const commitmentId = createCommitmentId();
-    const prompt = buildBaseSystemPrompt(
-      makeContext({
-        applicableCommitments: [makeGatingCommitment(createCommitmentId())],
-        workingMemory: {
-          ...makeContext().workingMemory,
-          discourse_state: {
-            stop_until_substantive_content: null,
-            recent_regenerations: [
-              {
-                turn_id: "turn-regenerated",
-                mechanism: "commitment_guard_regeneration",
-                ts: NOW_MS,
-                commitments: [{ id: commitmentId }],
-              },
-            ],
-          },
-        },
       }),
-      PROMPT_OPTIONS,
+      { ...PROMPT_OPTIONS, nowMs: NOW_MS },
     );
-    const block = extractBlock(prompt, "borg_mechanism_evidence");
 
-    expect(block).toContain(
-      `over commitment ${commitmentId} (unresolved_at_capture, no_longer_active)`,
-    );
-    expect(block).toContain("marks a defect in that writer rather than a state of the row");
-  });
-
-  it("omits the commitment attribution when the entry carries none", () => {
-    const prompt = buildBaseSystemPrompt(
-      makeContext({
-        workingMemory: {
-          ...makeContext().workingMemory,
-          discourse_state: {
-            stop_until_substantive_content: null,
-            recent_regenerations: [
-              {
-                turn_id: "turn-regenerated",
-                mechanism: "commitment_guard_regeneration",
-                ts: NOW_MS,
-              },
-            ],
-          },
-        },
-      }),
-      PROMPT_OPTIONS,
-    );
-    const block = extractBlock(prompt, "borg_mechanism_evidence");
-
-    expect(block).toContain("Regenerated final answers from my side");
-    expect(block).not.toContain("over commitment");
-    expect(block).not.toContain("which of my own constraints is biting");
+    expect(prompt).not.toContain("turn-regenerated");
+    expect(prompt).not.toContain("Regenerated final answers");
   });
 
   it("caps mechanism evidence rendering to the newest entries", () => {
@@ -5125,9 +4911,7 @@ describe("buildBaseSystemPrompt", () => {
     expect(block).not.toContain("turn-suppressed-00");
     expect(block).not.toContain("turn-suppressed-01");
     expect(block).toContain("turn-suppressed-02");
-    expect(block).not.toContain("turn-regenerated-00");
-    expect(block).not.toContain("turn-regenerated-01");
-    expect(block).toContain("turn-regenerated-02");
+    expect(block).not.toContain("turn-regenerated");
   });
 
   it("renders default host capabilities as trusted guidance with capability honesty posture", () => {
