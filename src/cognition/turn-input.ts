@@ -86,6 +86,15 @@ export type SingleMessageTurnInput = TurnInputBase & {
    */
   senderKind?: TurnSenderKind;
   /**
+   * Whether the message was addressed to the being itself, when the transport
+   * knows (a mention of it, or a reply to one of its posts). False means it was
+   * said in the being's hearing but not to it: the turn still stores, perceives
+   * and can answer it, but makes no prediction appraisal (M2) and no domain-trust
+   * appraisal (M4) of it, so expectations and trust grow only from exchanges the
+   * being is part of. Absent means the transport does not say, and both run.
+   */
+  directlyAddressed?: boolean;
+  /**
    * Called once, with the final reply text, as soon as a message emission is
    * persisted -- after every guard that can change or withhold it, and before
    * the post-reply work (the post-response shared-state compile, reflection,

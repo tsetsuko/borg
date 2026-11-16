@@ -114,6 +114,9 @@ export async function runExtractionPhase(input: {
   // Who wrote the message, when the transport says. A bot's message sets no
   // standing rule and no goal; see SingleMessageTurnInput.senderKind.
   senderKind: TurnSenderKind | null;
+  // The transport says the message was not addressed to the being. It is still
+  // stored, perceived and can be answered; see SingleMessageTurnInput.directlyAddressed.
+  notAddressed?: boolean;
   cognitionInput: string;
   perception: PerceptionResult;
   workingMemory: WorkingMemory;
@@ -236,6 +239,22 @@ export async function runExtractionPhase(input: {
     });
   }
 
+  // Expectations (M2) and per-domain trust (M4) are appraised only from a message
+  // addressed to the being: what it learns about partners and about what happens
+  // next comes from exchanges it is part of, not from talk it merely overhears.
+  const appraisesExchange = input.currentTurnFrameAnomaly === null && input.notAddressed !== true;
+  if (
+    input.currentTurnFrameAnomaly === null &&
+    input.notAddressed === true &&
+    input.options.tracer.enabled
+  ) {
+    input.options.tracer.emit("extraction.not_addressed.skipped", {
+      turnId: input.turnId,
+      session_id: input.sessionId,
+      skipped: ["prediction", "domain_trust"],
+    });
+  }
+
   const [
     correctivePreferenceTurn,
     createdActionIds,
@@ -344,7 +363,7 @@ export async function runExtractionPhase(input: {
     // Post-turn prediction reflection: reconcile open expectations this turn
     // resolved (with the model's own surprise appraisal) and record new ones.
     // Extract-only -- it reads the turn and writes the ledger, never the reply.
-    input.currentTurnFrameAnomaly === null && input.options.predictionTurnService !== undefined
+    appraisesExchange && input.options.predictionTurnService !== undefined
       ? input.options.predictionTurnService.extractAndReconcile({
           llmClient: input.llmClient,
           turnId: input.turnId,
@@ -361,7 +380,7 @@ export async function runExtractionPhase(input: {
     // Post-turn trust appraisal: did this partner turn out to be responsive,
     // and about what? Folds into their per-domain Beta posteriors. Attributed
     // to the resolved speaker when the turn has one, else the audience.
-    input.currentTurnFrameAnomaly === null && input.options.domainTrustTurnService !== undefined
+    appraisesExchange && input.options.domainTrustTurnService !== undefined
       ? input.options.domainTrustTurnService.extract({
           llmClient: input.llmClient,
           turnId: input.turnId,

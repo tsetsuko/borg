@@ -612,6 +612,8 @@ export class TurnPhaseCoordinator {
       "senderKind" in rawTurnInput && rawTurnInput.senderKind !== undefined
         ? rawTurnInput.senderKind
         : null;
+    const notAddressed =
+      "directlyAddressed" in rawTurnInput && rawTurnInput.directlyAddressed === false;
     const sessionRecord = this.options.sessionsRepository?.get(sessionId) ?? null;
     const effectiveAudience =
       batchEntryIds !== null &&
@@ -1146,6 +1148,7 @@ export class TurnPhaseCoordinator {
           isUserTurn,
           assessOnly,
           senderKind,
+          notAddressed,
           cognitionInput,
           perception,
           workingMemory,

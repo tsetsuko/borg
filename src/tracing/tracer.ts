@@ -145,6 +145,7 @@ export type TurnTraceEventName =
   | "extraction.goals.transitioned"
   | "extraction.goals.skipped"
   | "extraction.bot_author.skipped"
+  | "extraction.not_addressed.skipped"
   | "extraction.goals.dedup.degraded"
   | "frame_anomaly.degraded"
   | "frame_anomaly.degraded_fail_open"

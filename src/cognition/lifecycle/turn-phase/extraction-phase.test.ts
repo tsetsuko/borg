@@ -326,6 +326,59 @@ describe("runExtractionPhase", () => {
     });
   });
 
+  it("appraises predictions and trust only from a message addressed to the being", async () => {
+    const sessionId = createSessionId();
+    const workingMemory = createWorkingMemory(sessionId, 1_000);
+    const extractActionState = vi.fn(async () => []);
+    const withAppraisers = (input: Parameters<typeof runExtractionPhase>[0]) => {
+      const emit = vi.fn();
+      const extractAndReconcile = vi.fn(async () => ({
+        reconciledPredictionIds: [],
+        createdExpectationIds: [],
+      }));
+      const extractTrust = vi.fn(async () => ({ readings: [] }));
+      return {
+        emit,
+        extractAndReconcile,
+        extractTrust,
+        input: {
+          ...input,
+          options: {
+            ...input.options,
+            tracer: { enabled: true, emit },
+            predictionTurnService: { extractAndReconcile },
+            domainTrustTurnService: { extract: extractTrust },
+          } as never,
+        },
+      };
+    };
+
+    for (const notAddressed of [undefined, false] as const) {
+      const addressed = withAppraisers(
+        baseExtractionPhaseInput({ sessionId, workingMemory, extractActionState }),
+      );
+      await runExtractionPhase({ ...addressed.input, notAddressed });
+      expect(addressed.extractAndReconcile).toHaveBeenCalledTimes(1);
+      expect(addressed.extractTrust).toHaveBeenCalledTimes(1);
+    }
+
+    const overheard = withAppraisers(
+      baseExtractionPhaseInput({ sessionId, workingMemory, extractActionState }),
+    );
+    const result = await runExtractionPhase({ ...overheard.input, notAddressed: true });
+    expect(overheard.extractAndReconcile).not.toHaveBeenCalled();
+    expect(overheard.extractTrust).not.toHaveBeenCalled();
+    expect(result.predictions).toEqual({ reconciledPredictionIds: [], createdExpectationIds: [] });
+    expect(result.domainTrust).toEqual({ readings: [] });
+    // The rest of the turn's extraction is untouched.
+    expect(extractActionState).toHaveBeenCalled();
+    expect(overheard.emit).toHaveBeenCalledWith("extraction.not_addressed.skipped", {
+      turnId: "turn-speaker",
+      session_id: sessionId,
+      skipped: ["prediction", "domain_trust"],
+    });
+  });
+
   it("skips action-state extraction when the config turns it off", async () => {
     const sessionId = createSessionId();
     const workingMemory = createWorkingMemory(sessionId, 1_000);

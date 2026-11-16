@@ -145,6 +145,7 @@ export const TRACE_EVENT_TAXONOMY = {
     "extraction.goals.transitioned",
     "extraction.goals.skipped",
     "extraction.bot_author.skipped",
+    "extraction.not_addressed.skipped",
     "extraction.goals.dedup.degraded",
   ],
   discourse: ["discourse_state.transitioned", "discourse_state.rejected"],
