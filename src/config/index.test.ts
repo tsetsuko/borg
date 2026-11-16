@@ -253,6 +253,7 @@ describe("config", () => {
       finalizerTargetTokens: 60_000,
       finalizerHardCapTokens: 100_000,
       finalizerMaxEntryTextTokens: 1_200,
+      includeSemanticGraph: true,
       recentLivedExperience: {
         recencyWindowMs: 3 * 24 * 60 * 60_000,
         cap: 64,

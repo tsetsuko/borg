@@ -3782,6 +3782,58 @@ describe("EvidenceLedgerBuilder", () => {
     ).toBe("Atlas needs a rollback plan.");
   });
 
+  it("leaves the semantic-graph section out when includeSemanticGraph is false", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
+    tempDirs.push(tempDir);
+    const writer = new StreamWriter({
+      dataDir: tempDir,
+      sessionId: DEFAULT_SESSION_ID,
+      clock: new FixedClock(NOW_MS),
+    });
+    const userEntry = await writer.append({
+      kind: "user_msg",
+      content: "What do you know about qualia?",
+    });
+    const node = makeSemanticNode({ episodeId: createEpisodeId() });
+    const build = (includeSemanticGraph: boolean | undefined) =>
+      new EvidenceLedgerBuilder({
+        createStreamReader: (sessionId) => new StreamReader({ dataDir: tempDir, sessionId }),
+        relationalSlotRepository: { list: () => [] },
+        actionRepository: { list: () => [] },
+        currentSessionTranscriptTokenBudget: 50_000,
+        ...(includeSemanticGraph === undefined ? {} : { includeSemanticGraph }),
+      }).build({
+        sessionId: DEFAULT_SESSION_ID,
+        audienceEntityId: null,
+        currentUserMessage: String(userEntry.content),
+        currentUserEntry: userEntry,
+        workingMemory: makeWorkingMemory(),
+        applicableCommitments: [],
+        retrievedEvidence: [],
+        retrievedEpisodes: [],
+        retrievedSemantic: {
+          supports: [],
+          contradicts: [],
+          categories: [],
+          matched_node_ids: [node.id],
+          matched_nodes: [node],
+          support_hits: [],
+          causal_hits: [],
+          contradiction_hits: [],
+          category_hits: [],
+        },
+        openQuestions: [],
+        pendingCorrections: [],
+        frameAnomaly: null,
+      });
+    const semanticEntries = (ledger: Awaited<ReturnType<typeof build>>) =>
+      ledger.sections.find((section) => section.id === "semantic_graph")?.entries ?? [];
+
+    expect(semanticEntries(await build(undefined))).not.toHaveLength(0);
+    expect(semanticEntries(await build(true))).not.toHaveLength(0);
+    expect(semanticEntries(await build(false))).toHaveLength(0);
+  });
+
   it("leaves the action-states section out when the action lifecycle is switched off", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "borg-"));
     tempDirs.push(tempDir);

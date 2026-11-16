@@ -50,6 +50,8 @@ export type EvidenceLedgerBuilderOptions = {
   // False leaves the action-states section out of the ledger (the action
   // lifecycle is switched off for this being). Absent means included.
   includeActionStates?: boolean;
+  // False leaves the semantic-graph section out of the ledger. Absent means included.
+  includeSemanticGraph?: boolean;
   actionThreadRenderLimit?: number;
   actionThreadSimilarityThreshold?: number;
   actionThreadSourceRecordLimit?: number;

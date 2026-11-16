@@ -248,7 +248,9 @@ export class EvidenceLedgerBuilder {
     addRetrievedRawStreamEvidenceSection(context);
     addRetrievedStructuredEvidenceSection(context);
     addEpisodesSection(context);
-    addSemanticGraphSection(context);
+    if (this.options.includeSemanticGraph !== false) {
+      addSemanticGraphSection(context);
+    }
     await addOpenQuestionsSection(context);
     addRecentLivedExperienceSection(context);
     addAutobiographicalRecallSection(context);

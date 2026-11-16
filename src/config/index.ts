@@ -239,6 +239,9 @@ const evidenceLedgerConfigSchema = z
     finalizerTargetTokens: z.number().int().positive().default(60_000),
     finalizerHardCapTokens: z.number().int().positive().default(100_000),
     finalizerMaxEntryTextTokens: z.number().int().positive().default(1_200),
+    // False leaves the semantic-graph section out of the reply prompt. Recall and the
+    // graph itself are unchanged; only what the finalizer reads is.
+    includeSemanticGraph: z.boolean().default(true),
     recentLivedExperience: recentLivedExperienceConfigSchema,
     sectionOptions: z
       .partialRecord(evidenceLedgerSectionIdSchema, evidenceLedgerSectionOptionsSchema)
