@@ -1733,7 +1733,7 @@ describe("TurnOrchestrator inbound batch catch-up", () => {
       expect(secondFinalizerSystem).toContain("<borg_evidence_ledger>");
       expect(secondFinalizerSystem).toContain(previousReply);
       expect(secondFinalizerSystem).toContain(
-        `id=current_session_stream:${previousAgentEntry?.id}`,
+        `- ${previousAgentEntry?.id} assistant`,
       );
     } finally {
       await borg?.close();

@@ -94,6 +94,77 @@ export function renderEntry(entry: EvidenceLedgerEntry): string {
   return [`- ${metadata.join(" ")}`, ...body].join("\n");
 }
 
+const TRANSCRIPT_ROW_PREFIX = "current_session_stream:";
+const TRANSCRIPT_ROW_METADATA_KEYS = new Set([
+  "sender_entity_id",
+  "sender_display_name",
+  "reply_target_kind",
+  "reply_target_entity_id",
+  "reply_target_display_name",
+]);
+
+export const TRANSCRIPT_ROW_FORMAT =
+  "rows: <stream id> <speaker> (<entity id>) [-> <reply target> (<entity id>)] [<state>]: <message text>. The stream id is the source handle for citing the message.";
+
+function speakerLabel(name: unknown, entityId: unknown): string | null {
+  if (typeof entityId !== "string") {
+    return null;
+  }
+
+  return typeof name === "string" ? `${name} (${entityId})` : `(${entityId})`;
+}
+
+// A current-session transcript row printed as one line. Every row in this section shares its
+// source type and scope, so the section header says them once; the speaker and reply target are
+// the only per-row metadata the model reads. A row carrying anything this format does not print
+// (a disclosure label, other metadata, a citation other than its own stream id, a value) falls back to the full row, so nothing
+// is dropped silently.
+function renderTranscriptRow(entry: EvidenceLedgerEntry): string | null {
+  const metadata = entry.state_metadata ?? {};
+  const streamId = entry.id.slice(TRANSCRIPT_ROW_PREFIX.length);
+
+  if (
+    !entry.id.startsWith(TRANSCRIPT_ROW_PREFIX) ||
+    entry.source_type !== "current_session_stream" ||
+    entry.session_scope !== "current_session" ||
+    entry.text === undefined ||
+    entry.value !== undefined ||
+    // The builder cites each row with its own stream id, which the row already prints.
+    (entry.citations ?? []).some((citation) => citation !== streamId) ||
+    Object.keys(metadata).some((key) => !TRANSCRIPT_ROW_METADATA_KEYS.has(key))
+  ) {
+    return null;
+  }
+
+  const speaker =
+    entry.actor === "user"
+      ? (speakerLabel(metadata["sender_display_name"], metadata["sender_entity_id"]) ?? "user")
+      : entry.actor;
+  const replyTarget = speakerLabel(
+    metadata["reply_target_display_name"],
+    metadata["reply_target_entity_id"],
+  );
+  const tags = [
+    entry.state,
+    entry.taint === undefined || entry.taint === "none" ? undefined : `taint=${entry.taint}`,
+    entry.persistence_class === undefined
+      ? undefined
+      : `persistence_class=${entry.persistence_class}`,
+  ].filter((tag): tag is string => tag !== undefined && tag.length > 0);
+  const head = [
+    `- ${streamId} ${speaker}`,
+    replyTarget === null ? null : `-> ${replyTarget}`,
+    tags.length === 0 ? null : `[${tags.join(" ")}]`,
+  ]
+    .filter((part): part is string => part !== null)
+    .join(" ");
+  const anomalies = renderFrameAnomalyAnnotations(entry.frame_anomalies);
+
+  return [`${head}: ${entry.text}`, anomalies.length === 0 ? null : anomalies]
+    .filter((part): part is string => part !== null)
+    .join("\n");
+}
+
 export function renderSection(section: EvidenceLedgerSection): string {
   // framing.counts (rows assembled, folded out, omitted) is pipeline bookkeeping for the trace;
   // it is not printed for the model.
@@ -105,12 +176,17 @@ export function renderSection(section: EvidenceLedgerSection): string {
 
   const sourceTypes = [...new Set(section.entries.map((entry) => entry.source_type))].join(", ");
   const scopes = [...new Set(section.entries.map((entry) => entry.session_scope))].join(", ");
+  const transcript = section.id === "current_session_transcript";
+  const rows = section.entries.map((entry) =>
+    transcript ? (renderTranscriptRow(entry) ?? renderEntry(entry)) : renderEntry(entry),
+  );
 
   return [
     `## ${section.label}`,
     ...framingLines,
     `source_types: ${sourceTypes}`,
     `scopes: ${scopes}`,
-    ...section.entries.map((entry) => renderEntry(entry)),
+    ...(transcript ? [TRANSCRIPT_ROW_FORMAT] : []),
+    ...rows,
   ].join("\n");
 }

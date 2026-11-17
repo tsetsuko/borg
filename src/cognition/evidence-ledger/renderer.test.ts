@@ -255,6 +255,78 @@ describe("renderEvidenceLedger", () => {
     );
   });
 
+  it("renders current-session transcript rows as one line each", () => {
+    const ledger = makeLedger();
+
+    section(ledger, "current_session_transcript").entries = [
+      {
+        id: "current_session_stream:strm_user_a",
+        source_type: "current_session_stream",
+        session_scope: "current_session",
+        actor: "user",
+        trust_rank: 100,
+        stream_index: 0,
+        citations: ["strm_user_a"],
+        text: "Hello there.\nSecond line.",
+        state_metadata: { sender_entity_id: "ent_zosia", sender_display_name: "Zosia" },
+        taint: "none",
+      },
+      {
+        id: "current_session_stream:strm_agent_b",
+        source_type: "current_session_stream",
+        session_scope: "current_session",
+        actor: "assistant",
+        trust_rank: 100,
+        stream_index: 1,
+        text: "Hi.",
+        state_metadata: {
+          reply_target_kind: "entity",
+          reply_target_entity_id: "ent_zosia",
+          reply_target_display_name: "Zosia",
+        },
+        taint: "none",
+        persistence_class: "assistant_self_report",
+      },
+      {
+        id: "current_session_stream:strm_observed_c",
+        source_type: "current_session_stream",
+        session_scope: "current_session",
+        actor: "assistant",
+        trust_rank: 100,
+        stream_index: 2,
+        text: "observed",
+        state: "observed",
+        taint: "none",
+      },
+      {
+        id: "current_session_stream:strm_labelled_d",
+        source_type: "current_session_stream",
+        session_scope: "current_session",
+        actor: "user",
+        trust_rank: 100,
+        text: "Row with extra metadata.",
+        state_metadata: { sender_entity_id: "ent_other", extra_key: "kept" },
+        taint: "none",
+      },
+    ];
+
+    const rendered = renderEvidenceLedger(ledger) ?? "";
+
+    expect(rendered).toContain(
+      "- strm_user_a Zosia (ent_zosia): Hello there.\nSecond line.\n",
+    );
+    expect(rendered).toContain(
+      "- strm_agent_b assistant -> Zosia (ent_zosia) [persistence_class=assistant_self_report]: Hi.\n",
+    );
+    expect(rendered).toContain("- strm_observed_c assistant [observed]: observed\n");
+    expect(rendered).toContain("rows: <stream id> <speaker> (<entity id>)");
+    expect(rendered).not.toContain("id=current_session_stream:strm_user_a");
+    expect(rendered).not.toContain("id=current_session_stream:strm_agent_b");
+    // A row with metadata the one-line format does not print keeps the full row.
+    expect(rendered).toContain("id=current_session_stream:strm_labelled_d");
+    expect(rendered).toContain('"extra_key":"kept"');
+  });
+
   it("renders abandoned open-question state metadata", () => {
     const ledger = makeLedger();
     const openQuestionSection = ledger.sections.find((section) => section.id === "open_questions");
